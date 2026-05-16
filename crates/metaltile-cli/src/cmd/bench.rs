@@ -1,11 +1,4 @@
-//! MetalTile Benchmark Suite
-//!
-//! Runs all LLM operations and prints a single comprehensive table showing
-//! reference (MLX Metal kernels) vs MetalTile-generated performance.
-//!
-//! Usage:  cargo run --release -p metaltile-bench --bin bench_suite
-//!         cargo run --release -p metaltile-bench --bin bench_suite -- --json results/run.json
-//!         cargo run --release -p metaltile-bench --bin bench_suite -- --filter softmax
+//! `tile bench` — Benchmark suite: MetalTile vs MLX reference.
 
 use metaltile_bench::{
     ops::{
@@ -21,48 +14,50 @@ use metaltile_bench::{
     term::{Color, Style, paint_stderr, paint_stdout},
 };
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let json_out = flag_val(&args, "--json");
-    let filter = flag_val(&args, "--filter");
+use crate::{flag_val, matches_filter};
+
+pub fn run(args: &[String]) {
+    let json_out = flag_val(args, "--json").or_else(|| flag_val(args, "-o"));
+    let filter = flag_val(args, "--filter").or_else(|| flag_val(args, "-f"));
 
     let runner = match GpuRunner::new() {
         Ok(r) => r,
         Err(e) => {
-            println!(
+            eprintln!(
                 "{} {}",
-                paint_stdout("[skip]", Style::new().fg(Color::Yellow).bold()),
-                paint_stdout(e, Style::new().fg(Color::BrightWhite))
+                paint_stderr("Error:", Style::new().fg(Color::Red).bold()),
+                paint_stderr(e, Style::new().fg(Color::BrightWhite)),
             );
-            return;
+            std::process::exit(1);
         },
     };
 
+    // Banner
     println!(
         "{}",
         paint_stdout(
             "╔═══════════════════════════════════════════════════════════════════════════════╗",
-            Style::new().fg(Color::Cyan).bold()
+            Style::new().fg(Color::Cyan).bold(),
         )
     );
     println!(
         "{}",
         paint_stdout(
             "║  MetalTile Benchmark Suite                                                  ║",
-            Style::new().fg(Color::BrightWhite).bold()
+            Style::new().fg(Color::BrightWhite).bold(),
         )
     );
     println!(
         "{}",
         paint_stdout(
             "╚═══════════════════════════════════════════════════════════════════════════════╝",
-            Style::new().fg(Color::Cyan).bold()
+            Style::new().fg(Color::Cyan).bold(),
         )
     );
     println!(
         "\n{} {}",
         paint_stdout("Device:", Style::new().fg(Color::BrightBlack).bold()),
-        paint_stdout(&runner.device_name, Style::new().fg(Color::BrightWhite).bold())
+        paint_stdout(&runner.device_name, Style::new().fg(Color::BrightWhite).bold()),
     );
 
     // Run all ops, optionally narrowed to a single substring filter.
@@ -100,14 +95,14 @@ fn main() {
                 paint_stderr("[warn]", Style::new().fg(Color::Yellow).bold()),
                 paint_stderr(
                     format!("No benchmarks matched --filter {pattern:?}"),
-                    Style::new().fg(Color::BrightWhite)
-                )
+                    Style::new().fg(Color::BrightWhite),
+                ),
             );
         } else {
             eprintln!(
                 "{} {}",
                 paint_stderr("[warn]", Style::new().fg(Color::Yellow).bold()),
-                paint_stderr("No benchmarks ran", Style::new().fg(Color::BrightWhite))
+                paint_stderr("No benchmarks ran", Style::new().fg(Color::BrightWhite)),
             );
         }
         return;
@@ -135,7 +130,11 @@ fn main() {
         .collect();
     let avg_pct: Option<f64> = {
         let valid: Vec<f64> = all.iter().filter_map(|r| r.pct()).collect();
-        if valid.is_empty() { None } else { Some(valid.iter().sum::<f64>() / valid.len() as f64) }
+        if valid.is_empty() {
+            None
+        } else {
+            Some(valid.iter().sum::<f64>() / valid.len() as f64)
+        }
     };
 
     let mut summary = vec![
@@ -173,14 +172,14 @@ fn main() {
         println!(
             "  {} {}",
             paint_stdout("Correctness failures:", Style::new().fg(Color::BrightBlack).bold()),
-            paint_stdout(equiv_fail.to_string(), Style::new().fg(Color::Red).bold())
+            paint_stdout(equiv_fail.to_string(), Style::new().fg(Color::Red).bold()),
         );
     }
     if !unchecked.is_empty() {
         println!(
             "  {} {}",
             paint_stdout("Unchecked MT results:", Style::new().fg(Color::BrightBlack).bold()),
-            paint_stdout(unchecked.join(", "), Style::new().fg(Color::Yellow).bold())
+            paint_stdout(unchecked.join(", "), Style::new().fg(Color::Yellow).bold()),
         );
     }
     println!();
@@ -214,12 +213,12 @@ fn save_json(device: &str, results: &[OpResult], path: &str) {
         Ok(()) => println!(
             "  {} {}",
             paint_stdout("Saved →", Style::new().fg(Color::Cyan).bold()),
-            paint_stdout(path, Style::new().fg(Color::BrightWhite))
+            paint_stdout(path, Style::new().fg(Color::BrightWhite)),
         ),
         Err(e) => eprintln!(
             "  {} {}",
             paint_stderr("save failed:", Style::new().fg(Color::Red).bold()),
-            paint_stderr(e.to_string(), Style::new().fg(Color::BrightWhite))
+            paint_stderr(e.to_string(), Style::new().fg(Color::BrightWhite)),
         ),
     }
 }
@@ -237,26 +236,17 @@ fn extend_if_selected(
     all.extend(run(runner).into_iter().filter(|r| matches_filter(filter.as_deref(), r.op())));
 }
 
-fn matches_filter(filter: Option<&str>, label: &str) -> bool {
-    let Some(filter) = filter else {
-        return true;
-    };
-    label.to_ascii_lowercase().contains(&filter.to_ascii_lowercase())
-}
-
-fn flag_val(args: &[String], name: &str) -> Option<String> {
-    args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone())
-}
-
 fn summary_item(label: &str, value: &str, value_style: Style) -> String {
     format!(
         "{} {}",
         paint_stdout(label, Style::new().fg(Color::BrightBlack).bold()),
-        paint_stdout(value, value_style)
+        paint_stdout(value, value_style),
     )
 }
 
-fn summary_sep() -> String { paint_stdout("|", Style::new().fg(Color::BrightBlack).dim()) }
+fn summary_sep() -> String {
+    paint_stdout("|", Style::new().fg(Color::BrightBlack).dim())
+}
 
 fn pct_style(pct: f64) -> Style {
     if pct >= 90.0 {
@@ -265,18 +255,5 @@ fn pct_style(pct: f64) -> Style {
         Style::new().fg(Color::Yellow).bold()
     } else {
         Style::new().fg(Color::Red).bold()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::matches_filter;
-
-    #[test]
-    fn filter_matches_case_insensitively() {
-        assert!(matches_filter(Some("Soft"), "softmax"));
-        assert!(matches_filter(Some("NORM"), "layer_norm"));
-        assert!(!matches_filter(Some("gemv"), "matmul"));
-        assert!(matches_filter(None, "anything"));
     }
 }

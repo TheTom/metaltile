@@ -40,11 +40,4 @@ objc2-metal = { version = "0.3", features = [
 ] }
 objc2-foundation = "0.3"
 
-[[bin]]
-name = "bench_suite"
-path = "src/bench_suite.rs"
-
-[[bin]]
-name = "dump_msl"
-path = "src/dump_msl.rs"
 

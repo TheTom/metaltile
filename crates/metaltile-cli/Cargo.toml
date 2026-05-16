@@ -1,0 +1,25 @@
+[package]
+name = "metaltile-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "MetalTile CLI — benchmark, test, and inspect GPU kernels"
+keywords = ["metal", "gpu", "apple-silicon", "benchmark", "cli"]
+categories = ["hardware-support", "development-tools"]
+publish = false
+
+[[bin]]
+name = "tile"
+path = "src/main.rs"
+
+[dependencies]
+metaltile.workspace = true
+metaltile-core.workspace = true
+metaltile-codegen.workspace = true
+metaltile-interp.workspace = true
+metaltile-runtime.workspace = true
+metaltile-bench = { path = "../metaltile-bench" }
+inventory.workspace = true
+serde_json.workspace = true

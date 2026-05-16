@@ -8,6 +8,7 @@ members = [
   "crates/metaltile-runtime",
   "crates/metaltile",
   "crates/metaltile-bench",
+  "crates/metaltile-cli",
 ]
 
 [workspace.package]
@@ -26,6 +27,7 @@ metaltile-macros = { path = "crates/metaltile-macros" }
 metaltile-codegen = { path = "crates/metaltile-codegen" }
 metaltile-interp = { path = "crates/metaltile-interp" }
 metaltile-runtime = { path = "crates/metaltile-runtime" }
+metaltile-bench = { path = "crates/metaltile-bench" }
 
 # External
 syn = { version = "2", features = ["full", "extra-traits"] }
