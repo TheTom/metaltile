@@ -30,16 +30,30 @@ fn main() {
 
 /// Ensure `.cache/mlx` exists and contains the pinned MLX commit, fetching it
 /// if absent or stale.
+///
+/// Multiple Cargo build scripts (metaltile-std, metaltile-cli) share the same
+/// `.cache/mlx` directory.  Cargo may run their build scripts in parallel, so
+/// we use a file-based advisory lock to serialise the fetch.
 fn ensure_mlx(cache_dir: &Path) {
     let marker = cache_dir.join(".commit");
 
+    // Fast path: cache is already valid — no locking needed.
+    if cache_is_valid(cache_dir, &marker) {
+        return;
+    }
+
+    // Acquire exclusive lock (spins until the other build script releases it).
+    let lock_path = cache_dir.parent().unwrap().join(".mlx-fetch.lock");
+    std::fs::create_dir_all(cache_dir.parent().unwrap()).ok();
+    let _lock = acquire_lock(&lock_path);
+
+    // Re-check after acquiring — the other process may have populated the cache.
+    if cache_is_valid(cache_dir, &marker) {
+        return;
+    }
+
+    // Stale or corrupt cache — start fresh.
     if cache_dir.exists() {
-        if std::fs::read_to_string(&marker).ok().map(|s| s.trim().to_string()).as_deref()
-            == Some(MLX_COMMIT)
-        {
-            return; // cache is valid
-        }
-        // Stale or corrupt cache — start fresh.
         std::fs::remove_dir_all(cache_dir).unwrap();
     }
 
@@ -66,6 +80,30 @@ fn ensure_mlx(cache_dir: &Path) {
     }
 
     std::fs::write(&marker, MLX_COMMIT).unwrap();
+}
+
+fn cache_is_valid(cache_dir: &Path, marker: &Path) -> bool {
+    cache_dir.exists()
+        && std::fs::read_to_string(marker)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .as_deref()
+            == Some(MLX_COMMIT)
+}
+
+struct FileLock(PathBuf);
+
+impl Drop for FileLock {
+    fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+}
+
+fn acquire_lock(path: &Path) -> FileLock {
+    loop {
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(_) => return FileLock(path.to_path_buf()),
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(200)),
+        }
+    }
 }
 
 fn git_head(dir: &Path) -> String {
