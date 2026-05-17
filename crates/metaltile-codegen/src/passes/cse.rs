@@ -21,13 +21,21 @@
 use std::collections::HashMap;
 
 use metaltile_core::{
+    dtype::DType,
     error::Result,
-    ir::{BinOpKind, Block, BlockId, IndexExpr, Kernel, Op, ParamKind, ValueId},
+    ir::{
+        ActKind,
+        BinOpKind,
+        Block,
+        BlockId,
+        IndexExpr,
+        Kernel,
+        Op,
+        ParamKind,
+        UnaryOpKind,
+        ValueId,
+    },
 };
-
-use metaltile_core::ir::UnaryOpKind;
-use metaltile_core::ir::ActKind;
-use metaltile_core::dtype::DType;
 
 /// A structural key for CSE: captures the opcode and operands in a hashable form.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -77,8 +85,8 @@ fn cse_block(block: &mut Block, read_only: &std::collections::BTreeSet<String>) 
     let mut old_to_new: HashMap<ValueId, ValueId> = HashMap::new();
     let mut skip: Vec<bool> = vec![false; n];
 
-    for i in 0..n {
-        let Some(key) = op_key(&block.ops[i], read_only) else {
+    for (i, op) in block.ops.iter().enumerate() {
+        let Some(key) = op_key(op, read_only) else {
             continue;
         };
         let Some(&Some(vid)) = block.results.get(i) else {
@@ -127,13 +135,11 @@ fn op_key(op: &Op, read_only: &std::collections::BTreeSet<String>) -> Option<OpK
             let (l, r) = canonicalize_binop(*kind, lhs.as_u32(), rhs.as_u32());
             Some(OpKey::BinOp { op: *kind, lhs: l, rhs: r })
         },
-        Op::UnaryOp { op: kind, value } => {
-            Some(OpKey::UnaryOp { op: *kind, value: value.as_u32() })
-        },
+        Op::UnaryOp { op: kind, value } =>
+            Some(OpKey::UnaryOp { op: *kind, value: value.as_u32() }),
         Op::Cast { dtype, value } => Some(OpKey::Cast { dtype: *dtype, value: value.as_u32() }),
-        Op::Activation { kind, value } => {
-            Some(OpKey::Activation { kind: *kind, value: value.as_u32() })
-        },
+        Op::Activation { kind, value } =>
+            Some(OpKey::Activation { kind: *kind, value: value.as_u32() }),
         Op::Select { cond, on_true, on_false } => Some(OpKey::Select {
             cond: cond.as_u32(),
             on_true: on_true.as_u32(),
@@ -166,11 +172,7 @@ fn canonicalize_binop(op: BinOpKind, lhs: u32, rhs: u32) -> (u32, u32) {
             | BinOpKind::CmpEq
             | BinOpKind::CmpNe
     );
-    if is_commutative && lhs > rhs {
-        (rhs, lhs)
-    } else {
-        (lhs, rhs)
-    }
+    if is_commutative && lhs > rhs { (rhs, lhs) } else { (lhs, rhs) }
 }
 
 /// Replace all ValueId references in `op` using the remapping map.

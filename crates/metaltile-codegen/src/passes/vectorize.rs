@@ -42,6 +42,7 @@ impl super::Pass for VectorizePass {
 /// Maximum vector width to try (2, 4, or 8).
 const MAX_VEC_LEN: usize = 8;
 
+#[allow(clippy::needless_range_loop)]
 fn vectorize_block(block: &mut Block, params: &[Param]) {
     let n = block.ops.len();
     let mut skip: Vec<bool> = vec![false; n];
@@ -78,9 +79,7 @@ fn vectorize_block(block: &mut Block, params: &[Param]) {
                     break;
                 }
                 match &block.ops[j] {
-                    Op::Load { src: s2, indices: idx2, .. }
-                        if *s2 == *src && idx2.len() == 1 =>
-                    {
+                    Op::Load { src: s2, indices: idx2, .. } if *s2 == *src && idx2.len() == 1 => {
                         let next_base = match &idx2[0] {
                             IndexExpr::Value(v) | IndexExpr::Range(v, _) => *v,
                             _ => break,
@@ -98,7 +97,8 @@ fn vectorize_block(block: &mut Block, params: &[Param]) {
 
             if run_indices.len() >= 2 {
                 let vlen = run_indices.len() as u32;
-                block.ops[i] = Op::VectorLoad { src: src.clone(), byte_offset: base_vid, len: vlen };
+                block.ops[i] =
+                    Op::VectorLoad { src: src.clone(), byte_offset: base_vid, len: vlen };
                 for &idx in run_indices[1..].iter().rev() {
                     skip[idx] = true;
                 }
@@ -136,9 +136,7 @@ fn vectorize_block(block: &mut Block, params: &[Param]) {
                     break;
                 }
                 match &block.ops[j] {
-                    Op::Store { dst: d2, indices: idx2, .. }
-                        if *d2 == *dst && idx2.len() == 1 =>
-                    {
+                    Op::Store { dst: d2, indices: idx2, .. } if *d2 == *dst && idx2.len() == 1 => {
                         let next_base = match &idx2[0] {
                             IndexExpr::Value(v) | IndexExpr::Range(v, _) => *v,
                             _ => break,
@@ -249,9 +247,7 @@ fn find_const_in_block(block: &Block, vid: ValueId) -> Option<i64> {
 
 /// Whether a dtype supports vectorization. BF16 is vectorizable on Metal 3.1+
 /// (bfloat2, bfloat4 are valid MSL vector types).
-fn is_vectorizable(dtype: DType) -> bool {
-    matches!(dtype, DType::F16 | DType::F32 | DType::BF16)
-}
+fn is_vectorizable(dtype: DType) -> bool { matches!(dtype, DType::F16 | DType::F32 | DType::BF16) }
 
 fn remap_values_in_op(op: &mut Op, remap: &BTreeMap<usize, ValueId>) {
     let s = |v: &mut ValueId| {

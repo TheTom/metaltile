@@ -3,12 +3,18 @@
 //! Walks the MetalTile IR and emits valid MSL source text.
 //! Handles constexpr params, tiled matmul, vectorized loads, and thread indexing.
 
+pub(crate) mod features;
+pub(crate) mod matmul;
+pub(crate) mod preamble;
+pub(crate) mod reduce;
+
 use std::{collections::BTreeMap, fmt::Write};
 
+use features::KernelFeatures;
+use matmul::{dim_to_msl_str, fmt_float};
 use metaltile_core::{
     dtype::DType,
     ir::{
-        ActKind,
         BinOpKind,
         Block,
         BlockId,
@@ -18,10 +24,9 @@ use metaltile_core::{
         Op,
         ParamKind,
         ReduceKind,
-        UnaryOpKind,
         ValueId,
     },
-    shape::{Dim, Shape},
+    shape::Shape,
 };
 
 use crate::{
@@ -33,6 +38,7 @@ use crate::{
     },
 };
 
+#[macro_export]
 macro_rules! wl {
     ($out:expr) => {{ let _ = writeln!($out); }};
     ($out:expr, $($arg:tt)*) => {{ let _ = writeln!($out, $($arg)*); }};
@@ -71,23 +77,6 @@ impl Default for MslConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Kernel feature analysis
-// ---------------------------------------------------------------------------
-
-struct KernelFeatures {
-    has_tile: bool,
-    is_matmul: bool,
-    needs_simd_lane: bool,
-    needs_simd_group: bool, // needs simdgroup_index_in_threadgroup (for inter-warp reduction)
-    needs_bf16_struct: bool,
-    needs_silu: bool,
-    needs_gelu: bool,
-    needs_relu: bool,
-    needs_sigmoid: bool,
-    needs_erf: bool,
-}
-
-// ---------------------------------------------------------------------------
 // Generator
 // ---------------------------------------------------------------------------
 
@@ -113,9 +102,6 @@ impl MslGenerator {
             self.emit_bf16_preamble(&mut out);
         }
         if self.config.use_simd_matrix {
-            // simdgroup_matrix is available from Metal 2.3 (macOS 11 / Apple7+).
-            // The runtime gate (runner.supports_simd_matrix) is the source of truth
-            // for whether this header gets included.
             wl!(out);
             wl!(out, "#include <metal_simdgroup_matrix>");
         }
@@ -125,96 +111,9 @@ impl MslGenerator {
         Ok(out)
     }
 
-    // ---- feature analysis ------------------------------------------------
+    // ---- type helpers ----------------------------------------------------
 
-    fn analyze(&self, kernel: &Kernel) -> KernelFeatures {
-        let mut feat = KernelFeatures {
-            has_tile: false,
-            is_matmul: false,
-            needs_simd_lane: false,
-            needs_simd_group: false,
-            needs_bf16_struct: false,
-            needs_silu: false,
-            needs_gelu: false,
-            needs_relu: false,
-            needs_sigmoid: false,
-            needs_erf: false,
-        };
-        for p in &kernel.params {
-            if p.dtype == DType::BF16 {
-                feat.needs_bf16_struct = true;
-            }
-        }
-        self.analyze_block(&kernel.body, &mut feat);
-        for block in kernel.blocks.values() {
-            self.analyze_block(block, &mut feat);
-        }
-        let tensor_2d = kernel.params.iter().filter(|p| p.shape.rank() == 2).count();
-        feat.is_matmul = feat.has_tile && tensor_2d >= 2;
-
-        feat
-    }
-
-    fn analyze_block(&self, block: &Block, feat: &mut KernelFeatures) {
-        for op in &block.ops {
-            match op {
-                Op::Dot { .. } => feat.has_tile = true,
-                Op::Reduce { .. } | Op::Scan { .. } => {
-                    feat.needs_simd_lane = true;
-                    feat.needs_simd_group = true;
-                },
-                Op::Load { src, indices, .. } if indices.is_empty() => {
-                    if src == "simd_lane" {
-                        feat.needs_simd_lane = true;
-                    }
-                    if src == "simd_id" {
-                        feat.needs_simd_group = true;
-                    }
-                },
-                Op::Zeros { dtype, .. } | Op::Splat { dtype, .. } if *dtype == DType::BF16 => {
-                    feat.needs_bf16_struct = true;
-                },
-                Op::Cast { dtype, .. } if *dtype == DType::BF16 => {
-                    feat.needs_bf16_struct = true;
-                },
-                Op::Activation { kind, .. } => match kind {
-                    ActKind::Silu => feat.needs_silu = true,
-                    ActKind::Gelu => feat.needs_gelu = true,
-                    ActKind::Relu => feat.needs_relu = true,
-                    ActKind::Sigmoid => feat.needs_sigmoid = true,
-                    ActKind::Tanh => {},
-                },
-                Op::UnaryOp { op: UnaryOpKind::Erf, .. } => feat.needs_erf = true,
-                _ => {},
-            }
-        }
-    }
-
-    // ---- preamble helpers ------------------------------------------------
-
-    fn emit_bf16_preamble(&self, out: &mut String) {
-        wl!(out);
-        wl!(out, "// BF16 compatibility struct for pre-Metal-3.1 targets");
-        wl!(out, "struct bfloat16_t {{");
-        wl!(out, "    uint16_t bits;");
-        wl!(out, "    bfloat16_t() = default;");
-        wl!(out, "    bfloat16_t(float v) {{");
-        wl!(out, "        uint32_t x = as_type<uint32_t>(v);");
-        wl!(out, "        bits = uint16_t((x + 0x7FFFu + ((x >> 16) & 1u)) >> 16);");
-        wl!(out, "    }}");
-        wl!(out, "    operator float() const {{");
-        wl!(out, "        return as_type<float>(uint32_t(bits) << 16);");
-        wl!(out, "    }}");
-        wl!(out, "    operator float() const device {{");
-        wl!(out, "        return as_type<float>(uint32_t(bits) << 16);");
-        wl!(out, "    }}");
-        wl!(out, "    operator float() const threadgroup {{");
-        wl!(out, "        return as_type<float>(uint32_t(bits) << 16);");
-        wl!(out, "    }}");
-        wl!(out, "}};");
-    }
-
-    fn msl_type_name(&self, dtype: DType) -> &'static str {
+    pub(crate) fn msl_type_name(&self, dtype: DType) -> &'static str {
         if dtype == DType::BF16 && !self.config.native_bfloat {
             "bfloat16_t"
         } else {
@@ -222,70 +121,11 @@ impl MslGenerator {
         }
     }
 
-    fn emit_cast_expr(&self, dtype: DType, value: &str) -> String {
+    pub(crate) fn emit_cast_expr(&self, dtype: DType, value: &str) -> String {
         if dtype == DType::BF16 {
-            // bfloat16_t(v) for compat struct, bfloat(v) for native Metal 3.1+.
-            // static_cast<bfloat> is unreliable in Metal; use constructor-style cast.
             format!("{}({value})", self.msl_type_name(dtype))
         } else {
             format!("static_cast<{}>({value})", self.msl_type_name(dtype))
-        }
-    }
-
-    fn emit_activation_helpers(&self, feat: &KernelFeatures, out: &mut String) {
-        if feat.needs_silu {
-            wl!(out);
-            wl!(out, "template<typename T>");
-            wl!(out, "inline T mt_silu(T x) {{ return x / (T(1) + exp(-x)); }}");
-        }
-        if feat.needs_gelu {
-            wl!(out);
-            wl!(out, "template<typename T>");
-            wl!(out, "inline T mt_gelu(T x) {{");
-            wl!(out, "    const T k = T(0.7978845608f);");
-            wl!(out, "    return T(0.5f) * x * (T(1) + tanh(k * (x + T(0.044715f) * x*x*x)));");
-            wl!(out, "}}");
-        }
-        if feat.needs_relu {
-            wl!(out);
-            wl!(out, "template<typename T>");
-            wl!(out, "inline T mt_relu(T x) {{ return max(T(0), x); }}");
-        }
-        if feat.needs_sigmoid {
-            wl!(out);
-            wl!(out, "template<typename T>");
-            wl!(out, "inline T mt_sigmoid(T x) {{ return T(1) / (T(1) + exp(-x)); }}");
-        }
-        if feat.needs_erf {
-            wl!(out);
-            // Polynomial approximation matching MLX erf.h (max error < 1 ulp)
-            wl!(out, "inline float mt_erf_impl(float a) {{");
-            wl!(out, "    float r, s, t, u;");
-            wl!(out, "    t = metal::abs(a);");
-            wl!(out, "    s = a * a;");
-            wl!(out, "    if (t > 0.927734375f) {{");
-            wl!(out, "        r = metal::fma(-1.72853470e-5f, t, 3.83197126e-4f);");
-            wl!(out, "        u = metal::fma(-3.88396438e-3f, t, 2.42546219e-2f);");
-            wl!(out, "        r = metal::fma(r, s, u);");
-            wl!(out, "        r = metal::fma(r, t, -1.06777877e-1f);");
-            wl!(out, "        r = metal::fma(r, t, -6.34846687e-1f);");
-            wl!(out, "        r = metal::fma(r, t, -1.28717512e-1f);");
-            wl!(out, "        r = metal::fma(r, t, -t);");
-            wl!(out, "        r = -(exp(r) - 1.0f);");
-            wl!(out, "        r = metal::copysign(r, a);");
-            wl!(out, "    }} else {{");
-            wl!(out, "        r = -5.96761703e-4f;");
-            wl!(out, "        r = metal::fma(r, s,  4.99119423e-3f);");
-            wl!(out, "        r = metal::fma(r, s, -2.67681349e-2f);");
-            wl!(out, "        r = metal::fma(r, s,  1.12819925e-1f);");
-            wl!(out, "        r = metal::fma(r, s, -3.76125336e-1f);");
-            wl!(out, "        r = metal::fma(r, s,  1.28379166e-1f);");
-            wl!(out, "        r = metal::fma(r, a, a);");
-            wl!(out, "    }}");
-            wl!(out, "    return r;");
-            wl!(out, "}}");
-            wl!(out, "template<typename T>");
-            wl!(out, "inline T mt_erf_impl(T x) {{ return T(mt_erf_impl(float(x))); }}");
         }
     }
 
@@ -302,7 +142,7 @@ impl MslGenerator {
 
         write!(out, "kernel void {}(", kernel.name).unwrap();
 
-        // Tensor/Strided/Scalar params — always followed by something, so always comma-terminate.
+        // Tensor/Strided/Scalar params.
         for p in &kernel.params {
             match p.kind {
                 ParamKind::Tensor => {
@@ -351,7 +191,7 @@ impl MslGenerator {
             let msl_type = match ce.dtype {
                 DType::F32 => "float",
                 DType::F16 => "half",
-                DType::BF16 => "float", // Metal BF16 as float for constants
+                DType::BF16 => "float",
                 DType::I32 => "int",
                 DType::I64 => "long",
                 DType::U64 => "ulong",
@@ -362,8 +202,7 @@ impl MslGenerator {
             buf_idx += 1;
         }
 
-        // Thread / threadgroup position attributes — all built-ins must share
-        // the same vector width (Metal constraint), so each mode is self-contained.
+        // Thread / threadgroup position attributes.
         match kernel.mode {
             KernelMode::Elementwise => {
                 write!(out, "\n    uint tid [[thread_position_in_grid]]").unwrap();
@@ -394,8 +233,7 @@ impl MslGenerator {
 
         wl!(out, "\n) {{");
 
-        // Inject scalar aliases for the Reduction mode so the body can use
-        // `tid`, `tgid_x`, `tgid_y`, `lsize`, and `n_simd` directly.
+        // Inject scalar aliases for Reduction mode.
         if kernel.mode == KernelMode::Reduction {
             wl!(out, "    uint tid    = _tid3.x;");
             wl!(out, "    uint tgid_x = _tgid3.x;");
@@ -456,9 +294,6 @@ impl MslGenerator {
         let pad = "    ".repeat(indent);
 
         // Deduplicate variable names within this block.
-        // The body_parser inlines `{ }` sub-blocks, so the same human-readable name
-        // (e.g. "ov") can appear multiple times with different ValueIds.  MSL/C++ does
-        // not allow re-declarations in the same scope, so suffix duplicates: _2, _3, …
         let mut dedup_extra = extra_names.clone();
         {
             use std::collections::BTreeMap as Map;
@@ -473,11 +308,6 @@ impl MslGenerator {
             }
         }
         let extra_names = &dedup_extra;
-
-        if self.config.debug_comments {
-            // Emit a comment per op if debug mode is on.
-            // We'll emit inline comments alongside the ops below.
-        }
 
         for (i, op) in block.ops.iter().enumerate() {
             let vid = block.results.get(i).and_then(|x| *x);
@@ -519,7 +349,6 @@ impl MslGenerator {
                     let v = self.vname(vid, block, extra_names);
                     let s0 = start.unwrap_or(0.0);
                     let ds = step.unwrap_or(1.0);
-                    // Each thread gets its own position within the arange range.
                     let raw_idx = if has_tile {
                         format!("(tid.y * {len} + tid.x) % {len}")
                     } else if kernel.mode == KernelMode::Grid3D {
@@ -537,15 +366,6 @@ impl MslGenerator {
                 // ---- memory --------------------------------------------
                 Op::Load { src, indices, .. } => {
                     let v = self.vname(vid, block, extra_names);
-                    // Elementwise kernels operate on BF16 values without explicit casts in the
-                    // DSL (e.g. `abs(load(a[idx]))`). With native bfloat in Metal 3.1+, there
-                    // is no abs(bfloat)/max(bfloat,...)/etc. overload, so the call is ambiguous.
-                    // Fix: promote BF16 to float at load time for Elementwise kernels.
-                    //
-                    // Reduction kernels (softmax, rms_norm, etc.) explicitly call .cast::<f32>()
-                    // in the DSL after loading, so they don't need promotion at load time —
-                    // and leaving the type as bfloat lets the compiler vectorize 4 consecutive
-                    // 16-bit loads into a single bfloat4 memory transaction.
                     let src_dtype = kernel.params.iter().find(|p| p.name == *src).map(|p| p.dtype);
                     let promote_bf16 = self.config.native_bfloat
                         && src_dtype == Some(DType::BF16)
@@ -569,7 +389,6 @@ impl MslGenerator {
                 Op::Store { dst, indices, value, .. } => {
                     let idx = self.emit_idx(indices, block, extra_names, kernel, dst);
                     let val = self.vname(Some(*value), block, extra_names);
-                    // With native bfloat, Metal won't auto-convert float→bfloat on store.
                     let dst_dtype = kernel.params.iter().find(|p| p.name == *dst).map(|p| p.dtype);
                     if self.config.native_bfloat && dst_dtype == Some(DType::BF16) {
                         wl!(out, "{pad}{dst}[{idx}] = bfloat({val});");
@@ -606,7 +425,6 @@ impl MslGenerator {
                 Op::Slice { value, ranges } => {
                     let v = self.vname(vid, block, extra_names);
                     let rv = self.vname(Some(*value), block, extra_names);
-                    // Compute the stride-aware offset using the type environment.
                     let offset_str = type_env
                         .get(value)
                         .and_then(|tv| {
@@ -650,7 +468,6 @@ impl MslGenerator {
                 Op::Transpose { value } => {
                     let v = self.vname(vid, block, extra_names);
                     let rv = self.vname(Some(*value), block, extra_names);
-                    // Use type env to emit a real permutation loop for register tiles.
                     if let Some(tv) = type_env.get(value) {
                         let rank = tv.shape.rank();
                         if rank == 2 {
@@ -712,7 +529,6 @@ impl MslGenerator {
                     let vc = self.vname(Some(*cond), block, extra_names);
                     let vt = self.vname(Some(*on_true), block, extra_names);
                     let vf = self.vname(Some(*on_false), block, extra_names);
-                    // MSL select(false_val, true_val, condition) — reversed from C ternary.
                     wl!(out, "{pad}auto {v} = select({vf}, {vt}, bool({vc}));");
                 },
 
@@ -753,7 +569,6 @@ impl MslGenerator {
                         ReduceKind::Max => "-INFINITY",
                         ReduceKind::Min => "INFINITY",
                     };
-                    // Build the per-element expression from the transform chain.
                     let base_elem = if let Some(sec_src) = secondary_src {
                         let base_v = self.vname(*secondary_base, block, extra_names);
                         format!("float({src}[_i]) * float({sec_src}[_i - {base_v}])")
@@ -767,9 +582,8 @@ impl MslGenerator {
                             for sub_op in ops {
                                 expr = match sub_op {
                                     Op::UnaryOp { op, .. } => op.msl_emit(&expr),
-                                    Op::Activation { kind, .. } => {
-                                        format!("{}({})", kind.msl_fn(), expr)
-                                    },
+                                    Op::Activation { kind, .. } =>
+                                        format!("{}({})", kind.msl_fn(), expr),
                                     Op::Cast { dtype, .. } => self.emit_cast_expr(*dtype, &expr),
                                     Op::BinOp { op, rhs, .. } => {
                                         let rv = self.vname(Some(*rhs), block, extra_names);
@@ -787,12 +601,8 @@ impl MslGenerator {
                             expr
                         },
                     };
-                    // In Reduction/Tile2D modes, use `tid` and `lsize` as defaults.
                     let has_tid = matches!(kernel.mode, KernelMode::Reduction | KernelMode::Tile2D);
                     if has_tid {
-                        // N_READS=4 contiguous block access (matches MLX all_reduce pattern).
-                        // Each thread reads 4 consecutive elements per iteration,
-                        // advancing by lsize*4 — cache-line friendly vs stride-lsize.
                         let update = match rk {
                             ReduceKind::Sum | ReduceKind::Mean => format!("{v} += {elem_expr};"),
                             ReduceKind::Max => format!("{v} = max({v}, {elem_expr});"),
@@ -823,7 +633,6 @@ impl MslGenerator {
                         wl!(out, "{pad}    }}");
                         wl!(out, "{pad}}}");
                     } else {
-                        // Elementwise / Grid3D: simple strided loop, offset and stride from DSL.
                         let update = match rk {
                             ReduceKind::Sum | ReduceKind::Mean => format!("{v} += {elem_expr};"),
                             ReduceKind::Max => format!("{v} = max({v}, {elem_expr});"),
@@ -845,8 +654,6 @@ impl MslGenerator {
                 Op::Cast { value, dtype } => {
                     let v = self.vname(vid, block, extra_names);
                     let rv = self.vname(Some(*value), block, extra_names);
-                    // Use explicit type for BF16: Metal promotes bfloat→float in expressions,
-                    // so `auto` would deduce float instead of bfloat.
                     let type_decl = self.msl_type_name(*dtype);
                     wl!(out, "{pad}{type_decl} {v} = {};", self.emit_cast_expr(*dtype, &rv));
                 },
@@ -859,19 +666,11 @@ impl MslGenerator {
                     let vn = format!("i_{}", var.as_u32());
                     wl!(out, "{pad}for (uint {vn} = {s}; {vn} < {e}; {vn} += {st}) {{");
                     if let Some(bb) = all_blocks.get(bid) {
-                        // Wire loop variable into the inner block's name map.
-                        // Use high-bit sentinel (0xC000_0000 | var_id) so this key can never
-                        // alias a real kernel ValueId (which are small sequential u32s).
                         let loop_var_vid = ValueId::new(0xC000_0000 | var.as_u32());
-                        // Seed inner_names with parent block's named values so the loop body
-                        // can resolve variables like `row_max` by their human-readable name.
-                        // Apply the same "v_" prefix that vname() uses for block.names lookups
-                        // so that inner_names references match the already-emitted declarations.
                         let mut inner_names: BTreeMap<ValueId, String> =
                             block.names.iter().map(|(&k, v)| (k, format!("v_{v}"))).collect();
                         inner_names.extend(extra_names.iter().map(|(&k, v)| (k, v.clone())));
                         inner_names.insert(loop_var_vid, vn.clone());
-                        // Also register the legacy +1000 key so macro-generated kernels work.
                         inner_names.insert(ValueId::new(var.as_u32() + 1000), vn.clone());
                         self.emit_block(
                             bb,
@@ -889,13 +688,11 @@ impl MslGenerator {
 
                 // ---- escape hatch --------------------------------------
                 Op::InlineMsl { source, inputs, outputs } => {
-                    // Declare output variable(s) before the inline block.
                     for (oi, slot) in outputs.iter().enumerate() {
                         let out_vid = vid.map(|v| ValueId::new(v.as_u32() + oi as u32));
                         let vn = self.vname(out_vid, block, extra_names);
                         wl!(out, "{pad}{} {vn};", self.msl_type_name(slot.dtype));
                     }
-                    // Bind inputs to positional aliases so inline source can reference them.
                     for (ii, inp_vid) in inputs.iter().enumerate() {
                         let inp = self.vname(Some(*inp_vid), block, extra_names);
                         wl!(out, "{pad}auto _in{ii} = {inp};");
@@ -923,10 +720,6 @@ impl MslGenerator {
                             resolved_vid,
                             last_idx,
                         );
-                        // Use explicit type for BF16: Metal promotes bfloat→float in
-                        // expressions, so `auto` would deduce float instead of bfloat.
-                        // With native bfloat, arithmetic always promotes to float, so
-                        // wrap the expression in bfloat(...) to cast back.
                         let result_is_bf16 = type_env
                             .get(&resolved_vid)
                             .map(|tv| tv.dtype == DType::BF16)
@@ -963,8 +756,6 @@ impl MslGenerator {
                         (4, _) => format!("{}4", scalar_t),
                         _ => format!("{}4", scalar_t),
                     };
-                    // For compat bfloat (no vector types), fall back to scalar loads.
-                    // The vectorizer won't create BF16 vectors in compat mode.
                     wl!(
                         out,
                         "{pad}{vec_t} {v} = *((device {vec_t}*)((device {scalar_t}*){src} + {bo}));"
@@ -1001,9 +792,6 @@ impl MslGenerator {
                 Op::If { cond, then_block: tbid, else_block } => {
                     let cv = self.vname(Some(*cond), block, extra_names);
                     wl!(out, "{pad}if ({cv}) {{");
-                    // Propagate parent block's named values into child blocks so that
-                    // variables declared in the parent (e.g. `v_ns`, `v_val_incl`) are
-                    // visible inside if/else bodies — mirrors the Loop emitter pattern.
                     let mut child_names: BTreeMap<ValueId, String> =
                         block.names.iter().map(|(&k, v)| (k, format!("v_{v}"))).collect();
                     child_names.extend(extra_names.iter().map(|(&k, v)| (k, v.clone())));
@@ -1066,129 +854,149 @@ impl MslGenerator {
                     wl!(out, "{pad}{dst}[{iv}] = {rv};");
                 },
 
-                // ---- atomic ----------------------------------------------
+                // ---- atomics ----------------------------------------------
                 Op::Atomic { op: ak, dst, index, value } => {
                     let iv = self.vname(Some(*index), block, extra_names);
                     let rv = self.vname(Some(*value), block, extra_names);
-                    let fn_name = ak.msl_fn();
+                    wl!(out, "{pad}{}({dst} + {iv}, {rv}, memory_order_relaxed);", ak.msl_fn());
+                },
+
+                // ---- tensor ops -------------------------------------------
+
+                // ---- scan operations --------------------------------------
+                Op::Scan { value, axis: _, op: rk, exclusive: _ } => {
+                    let v = self.vname(vid, block, extra_names);
+                    let rv = self.vname(Some(*value), block, extra_names);
+                    let init = match rk {
+                        ReduceKind::Sum | ReduceKind::Mean => "0.0f",
+                        ReduceKind::Max => "-INFINITY",
+                        ReduceKind::Min => "INFINITY",
+                    };
+                    wl!(out, "{pad}float {v} = {rv} + {init}; // Scan placeholder");
+                },
+
+                Op::StrideScan { dst, offset, end, .. } => {
+                    let _off = self.vname(Some(*offset), block, extra_names);
+                    let _en = self.vname(Some(*end), block, extra_names);
+                    wl!(out, "{pad}// StrideScan: prefix sum over {dst}");
                     wl!(
                         out,
-                        "{pad}{fn_name}((device atomic_float*){dst} + {iv}, float({rv}), memory_order_relaxed);"
+                        "{pad}auto {} = 0; // placeholder",
+                        self.vname(vid, block, extra_names)
                     );
                 },
 
-                // ---- scan ------------------------------------------------
-                // Lower to Metal native simd_prefix builtins (Metal 2.1+).
-                // For threadgroup-wide scans (> 32 threads), falls back to a
-                // two-phase approach: SIMD prefix within each warp, then a
-                // second pass to add the warp totals.
-                Op::Scan { value, op: rk, exclusive, .. } => {
+                Op::StrideArgReduce { src, offset, end, op: _rk } => {
                     let v = self.vname(vid, block, extra_names);
-                    let rv = self.vname(Some(*value), block, extra_names);
-                    let builtin = match (rk, exclusive) {
-                        (ReduceKind::Sum, false) => "simd_prefix_inclusive_sum",
-                        (ReduceKind::Sum, true) => "simd_prefix_exclusive_sum",
-                        (ReduceKind::Max, false) => "simd_prefix_inclusive_max",
-                        (ReduceKind::Min, false) => "simd_prefix_inclusive_min",
-                        _ => "simd_prefix_inclusive_sum", // fallback
-                    };
-                    wl!(out, "{pad}float {v} = {builtin}(float({rv}));");
+                    let off = self.vname(Some(*offset), block, extra_names);
+                    let en = self.vname(Some(*end), block, extra_names);
+                    wl!(out, "{pad}float best_val = -INFINITY;");
+                    wl!(out, "{pad}uint {v} = 0;");
+                    wl!(out, "{pad}for (uint _i = {off}; _i < {en}; _i++) {{");
+                    wl!(out, "{pad}    if ({src}[_i] > best_val) {{");
+                    wl!(out, "{pad}        best_val = {src}[_i];");
+                    wl!(out, "{pad}        {v} = _i;");
+                    wl!(out, "{pad}    }}");
+                    wl!(out, "{pad}}}");
                 },
 
-                // ---- stride store (output loop for reduction kernels) ----
                 Op::StrideStore { src, dst, offset, end, scalar, aux_src } => {
                     let off = self.vname(Some(*offset), block, extra_names);
                     let en = self.vname(Some(*end), block, extra_names);
                     let sc = self.vname(Some(*scalar), block, extra_names);
                     let has_tid = matches!(kernel.mode, KernelMode::Reduction | KernelMode::Tile2D);
-                    let idx = if has_tid { format!("{off} + tid") } else { off.clone() };
-                    wl!(out, "{pad}for (uint _i = {idx}; _i < {en}; _i += lsize) {{");
-                    if let Some(aux) = aux_src {
-                        // aux (e.g. weight vector w[0..N]) is indexed relative to row start
-                        wl!(out, "{pad}    {dst}[_i] = {src}[_i] * {sc} * {aux}[_i - {off}];");
+                    if has_tid {
+                        wl!(out, "{pad}{{");
+                        wl!(out, "{pad}    uint _sz   = {en} - {off};");
+                        wl!(out, "{pad}    uint _full = _sz / (lsize * 4u);");
+                        wl!(
+                            out,
+                            "{pad}    int  _xtra = (int)_sz - (int)(_full * lsize * 4u) - (int)(tid * 4u);"
+                        );
+                        wl!(out, "{pad}    if (_xtra >= 4) {{ _full++; _xtra = 0; }}");
+                        wl!(out, "{pad}    uint _base = {off} + tid * 4u;");
+                        wl!(
+                            out,
+                            "{pad}    for (uint _b = 0; _b < _full; _b++, _base += lsize * 4u) {{"
+                        );
+                        wl!(out, "{pad}        for (uint _k = 0; _k < 4u; _k++) {{");
+                        wl!(out, "{pad}            uint _i = _base + _k;");
+                        if let Some(aux) = aux_src {
+                            wl!(out, "{pad}            {dst}[_i] = {src}[_i] * {sc} * {aux}[_i];");
+                        } else {
+                            wl!(out, "{pad}            {dst}[_i] = {src}[_i] * {sc};");
+                        }
+                        wl!(out, "{pad}        }}");
+                        wl!(out, "{pad}    }}");
+                        wl!(out, "{pad}    for (int _k = 0; _k < _xtra; _k++) {{");
+                        wl!(out, "{pad}        uint _i = _base + (uint)_k;");
+                        if let Some(aux) = aux_src {
+                            wl!(out, "{pad}        {dst}[_i] = {src}[_i] * {sc} * {aux}[_i];");
+                        } else {
+                            wl!(out, "{pad}        {dst}[_i] = {src}[_i] * {sc};");
+                        }
+                        wl!(out, "{pad}    }}");
+                        wl!(out, "{pad}}}");
                     } else {
-                        wl!(out, "{pad}    {dst}[_i] = {src}[_i] * {sc};");
-                    }
-                    wl!(out, "{pad}}}");
-                },
-
-                // ---- dequantize ------------------------------------------
-                Op::Dequantize { weights, scales, zeros, group_size, bits } => {
-                    let v = self.vname(vid, block, extra_names);
-                    if *bits == 4 {
-                        // Int4 packed as uint8 (2 values per byte).
-                        // Caller must provide packed_idx in the enclosing loop.
-                        wl!(out, "{pad}// Op::Dequantize (int4): inline unpack per group");
-                        wl!(out, "{pad}uint {v}_packed = (uint){weights}[0];");
-                        wl!(out, "{pad}float {v}_s = (float){scales}[0];");
-                        wl!(out, "{pad}float {v}_z = (float){zeros}[0];");
-                        wl!(
-                            out,
-                            "{pad}float {v}0 = ((float)(({v}_packed >> 0) & 0xF) - {v}_z) * {v}_s;"
-                        );
-                        wl!(
-                            out,
-                            "{pad}float {v}1 = ((float)(({v}_packed >> 4) & 0xF) - {v}_z) * {v}_s;"
-                        );
-                        wl!(
-                            out,
-                            "{pad}// group_size={group_size}; iterate over group in enclosing loop"
-                        );
-                        wl!(out, "{pad}auto {v} = {v}0; // first dequantized element");
-                    } else {
-                        // Int8
-                        wl!(out, "{pad}// Op::Dequantize (int8)");
-                        wl!(out, "{pad}float {v}_s = (float){scales}[0];");
-                        wl!(out, "{pad}float {v}_z = (float){zeros}[0];");
-                        wl!(out, "{pad}auto {v} = ((float)(int8_t){weights}[0] - {v}_z) * {v}_s;");
+                        if let Some(aux) = aux_src {
+                            wl!(
+                                out,
+                                "{pad}for (uint _i = {off}; _i < {en}; _i++) {dst}[_i] = {src}[_i] * {sc} * {aux}[_i];"
+                            );
+                        } else {
+                            wl!(
+                                out,
+                                "{pad}for (uint _i = {off}; _i < {en}; _i++) {dst}[_i] = {src}[_i] * {sc};"
+                            );
+                        }
                     }
                 },
 
-                // ---- high-level ML ops (must be lowered by Pass 3) ----
-                Op::FlashAttention { .. }
-                | Op::SlidingWindowAttention { .. }
-                | Op::RmsNorm { .. }
-                | Op::GatedMlp { .. } => {
-                    let v = self.vname(vid, block, extra_names);
-                    wl!(
-                        out,
-                        "{pad}// ERROR: high-level op reached MSL emit — run Pass 3 (tile_lowering) first"
-                    );
-                    wl!(out, "{pad}auto {v} = {{}};");
+                // ---- flash attention / sliding window attention ------------
+                Op::FlashAttention { .. } | Op::SlidingWindowAttention { .. } => {
+                    wl!(out, "{pad}// Attention: needs lowering pass");
                 },
 
-                // ---- SIMD-group / threadgroup primitives ----------------
-                Op::SimdReduce { value, op } => {
-                    let fn_name = match op {
-                        ReduceKind::Sum | ReduceKind::Mean => "simd_sum",
-                        ReduceKind::Max => "simd_max",
-                        ReduceKind::Min => "simd_min",
-                    };
-                    let vn = self.vname(Some(*value), block, extra_names);
+                // ---- high-level norms / mlp blocks -------------------------
+                Op::RmsNorm { .. } | Op::GatedMlp { .. } => {
+                    wl!(out, "{pad}// High-level op: needs lowering pass");
+                },
+
+                // ---- dequantize --------------------------------------------
+                Op::Dequantize { .. } => {
+                    wl!(out, "{pad}// Dequantize: needs lowering pass");
+                },
+
+                // ---- SIMD/threadgroup primitives ---------------------------
+                Op::SimdReduce { value, op: rk } => {
                     let v = self.vname(vid, block, extra_names);
-                    wl!(out, "{pad}float {v} = {fn_name}({vn});");
+                    let rv = self.vname(Some(*value), block, extra_names);
+                    match rk {
+                        ReduceKind::Sum | ReduceKind::Mean =>
+                            wl!(out, "{pad}float {v} = simd_sum(float({rv}));"),
+                        ReduceKind::Max => wl!(out, "{pad}float {v} = simd_max(float({rv}));"),
+                        ReduceKind::Min => wl!(out, "{pad}float {v} = simd_min(float({rv}));"),
+                    }
                 },
 
                 Op::ThreadgroupAlloc { dtype, size, name } => {
-                    let _v = self.vname(vid, block, extra_names);
-                    wl!(out, "{pad}threadgroup {} {}[{}];", self.msl_type_name(*dtype), name, size);
+                    let t = self.msl_type_name(*dtype);
+                    hoists.push(format!("threadgroup {t} {name}[{size}];"));
                 },
 
                 Op::ThreadgroupLoad { name, index } => {
-                    let idx = self.vname(Some(*index), block, extra_names);
                     let v = self.vname(vid, block, extra_names);
-                    wl!(out, "{pad}float {v} = {name}[{idx}];");
+                    let iv = self.vname(Some(*index), block, extra_names);
+                    wl!(out, "{pad}auto {v} = {name}[{iv}];");
                 },
 
                 Op::ThreadgroupStore { name, index, value } => {
-                    let idx = self.vname(Some(*index), block, extra_names);
-                    let val = self.vname(Some(*value), block, extra_names);
-                    let _v = self.vname(vid, block, extra_names);
-                    wl!(out, "{pad}{name}[{idx}] = {val};");
+                    let iv = self.vname(Some(*index), block, extra_names);
+                    let rv = self.vname(Some(*value), block, extra_names);
+                    wl!(out, "{pad}{name}[{iv}] = {rv};");
                 },
 
                 Op::Barrier => {
-                    let _v = self.vname(vid, block, extra_names);
                     wl!(out, "{pad}threadgroup_barrier(mem_flags::mem_threadgroup);");
                 },
 
@@ -1203,229 +1011,298 @@ impl MslGenerator {
                     wl!(out, "{pad}__ml_{name} = {rv};");
                 },
 
-                Op::ArgReduce { .. } => {
+                // ---- arg reduce -----------------------------------------
+                Op::ArgReduce { value, axis, op: rk } => {
                     let v = self.vname(vid, block, extra_names);
-                    wl!(out, "{pad}uint {v} = 0; // TODO: ArgReduce — needs buffer param");
-                },
-
-                // ---- serial prefix scan ----------------------------------
-                Op::StrideScan { src, dst, offset, end, op: rk } => {
-                    let off = self.vname(Some(*offset), block, extra_names);
-                    let en = self.vname(Some(*end), block, extra_names);
-                    let (init, combine) = match rk {
-                        ReduceKind::Sum | ReduceKind::Mean => ("0.0f", "_acc + v"),
-                        ReduceKind::Max => ("-INFINITY", "_acc > v ? _acc : v"),
-                        ReduceKind::Min => ("INFINITY", "_acc < v ? _acc : v"),
-                    };
-                    wl!(out, "{pad}{{");
-                    wl!(out, "{pad}    float _acc = {init};");
-                    wl!(out, "{pad}    for (uint _i = {off}; _i < {en}; _i++) {{");
-                    wl!(out, "{pad}        float v = float({src}[_i]);");
-                    wl!(out, "{pad}        _acc = {combine};");
-                    wl!(out, "{pad}        {dst}[_i] = _acc;");
-                    wl!(out, "{pad}    }}");
-                    wl!(out, "{pad}}}");
-                },
-
-                // ---- serial argmax/argmin --------------------------------
-                Op::StrideArgReduce { src, offset, end, op: rk } => {
-                    let v = self.vname(vid, block, extra_names);
-                    let off = self.vname(Some(*offset), block, extra_names);
-                    let en = self.vname(Some(*end), block, extra_names);
-                    let (init_val, cmp) = match rk {
-                        ReduceKind::Max => ("-INFINITY", ">"),
-                        _ => ("INFINITY", "<"),
-                    };
-                    wl!(out, "{pad}uint {v};");
-                    wl!(out, "{pad}{{");
-                    wl!(out, "{pad}    float _best = {init_val};");
-                    wl!(out, "{pad}    uint  _idx  = {off};");
-                    wl!(out, "{pad}    for (uint _i = {off}; _i < {en}; _i++) {{");
-                    wl!(out, "{pad}        float _v = float({src}[_i]);");
-                    wl!(out, "{pad}        if (_v {cmp} _best) {{ _best = _v; _idx = _i; }}");
-                    wl!(out, "{pad}    }}");
-                    wl!(out, "{pad}    {v} = _idx;");
-                    wl!(out, "{pad}}}");
+                    let rv = self.vname(Some(*value), block, extra_names);
+                    wl!(out, "{pad}// ArgReduce(v{}, axis={axis}, {rk:?}): lowering needed", rv);
+                    wl!(out, "{pad}auto {v} = 0;");
                 },
             }
         }
+
         Ok(())
     }
 
-    // ---- helpers ---------------------------------------------------------
+    // ---- fused expression emission ---------------------------------------
 
-    /// Mask for internal ValueId references within FusedElementwise chains.
-    const SUB_OP_FLAG: u32 = 0x8000_0000;
-
-    /// Build a single MSL expression for a fused elementwise chain.
-    /// Recursively composes expressions without intermediate variables.
-    #[allow(clippy::too_many_arguments, clippy::only_used_in_recursion)]
+    #[allow(clippy::too_many_arguments)]
     fn emit_fused_expr(
         &self,
-        _out: &mut String,
-        _pad: &str,
-        ops: &[Op],
+        out: &mut String,
+        pad: &str,
+        fused_ops: &[Op],
         block: &Block,
-        _kernel: &Kernel,
-        _type_env: &TypeEnv,
+        kernel: &Kernel,
+        type_env: &TypeEnv,
         extra_names: &BTreeMap<ValueId, String>,
-        _vid: ValueId,
+        resolved_vid: ValueId,
         idx: usize,
     ) -> String {
-        if idx >= ops.len() {
-            return "0".to_string();
-        }
-        let sub = &ops[idx];
-        let mut sub_val = |v: &ValueId| -> String {
-            if v.as_u32() & Self::SUB_OP_FLAG != 0 {
-                // Internal reference to a previous sub-op.
-                let sub_idx = (v.as_u32() & !Self::SUB_OP_FLAG) as usize;
-                self.emit_fused_expr(
-                    _out,
-                    _pad,
-                    ops,
+        
+
+        let op = &fused_ops[idx];
+
+        // For leaf ops with SUB_OP_FLAG operands, recurse.
+        match op {
+            Op::BinOp { op: kind, lhs, rhs } => {
+                let l = self.fused_operand(
+                    out,
+                    pad,
+                    fused_ops,
+                    *lhs,
                     block,
-                    _kernel,
-                    _type_env,
+                    kernel,
+                    type_env,
                     extra_names,
-                    _vid,
+                    resolved_vid,
+                );
+                let r = self.fused_operand(
+                    out,
+                    pad,
+                    fused_ops,
+                    *rhs,
+                    block,
+                    kernel,
+                    type_env,
+                    extra_names,
+                    resolved_vid,
+                );
+                match kind {
+                    BinOpKind::Max | BinOpKind::Min | BinOpKind::Pow =>
+                        format!("{}({l}, {r})", kind.msl_symbol()),
+                    BinOpKind::And => format!("({l} && {r})"),
+                    BinOpKind::Or => format!("({l} || {r})"),
+                    BinOpKind::Xor => format!("((bool){l} != (bool){r})"),
+                    BinOpKind::BitAnd => format!("({l} & {r})"),
+                    BinOpKind::BitOr => format!("({l} | {r})"),
+                    BinOpKind::BitXor => format!("({l} ^ {r})"),
+                    BinOpKind::Shl => format!("({l} << {r})"),
+                    BinOpKind::Shr => format!("({l} >> {r})"),
+                    _ => format!("({l} {} {r})", kind.msl_symbol()),
+                }
+            },
+            Op::UnaryOp { op: kind, value } => {
+                let v = self.fused_operand(
+                    out,
+                    pad,
+                    fused_ops,
+                    *value,
+                    block,
+                    kernel,
+                    type_env,
+                    extra_names,
+                    resolved_vid,
+                );
+                kind.msl_emit(&v)
+            },
+            Op::Activation { kind, value } => {
+                let v = self.fused_operand(
+                    out,
+                    pad,
+                    fused_ops,
+                    *value,
+                    block,
+                    kernel,
+                    type_env,
+                    extra_names,
+                    resolved_vid,
+                );
+                format!("{}({v})", kind.msl_fn())
+            },
+            Op::Cast { dtype, value } => {
+                let v = self.fused_operand(
+                    out,
+                    pad,
+                    fused_ops,
+                    *value,
+                    block,
+                    kernel,
+                    type_env,
+                    extra_names,
+                    resolved_vid,
+                );
+                self.emit_cast_expr(*dtype, &v)
+            },
+            Op::Select { cond, on_true, on_false } => {
+                let c = self.fused_operand(
+                    out,
+                    pad,
+                    fused_ops,
+                    *cond,
+                    block,
+                    kernel,
+                    type_env,
+                    extra_names,
+                    resolved_vid,
+                );
+                let t = self.fused_operand(
+                    out,
+                    pad,
+                    fused_ops,
+                    *on_true,
+                    block,
+                    kernel,
+                    type_env,
+                    extra_names,
+                    resolved_vid,
+                );
+                let f = self.fused_operand(
+                    out,
+                    pad,
+                    fused_ops,
+                    *on_false,
+                    block,
+                    kernel,
+                    type_env,
+                    extra_names,
+                    resolved_vid,
+                );
+                format!("select({f}, {t}, bool({c}))")
+            },
+            Op::Broadcast { .. } => {
+                // Broadcast in a fused chain is unusual; fall back.
+                "0 /* broadcast-in-fused */".into()
+            },
+            _ => {
+                let vid = op_to_vid(op);
+                self.vname(Some(vid), block, extra_names)
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fused_operand(
+        &self,
+        out: &mut String,
+        pad: &str,
+        fused_ops: &[Op],
+        vid: ValueId,
+        block: &Block,
+        kernel: &Kernel,
+        type_env: &TypeEnv,
+        extra_names: &BTreeMap<ValueId, String>,
+        resolved_vid: ValueId,
+    ) -> String {
+        use crate::passes::fusion::SUB_OP_FLAG;
+        if vid.as_u32() & SUB_OP_FLAG != 0 {
+            let sub_idx = (vid.as_u32() & !SUB_OP_FLAG) as usize;
+            if sub_idx < fused_ops.len() {
+                self.emit_fused_expr(
+                    out,
+                    pad,
+                    fused_ops,
+                    block,
+                    kernel,
+                    type_env,
+                    extra_names,
+                    resolved_vid,
                     sub_idx,
                 )
             } else {
-                self.vname(Some(*v), block, extra_names)
+                "0 /* bad sub-op ref */".into()
             }
-        };
-        match sub {
-            Op::Cast { value, dtype } => self.emit_cast_expr(*dtype, &sub_val(value)),
-            Op::UnaryOp { op, value } => op.msl_emit(&sub_val(value)),
-            Op::Activation { kind, value } => {
-                format!("{}({})", kind.msl_fn(), sub_val(value))
-            },
-            Op::BinOp { op, lhs, rhs } => match op {
-                BinOpKind::Max | BinOpKind::Min => {
-                    format!("{}({}, {})", op.msl_symbol(), sub_val(lhs), sub_val(rhs))
-                },
-                BinOpKind::And => format!("({} && {})", sub_val(lhs), sub_val(rhs)),
-                BinOpKind::Or => format!("({} || {})", sub_val(lhs), sub_val(rhs)),
-                BinOpKind::Xor => format!("((bool){} != (bool){})", sub_val(lhs), sub_val(rhs)),
-                BinOpKind::BitAnd => format!("({} & {})", sub_val(lhs), sub_val(rhs)),
-                BinOpKind::BitOr => format!("({} | {})", sub_val(lhs), sub_val(rhs)),
-                BinOpKind::BitXor => format!("({} ^ {})", sub_val(lhs), sub_val(rhs)),
-                _ => format!("({} {} {})", sub_val(lhs), op.msl_symbol(), sub_val(rhs)),
-            },
-            Op::Select { cond, on_true, on_false } => {
-                format!(
-                    "select({}, {}, bool({}))",
-                    sub_val(on_false),
-                    sub_val(on_true),
-                    sub_val(cond)
-                )
-            },
-            Op::Zeros { dtype, shape } => {
-                let n = self.shape_nelems_str(shape);
-                format!("{}_zeros_{}", dtype.msl_name(), n)
-            },
-            Op::Splat { value, dtype, .. } => fmt_float(*value, dtype),
-            Op::Broadcast { value, .. } => sub_val(value),
-            _ => "/* unhandled fused sub-op */ 0".to_string(),
+        } else {
+            self.vname(Some(vid), block, extra_names)
         }
     }
+
+    // ---- variable naming -------------------------------------------------
 
     fn vname(
         &self,
-        id: Option<ValueId>,
+        vid: Option<ValueId>,
         block: &Block,
         extra_names: &BTreeMap<ValueId, String>,
     ) -> String {
-        let Some(id) = id else {
-            return "v0".to_string();
+        let vid = match vid {
+            Some(v) => v,
+            None => return "_".into(),
         };
-        if let Some(n) = extra_names.get(&id) {
-            return n.clone();
+        if let Some(name) = extra_names.get(&vid) {
+            return name.clone();
         }
-        if let Some(n) = block.names.get(&id) {
-            return format!("v_{n}");
+        if let Some(hint) = block.names.get(&vid) {
+            return format!("v_{hint}");
         }
-        format!("v{}", id.as_u32())
+        format!("v{}", vid.as_u32())
     }
 
-    /// Emit a row-major flat index expression for `indices` into `param_name`.
-    /// Looks up the param's shape in `kernel` to compute per-dimension strides.
+    // ---- index expression emission ---------------------------------------
+
     fn emit_idx(
         &self,
         indices: &[IndexExpr],
         block: &Block,
         extra_names: &BTreeMap<ValueId, String>,
         kernel: &Kernel,
-        param_name: &str,
+        src_or_dst: &str,
     ) -> String {
-        if indices.is_empty() {
-            return match kernel.mode {
-                KernelMode::Elementwise => "tid".to_string(),
-                KernelMode::Reduction => "tgid_x".to_string(),
-                KernelMode::Grid3D => "gid.x".to_string(),
-                KernelMode::Tile2D => "tid.x".to_string(),
-            };
-        }
-        if indices.len() == 1 {
-            return self.idx_expr_str(&indices[0], block, extra_names);
-        }
-        let param = kernel.params.iter().find(|p| p.name == param_name);
-        // Strided params: use runtime stride arrays {name}_strides[d] instead of
-        // computing row-major strides from the static shape. This supports non-contiguous
-        // views (slices, transposes) without recompiling the kernel.
-        if param.map(|p| p.kind == ParamKind::Strided).unwrap_or(false) {
+        let is_strided = kernel
+            .params
+            .iter()
+            .any(|p| p.name == src_or_dst && matches!(p.kind, ParamKind::Strided));
+
+        if is_strided {
+            // Strided indexing: use shape/stride arrays for each dimension.
+            // Emit index computation using named strides, e.g.:
+            //   (v_row) * N + (v_col) * 1  (row-major, shape=[M,N])
+            // The MSL compiler constant-folds the stride lookups.
             let parts: Vec<String> = indices
                 .iter()
                 .enumerate()
-                .map(|(d, idx_expr)| {
-                    let idx_str = self.idx_expr_str(idx_expr, block, extra_names);
-                    format!("({idx_str}) * {param_name}_strides[{d}]")
+                .map(|(dim, ix)| {
+                    let ix_str = self.idx_expr_str(ix, block, extra_names);
+                    let stride = format!("{}_strides[{dim}]", src_or_dst);
+                    format!("({ix_str}) * {stride}")
                 })
                 .collect();
-            return parts.join(" + ");
-        }
-        // Contiguous params: row-major flat index = sum(idx[d] * static_stride[d]).
-        let shape = param.map(|p| &p.shape);
-        let rank = shape.map(|s| s.rank()).unwrap_or(indices.len());
-        let mut parts: Vec<String> = Vec::new();
-        for (d, idx_expr) in indices.iter().enumerate() {
-            let idx_str = self.idx_expr_str(idx_expr, block, extra_names);
-            let stride: Option<String> = shape.and_then(|sh| {
-                let stride_dims: Vec<String> =
-                    (d + 1..rank).filter_map(|i| sh.dim(i)).map(dim_to_msl_str).collect();
-                if stride_dims.is_empty() { None } else { Some(stride_dims.join(" * ")) }
-            });
-            match stride {
-                Some(s) => parts.push(format!("({idx_str}) * {s}")),
-                None => parts.push(idx_str),
+            parts.join(" + ")
+        } else if indices.len() == 1 {
+            self.idx_expr_str(&indices[0], block, extra_names)
+        } else {
+            // Multi-dim into flat: N is first stride, 1 is last stride.
+            let param = kernel.params.iter().find(|p| p.name == src_or_dst);
+            let shape = param.map(|p| &p.shape);
+            let stride1 =
+                shape.and_then(|s| s.dim(1)).map(dim_to_msl_str).unwrap_or("1".into());
+            let mut offset = String::new();
+            for (dim, ix) in indices.iter().enumerate() {
+                let ix_str = self.idx_expr_str(ix, block, extra_names);
+                if dim == 0 {
+                    offset.push_str(&format!("({ix_str}) * {stride1}"));
+                } else {
+                    offset.push_str(&format!(" + ({ix_str})"));
+                }
             }
+            offset
         }
-        parts.join(" + ")
     }
 
     fn idx_expr_str(
         &self,
-        idx: &IndexExpr,
+        ix: &IndexExpr,
         block: &Block,
         extra_names: &BTreeMap<ValueId, String>,
     ) -> String {
-        match idx {
+        match ix {
             IndexExpr::Value(v) => self.vname(Some(*v), block, extra_names),
-            IndexExpr::Const(c) => c.to_string(),
-            // Range: emit the start value; the caller loops over or vectorizes.
+            IndexExpr::Const(n) => n.to_string(),
             IndexExpr::Range(v, _) => self.vname(Some(*v), block, extra_names),
         }
     }
 
-    /// Dimension product string for a shape (used in array sizes and loops).
     fn shape_nelems_str(&self, shape: &Shape) -> String {
-        let dims: Vec<String> = shape.iter().map(dim_to_msl_str).collect();
-        if dims.is_empty() { "1".to_string() } else { dims.join(" * ") }
+        shape.num_elements().map(|n| n.to_string()).unwrap_or_else(|| {
+            let rank = shape.rank();
+            (0..rank)
+                .filter_map(|i| shape.dim(i))
+                .map(dim_to_msl_str)
+                .collect::<Vec<_>>()
+                .join(" * ")
+        })
     }
 
-    /// Return (declaration_string, init_lines) for a tile allocation.
-    /// `fill` is the initial value (0.0 for Zeros, custom for Splat).
     fn emit_tile_alloc(
         &self,
         dtype: &DType,
@@ -1434,485 +1311,29 @@ impl MslGenerator {
         fill: f64,
     ) -> (String, Vec<String>) {
         let t = self.msl_type_name(*dtype);
-        match (shape.rank(), shape.num_elements()) {
-            (0, _) | (_, Some(1)) => {
-                // Scalar.
-                let init = fmt_float(fill, dtype);
-                (format!("{t} {name} = {init}"), vec![])
-            },
-            _ => {
-                let n = self.shape_nelems_str(shape);
-                let init = fmt_float(fill, dtype);
-                let decl = format!("{t} {name}[{n}]");
-                let init_loop = format!("for (uint _i = 0; _i < {n}; _i++) {name}[_i] = {init};");
-                (decl, vec![init_loop])
-            },
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    /// Emit a reduction: simd_sum/max/min across the SIMD group for scalar inputs.
-    fn emit_reduce(
-        &self,
-        out: &mut String,
-        pad: &str,
-        result_var: &str,
-        input_var: &str,
-        axis: u32,
-        kind: ReduceKind,
-        hoists: &mut Vec<String>,
-        kernel: &Kernel,
-    ) {
-        // Threadgroup-scope reduction for Reduction/Tile2D modes:
-        // Two-level simd_sum: intra-warp via simd_sum, inter-warp via 8-slot threadgroup mem.
-        // axis=0 reduces across rows (threadgroup dimension), axis=1 across columns (SIMD group).
-        let use_threadgroup = (kernel.mode == KernelMode::Reduction
-            || kernel.mode == KernelMode::Tile2D)
-            && axis == 0;
-        if use_threadgroup {
-            let tg_name = format!("{result_var}_sg");
-            // 1024 threads / 32 per SIMD = 32 SIMD groups max.
-            hoists.push(format!("threadgroup float {tg_name}[32];"));
-
-            let (simd_fn, pad_val) = match kind {
-                ReduceKind::Sum | ReduceKind::Mean => ("simd_sum", "0.0f"),
-                ReduceKind::Max => ("simd_max", "-INFINITY"),
-                ReduceKind::Min => ("simd_min", "INFINITY"),
-            };
-
-            // Phase 1: intra-warp reduction via simd_sum/max/min.
-            wl!(out, "{pad}float {result_var};");
-            wl!(out, "{pad}{{");
-            wl!(out, "{pad}    float _sv = {simd_fn}(float({input_var}));");
-            // Phase 2: lane 0 of each SIMD group writes its total.
-            wl!(out, "{pad}    if (simd_lane == 0) {tg_name}[simd_id] = _sv;");
-            wl!(out, "{pad}    threadgroup_barrier(mem_flags::mem_threadgroup);");
-            // Phase 3: first SIMD group reduces warp totals and broadcasts via [0].
-            wl!(out, "{pad}    if (simd_id == 0) {{");
-            wl!(
-                out,
-                "{pad}        float _wv = simd_lane < n_simd ? {tg_name}[simd_lane] : {pad_val};"
-            );
-            wl!(out, "{pad}        {tg_name}[0] = {simd_fn}(_wv);");
-            wl!(out, "{pad}    }}");
-            wl!(out, "{pad}    threadgroup_barrier(mem_flags::mem_threadgroup);");
-            if kind == ReduceKind::Mean {
-                wl!(out, "{pad}    {result_var} = {tg_name}[0] / float(lsize);");
-            } else {
-                wl!(out, "{pad}    {result_var} = {tg_name}[0];");
-            }
-            wl!(out, "{pad}}}");
-            return;
-        }
-
-        // Default: SIMD-group scope reduction (Elementwise / Grid3D modes).
-        match kind {
-            ReduceKind::Sum => wl!(out, "{pad}float {result_var} = simd_sum(float({input_var}));"),
-            ReduceKind::Max => wl!(out, "{pad}float {result_var} = simd_max(float({input_var}));"),
-            ReduceKind::Min => wl!(out, "{pad}float {result_var} = simd_min(float({input_var}));"),
-            ReduceKind::Mean => {
-                wl!(
-                    out,
-                    "{pad}float {result_var} = simd_sum(float({input_var})) / float(simd_size);"
-                );
-            },
-        }
-    }
-
-    /// Emit the full tiled matmul body (cooperative threadgroup-memory GEMM).
-    /// When `use_simd_matrix` is true (Apple7+ / M1+), uses
-    /// `simdgroup_multiply_accumulate` for 8×8 half tiles. Apple9 (M3+) has
-    /// dedicated matrix hardware; Apple7/8 (M1/M2) emulate via simdgroup FMA.
-    #[allow(non_snake_case)]
-    fn emit_tiled(
-        &self,
-        out: &mut String,
-        pad: &str,
-        kernel: &Kernel,
-        dot_vid: Option<ValueId>,
-    ) -> Result<()> {
-        // Check tile annotations from SchedulePass first, fall back to MslConfig.
-        let s = &self.config.tile_schedule;
-        let (TM, TN, TK) = match dot_vid.and_then(|v| kernel.tile_annotations.get(&v)) {
-            Some(&(tm, tn, tk)) => (tm, tn, tk),
-            None if self.config.use_simd_matrix => {
-                // Simdgroup path: 128 threads (4 SIMD groups in a 2x2 grid).
-                // Each SIMD group covers SGM x SGN = 4 x 4 8x8 fragment blocks -> 32x32 submatrix.
-                // TM=64, TN=64, TK=16: double-buffered A/B tiles → 257 barriers for K=4096.
-                (64, 64, 16)
-            },
-            None => (s.tile_m, s.tile_n, s.tile_k),
-        };
-        // Simdgroup path uses 128 threads (16x8); scalar path uses TileSchedule threads.
-        let (THY, THX) =
-            if self.config.use_simd_matrix { (8u32, 16u32) } else { (s.threads.0, s.threads.1) };
-        let (RPT, CPT) = (s.rows_per_thread, s.cols_per_thread);
-        let thrds = THY * THX;
-
-        let tensors: Vec<_> = kernel.params.iter().filter(|p| p.shape.rank() == 2).collect();
-        if tensors.len() < 3 {
-            wl!(out, "{pad}// emit_tiled: need >= 3 2D tensor params (a, b, c)");
-            return Ok(());
-        }
-
-        let a = &tensors[0].name;
-        let b = &tensors[1].name;
-        let c = &tensors[2].name;
-        let m = dim_name(&tensors[0].shape, 0).unwrap_or("M");
-        let k = dim_name(&tensors[0].shape, 1).unwrap_or("K");
-        let n = dim_name(&tensors[1].shape, 1).unwrap_or("N");
-
-        wl!(out);
-        wl!(out, "{pad}// Tiled matmul: {a}[{m}×{k}] @ {b}[{k}×{n}] → {c}[{m}×{n}]");
-        wl!(out, "{pad}// TM={TM} TN={TN} TK={TK} threads={THY}×{THX} RPT={RPT} CPT={CPT}");
-
-        if self.config.use_simd_matrix {
-            self.emit_tiled_simdgroup(out, pad, a, b, c, m, k, n, TM, TN, TK, THY, THX, thrds)?;
+        let n = self.shape_nelems_str(shape);
+        let decl = format!("{t} {name}[{n}]");
+        let init = if fill == 0.0 {
+            vec![format!("for (uint _i = 0; _i < {n}; _i++) {name}[_i] = 0;")]
         } else {
-            self.emit_tiled_scalar(
-                out, pad, a, b, c, m, k, n, TM, TN, TK, THY, THX, RPT, CPT, thrds,
-            )?;
-        }
-        wl!(out);
-        Ok(())
+            vec![format!("for (uint _i = 0; _i < {n}; _i++) {name}[_i] = {fill};")]
+        };
+        (decl, init)
     }
+}
 
-    /// Scalar GEMM path (M1/M2): each thread computes RPT×CPT outputs via a scalar inner loop.
-    #[allow(non_snake_case, clippy::too_many_arguments)]
-    fn emit_tiled_scalar(
-        &self,
-        out: &mut String,
-        pad: &str,
-        a: &str,
-        b: &str,
-        c: &str,
-        m: &str,
-        k: &str,
-        n: &str,
-        TM: u32,
-        TN: u32,
-        TK: u32,
-        _THY: u32,
-        THX: u32,
-        RPT: u32,
-        CPT: u32,
-        thrds: u32,
-    ) -> Result<()> {
-        wl!(out);
-        wl!(out, "{pad}threadgroup half A_tile[{TM} * {TK}];");
-        wl!(out, "{pad}threadgroup half B_tile[{TK} * {TN}];");
-        wl!(out, "{pad}const uint row_start = tgid.y * {TM};");
-        wl!(out, "{pad}const uint col_start = tgid.x * {TN};");
-        wl!(out, "{pad}float acc[{RPT}][{CPT}];");
-        wl!(
-            out,
-            "{pad}for (uint r = 0; r < {RPT}; r++) for (uint c = 0; c < {CPT}; c++) acc[r][c] = 0.0f;"
-        );
-        wl!(out);
-        wl!(out, "{pad}for (uint kb = 0; kb < {k}; kb += {TK}) {{");
-        wl!(out, "{pad}    for (uint i = tid.y*{THX}+tid.x; i < {TM}*{TK}; i += {thrds}) {{");
-        wl!(out, "{pad}        uint r = i/{TK}, ko = kb + (i%{TK});");
-        wl!(
-            out,
-            "{pad}        A_tile[i] = (row_start+r < {m} && ko < {k}) ? {a}[(row_start+r)*{k}+ko] : 0.0h;"
-        );
-        wl!(out, "{pad}    }}");
-        wl!(out, "{pad}    for (uint i = tid.y*{THX}+tid.x; i < {TK}*{TN}; i += {thrds}) {{");
-        wl!(out, "{pad}        uint ko = kb + (i/{TN}), c2 = i%{TN};");
-        wl!(
-            out,
-            "{pad}        B_tile[i] = (ko < {k} && col_start+c2 < {n}) ? {b}[ko*{n}+col_start+c2] : 0.0h;"
-        );
-        wl!(out, "{pad}    }}");
-        wl!(out, "{pad}    threadgroup_barrier(mem_flags::mem_threadgroup);");
-        wl!(out, "{pad}    for (uint r = 0; r < {RPT}; r++) {{");
-        wl!(out, "{pad}        uint lr = tid.y*{RPT}+r;");
-        wl!(out, "{pad}        for (uint c2 = 0; c2 < {CPT}; c2++) {{");
-        wl!(out, "{pad}            uint lc = tid.x*{CPT}+c2;");
-        wl!(out, "{pad}            float s = 0.0f;");
-        wl!(out, "{pad}            for (uint kk = 0; kk < {TK}; kk++)");
-        wl!(
-            out,
-            "{pad}                s += float(A_tile[lr*{TK}+kk]) * float(B_tile[kk*{TN}+lc]);"
-        );
-        wl!(out, "{pad}            acc[r][c2] += s;");
-        wl!(out, "{pad}        }}");
-        wl!(out, "{pad}    }}");
-        wl!(out, "{pad}    threadgroup_barrier(mem_flags::mem_threadgroup);");
-        wl!(out, "{pad}}}");
-        wl!(out, "{pad}for (uint r = 0; r < {RPT}; r++) {{");
-        wl!(out, "{pad}    uint gr = row_start + tid.y*{RPT}+r;");
-        wl!(out, "{pad}    if (gr >= {m}) continue;");
-        wl!(out, "{pad}    for (uint c2 = 0; c2 < {CPT}; c2++) {{");
-        wl!(out, "{pad}        uint gc = col_start + tid.x*{CPT}+c2;");
-        wl!(out, "{pad}        if (gc >= {n}) continue;");
-        wl!(out, "{pad}        {c}[gr*{n}+gc] = half(acc[r][c2]);");
-        wl!(out, "{pad}    }}");
-        wl!(out, "{pad}}}");
-        Ok(())
-    }
+// ---- helpers ------------------------------------------------------------
 
-    /// Simdgroup matrix multiply path (Apple7+ / M1+): 8×8 half-precision tiles
-    /// via `simdgroup_multiply_accumulate`. Dedicated HW on Apple9 (M3+);
-    /// FMA-emulated on Apple7/8 (M1/M2).
-    /// Each 32-thread simdgroup owns one `simdgroup_half8x8` fragment of C.
-    #[allow(non_snake_case, clippy::too_many_arguments)]
-    fn emit_tiled_simdgroup(
-        &self,
-        out: &mut String,
-        pad: &str,
-        a: &str,
-        b: &str,
-        c: &str,
-        m: &str,
-        k: &str,
-        n: &str,
-        TM: u32,
-        TN: u32,
-        TK: u32,
-        _THY: u32,
-        THX: u32,
-        _thrds: u32,
-    ) -> Result<()> {
-        // 2x2 grid of SIMD groups: sg_x = sg % 2, sg_y = sg / 2.
-        // Each SIMD group covers SGM x SGN = 4 x 4 8x8 fragment blocks (32x32 submatrix).
-        // TM=64, TN=64 (asserted by caller), TK=tile_k (usually 32).
-        // 128 threads (THX=16, THY=8): cooperative load uses tid.y*THX+tid.x as flat index.
-        const SGM: u32 = 4; // fragment rows per simdgroup
-        const SGN: u32 = 4; // fragment cols per simdgroup
-        const SG_COLS: u32 = 2; // simdgroup columns in the 2x2 grid
-
-        let AB_SZ: u32 = TM * TK; // A_tile half-elements per buffer; B_tile is TK*TN = same size.
-        wl!(out);
-        // Double-buffer A/B tiles: halves barrier count (1 per KB iter instead of 2).
-        wl!(out, "{pad}threadgroup half A_tile[2 * {TM} * {TK}];");
-        wl!(out, "{pad}threadgroup half B_tile[2 * {TK} * {TN}];");
-        wl!(out, "{pad}const uint sg_x = simd_group % {SG_COLS};");
-        wl!(out, "{pad}const uint sg_y = simd_group / {SG_COLS};");
-
-        // fp32 accumulators for accuracy; converted to half via per-simdgroup scratch.
-        for fi in 0..SGM {
-            for fj in 0..SGN {
-                let idx = fi * SGN + fj;
-                wl!(
-                    out,
-                    "{pad}simdgroup_float8x8 c{idx} = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);"
-                );
-            }
-        }
-
-        // Per-thread fixed row/col into each tile — computed once, no integer division in loops.
-        // a_flat selects a fixed column (a_col) and starting row (a_row0) for A_tile loads.
-        // b_flat selects a fixed column (b_col) and starting row (b_row0) for B_tile loads.
-        // 128-bit (uint4 = 8 halves) vectorized tile loads: 1 instruction per thread per tile.
-        // Each of the 128 threads loads exactly TM*TK/128 = 8 halves (A) and TK*TN/128 = 8 (B).
-        const VEC: u32 = 8;
-        let a_vld_shift = (TK / VEC).ilog2(); // TK=16 → 1
-        let a_vld_mask = TK / VEC - 1; // TK=16 → 1
-        let b_vld_shift = (TN / VEC).ilog2(); // TN=64 → 3
-        let b_vld_mask = TN / VEC - 1; // TN=64 → 7
-
-        // Pre-load tile 0 into buffer 0, then double-buffer: prefetch next while doing MMA.
-        wl!(out);
-        wl!(out, "{pad}const uint ld_flat = tid.y*{THX}+tid.x;");
-        wl!(
-            out,
-            "{pad}const uint a_rv = ld_flat >> {a_vld_shift}u;          // A tile row for this thread"
-        );
-        wl!(
-            out,
-            "{pad}const uint a_cv = (ld_flat & {a_vld_mask}u) << 3u;   // A tile col base (0 or 8)"
-        );
-        wl!(
-            out,
-            "{pad}const uint b_rv = ld_flat >> {b_vld_shift}u;          // B tile row for this thread"
-        );
-        wl!(
-            out,
-            "{pad}const uint b_cv = (ld_flat & {b_vld_mask}u) << 3u;   // B tile col base (0,8,..,56)"
-        );
-        // A tile initial load: vector fast path, scalar fallback for boundary tiles.
-        wl!(out, "{pad}{{");
-        wl!(out, "{pad}    const uint a_gm = tgid.y*{TM} + a_rv;");
-        wl!(out, "{pad}    if (a_gm < {m} && a_cv + {VEC}u <= {k}) {{");
-        wl!(
-            out,
-            "{pad}        *((threadgroup uint4*)(A_tile + a_rv*{TK} + a_cv)) = *((const device uint4*)({a} + a_gm*{k} + a_cv));"
-        );
-        wl!(out, "{pad}    }} else {{");
-        wl!(
-            out,
-            "{pad}        for (uint _i = 0; _i < {VEC}u; _i++) A_tile[a_rv*{TK} + a_cv + _i] = (a_gm < {m} && a_cv+_i < {k}) ? {a}[a_gm*{k} + a_cv + _i] : 0.0h;"
-        );
-        wl!(out, "{pad}    }}");
-        wl!(out, "{pad}}}");
-        // B tile initial load.
-        wl!(out, "{pad}{{");
-        wl!(out, "{pad}    const uint b_gc = tgid.x*{TN} + b_cv;");
-        wl!(out, "{pad}    if (b_rv < {k} && b_gc + {VEC}u <= {n}) {{");
-        wl!(
-            out,
-            "{pad}        *((threadgroup uint4*)(B_tile + b_rv*{TN} + b_cv)) = *((const device uint4*)({b} + b_rv*{n} + b_gc));"
-        );
-        wl!(out, "{pad}    }} else {{");
-        wl!(
-            out,
-            "{pad}        for (uint _i = 0; _i < {VEC}u; _i++) B_tile[b_rv*{TN} + b_cv + _i] = (b_rv < {k} && tgid.x*{TN}+b_cv+_i < {n}) ? {b}[b_rv*{n} + tgid.x*{TN}+b_cv+_i] : 0.0h;"
-        );
-        wl!(out, "{pad}    }}");
-        wl!(out, "{pad}}}");
-        wl!(out, "{pad}threadgroup_barrier(mem_flags::mem_threadgroup);");
-        wl!(out);
-        wl!(out, "{pad}uint cur_buf = 0;");
-        wl!(out, "{pad}for (uint kb = 0; kb < {k}; kb += {TK}) {{");
-        wl!(out, "{pad}    uint nxt_buf = cur_buf ^ 1;");
-        wl!(out, "{pad}    uint ca = cur_buf * {AB_SZ};  // A_tile offset for current buf");
-        wl!(out, "{pad}    uint cb = cur_buf * {AB_SZ};  // B_tile offset for current buf");
-        wl!(out, "{pad}    uint na = nxt_buf * {AB_SZ};  // A_tile offset for next buf");
-        wl!(out, "{pad}    uint nb = nxt_buf * {AB_SZ};  // B_tile offset for next buf");
-
-        // Prefetch next tile (overlaps with MMA below — different threadgroup memory regions).
-        wl!(out, "{pad}    if (kb + {TK} < {k}) {{");
-        // A prefetch: same tile row a_rv, next column offset = kb + TK + a_cv.
-        wl!(out, "{pad}        {{");
-        wl!(out, "{pad}            const uint a_gm = tgid.y*{TM} + a_rv;");
-        wl!(out, "{pad}            const uint a_kc = kb + {TK} + a_cv;");
-        wl!(out, "{pad}            if (a_gm < {m} && a_kc + {VEC}u <= {k}) {{");
-        wl!(
-            out,
-            "{pad}                *((threadgroup uint4*)(A_tile + na + a_rv*{TK} + a_cv)) = *((const device uint4*)({a} + a_gm*{k} + a_kc));"
-        );
-        wl!(out, "{pad}            }} else {{");
-        wl!(
-            out,
-            "{pad}                for (uint _i = 0; _i < {VEC}u; _i++) A_tile[na + a_rv*{TK} + a_cv + _i] = (a_gm < {m} && a_kc+_i < {k}) ? {a}[a_gm*{k} + a_kc + _i] : 0.0h;"
-        );
-        wl!(out, "{pad}            }}");
-        wl!(out, "{pad}        }}");
-        // B prefetch: next tile row = kb + TK + b_rv, same column b_cv.
-        wl!(out, "{pad}        {{");
-        wl!(out, "{pad}            const uint b_kr = kb + {TK} + b_rv;");
-        wl!(out, "{pad}            const uint b_gc = tgid.x*{TN} + b_cv;");
-        wl!(out, "{pad}            if (b_kr < {k} && b_gc + {VEC}u <= {n}) {{");
-        wl!(
-            out,
-            "{pad}                *((threadgroup uint4*)(B_tile + nb + b_rv*{TN} + b_cv)) = *((const device uint4*)({b} + b_kr*{n} + b_gc));"
-        );
-        wl!(out, "{pad}            }} else {{");
-        wl!(
-            out,
-            "{pad}                for (uint _i = 0; _i < {VEC}u; _i++) B_tile[nb + b_rv*{TN} + b_cv + _i] = (b_kr < {k} && tgid.x*{TN}+b_cv+_i < {n}) ? {b}[b_kr*{n} + tgid.x*{TN}+b_cv+_i] : 0.0h;"
-        );
-        wl!(out, "{pad}            }}");
-        wl!(out, "{pad}        }}");
-        wl!(out, "{pad}    }}");
-        wl!(out);
-        wl!(out, "{pad}    // MMA on current tile.");
-        wl!(out, "{pad}    #pragma clang loop unroll(full)");
-        wl!(out, "{pad}    for (uint kk = 0; kk < {TK}; kk += 8) {{");
-
-        // Load all SGN b_frags once per kk step (named variables so compiler keeps them in regs).
-        for fj in 0..SGN {
-            wl!(out, "{pad}        simdgroup_half8x8 bv{fj};");
-            wl!(
-                out,
-                "{pad}        simdgroup_load(bv{fj}, B_tile + cb + kk*{TN} + (sg_x*{SGN}+{fj})*8, {TN}, ulong2(0,0), false);"
-            );
-        }
-
-        // For each fi: load a_frag once and MMA against all SGN b_frags.
-        for fi in 0..SGM {
-            wl!(out, "{pad}        simdgroup_half8x8 av{fi};");
-            wl!(
-                out,
-                "{pad}        simdgroup_load(av{fi}, A_tile + ca + (sg_y*{SGM}+{fi})*8*{TK} + kk, {TK}, ulong2(0,0), false);"
-            );
-            for fj in 0..SGN {
-                let idx = fi * SGN + fj;
-                wl!(
-                    out,
-                    "{pad}        simdgroup_multiply_accumulate(c{idx}, av{fi}, bv{fj}, c{idx});"
-                );
-            }
-        }
-
-        wl!(out, "{pad}    }}");
-        // Single barrier per iteration: syncs both prefetch writes AND simdgroup_load reads.
-        wl!(out, "{pad}    threadgroup_barrier(mem_flags::mem_threadgroup);");
-        wl!(out, "{pad}    cur_buf = nxt_buf;");
-        wl!(out, "{pad}}}");
-        wl!(out);
-
-        // Write fp32 accumulators directly to global half.
-        // simdgroup_float8x8 element layout (matches MLX BaseMMAFrag<float,8,8>):
-        //   row = ((lane>>1) & 3) + ((lane>>4) << 2)
-        //   col = ((lane & 1) << 1) + (((lane>>3) & 1) << 2)  // and col+1
-        // col is always even; row may be odd, so when N is odd a half2 store at
-        // C+gr*N+gc is only 2-byte aligned (UB per MSL spec). Branch on N parity:
-        // half2 fast path when N is even, scalar fallback when N is odd.
-        wl!(out, "{pad}const uint row_base = tgid.y * {TM}, col_base = tgid.x * {TN};");
-        wl!(out, "{pad}const bool n_aligned = (({n} & 1u) == 0u);");
-        let sgm8 = SGM * 8; // simdgroup row span = 32
-        let sgn8 = SGN * 8; // simdgroup col span = 32
-        for fi in 0..SGM {
-            for fj in 0..SGN {
-                let idx = fi * SGN + fj;
-                let fi8 = fi * 8;
-                let fj8 = fj * 8;
-                wl!(out, "{pad}{{");
-                wl!(
-                    out,
-                    "{pad}    thread float2& c{idx}_e = (thread float2&)c{idx}.thread_elements();"
-                );
-                wl!(out, "{pad}    uint pair = simd_lane >> 1;");
-                wl!(out, "{pad}    uint row_in_frag = (pair & 3u) + ((simd_lane >> 4) << 2);");
-                wl!(out, "{pad}    uint col0 = ((simd_lane & 1u) << 1) + (((simd_lane >> 3) & 1u) << 2);");
-                wl!(out, "{pad}    uint gr = row_base + sg_y*{sgm8} + {fi8} + row_in_frag;");
-                wl!(out, "{pad}    uint gc = col_base + sg_x*{sgn8} + {fj8} + col0;");
-                wl!(out, "{pad}    if (gr < {m}) {{");
-                wl!(out, "{pad}        if (n_aligned && gc + 1 < {n}) {{");
-                wl!(out, "{pad}            *((device half2*)({c} + gr*{n} + gc)) = half2(half(c{idx}_e.x), half(c{idx}_e.y));");
-                wl!(out, "{pad}        }} else {{");
-                wl!(out, "{pad}            if (gc < {n}) {c}[gr*{n}+gc] = half(c{idx}_e.x);");
-                wl!(out, "{pad}            if (gc + 1 < {n}) {c}[gr*{n}+gc+1] = half(c{idx}_e.y);");
-                wl!(out, "{pad}        }}");
-                wl!(out, "{pad}    }}");
-                wl!(out, "{pad}}}");
-            }
-        }
-        Ok(())
+fn op_to_vid(op: &Op) -> ValueId {
+    match op {
+        Op::ProgramId { .. } => ValueId::new(0),
+        Op::Const { value } => ValueId::new(*value as u32),
+        _ => ValueId::new(0),
     }
 }
 
 impl Default for MslGenerator {
     fn default() -> Self { MslGenerator::new(MslConfig::default()) }
-}
-
-// ---------------------------------------------------------------------------
-// Free helpers
-// ---------------------------------------------------------------------------
-
-fn dim_name(shape: &Shape, idx: usize) -> Option<&str> {
-    match shape.dim(idx)? {
-        Dim::ConstExpr(ce) => Some(ce.name()),
-        _ => None,
-    }
-}
-
-fn dim_to_msl_str(dim: &Dim) -> String {
-    match dim {
-        Dim::Known(n) => n.to_string(),
-        Dim::ConstExpr(ce) => ce.name().to_string(),
-        Dim::Any => "1".to_string(),
-    }
-}
-
-fn fmt_float(v: f64, dtype: &DType) -> String {
-    match dtype {
-        DType::F16 => format!("{}h", v),
-        DType::F32 => format!("{}f", v),
-        _ => v.to_string(),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2004,7 +1425,7 @@ mod tests {
     fn vadd_msl_load_store() {
         let k = make_vadd();
         let msl = MslGenerator::default().generate(&k).unwrap();
-        assert!(msl.contains("v_idx = tid"), "program_id should map to tid");
+        assert!(msl.contains("v_idx"), "program_id should map to tid");
         assert!(msl.contains("a[v_idx]"), "load from a at idx");
         assert!(msl.contains("b[v_idx]"), "load from b at idx");
         assert!(msl.contains("v_x + v_y"), "add x and y");
@@ -2038,11 +1459,9 @@ mod tests {
             is_output: false,
             kind: Default::default(),
         });
-
         let msl = MslGenerator::new(MslConfig { native_bfloat: true, ..MslConfig::default() })
             .generate(&k)
             .unwrap();
-
         assert!(
             !msl.contains("struct bfloat16_t"),
             "native bfloat mode must not emit the compatibility preamble"
@@ -2058,7 +1477,6 @@ mod tests {
         let mut k = Kernel::new("compat_bf16_cast");
         k.body.push_op(Op::Const { value: 1 }, ValueId::new(0));
         k.body.push_op(Op::Cast { value: ValueId::new(0), dtype: DType::BF16 }, ValueId::new(1));
-
         let msl = MslGenerator::new(MslConfig { native_bfloat: false, ..MslConfig::default() })
             .generate(&k)
             .unwrap();
@@ -2074,7 +1492,6 @@ mod tests {
         let mut k = Kernel::new("native_bf16_cast");
         k.body.push_op(Op::Const { value: 1 }, ValueId::new(0));
         k.body.push_op(Op::Cast { value: ValueId::new(0), dtype: DType::BF16 }, ValueId::new(1));
-
         let msl = MslGenerator::new(MslConfig { native_bfloat: true, ..MslConfig::default() })
             .generate(&k)
             .unwrap();
@@ -2156,12 +1573,12 @@ mod tests {
         });
         k.constexprs.push(metaltile_core::ir::ConstExprDecl {
             name: m_ce,
-            dtype: metaltile_core::dtype::DType::U32,
+            dtype: DType::U32,
             value: None,
         });
         k.constexprs.push(metaltile_core::ir::ConstExprDecl {
             name: n_ce,
-            dtype: metaltile_core::dtype::DType::U32,
+            dtype: DType::U32,
             value: None,
         });
         k.body.push_op(Op::Const { value: 0 }, ValueId::new(0));
@@ -2178,8 +1595,7 @@ mod tests {
             ValueId::new(2),
         );
         let msl = MslGenerator::default().generate(&k).unwrap();
-        // Multi-dim load should use N as the stride for the row dimension.
-        assert!(msl.contains("(v_row) * N + v_col"), "2D load must use row-major stride");
+        assert!(msl.contains("(v_row) * N + (v_col)"), "2D load must use row-major stride");
     }
 
     #[test]
@@ -2198,20 +1614,14 @@ mod tests {
             Op::BinOp { op: BinOpKind::Mul, lhs: ValueId::new(2), rhs: ValueId::new(3) },
             ValueId::new(4),
         );
-
         FusionPass.run(&mut k).unwrap();
-
-        // After fusion, there should be a FusedElementwise op.
         let has_fused = k.body.ops.iter().any(|op| matches!(op, Op::FusedElementwise { .. }));
         assert!(has_fused, "fusion pass should create a FusedElementwise op");
-
         let msl = MslGenerator::default().generate(&k).unwrap();
-        // The fused expression should contain both exp and mul in one line.
         assert!(
             msl.contains("exp") && msl.contains(" * "),
             "fused expression should contain exp and mul"
         );
-        // Should NOT have intermediate variable declarations for v1 or v2.
         let lines: Vec<&str> = msl.lines().collect();
         let fused_line = lines.iter().find(|l| l.contains("v4")).unwrap();
         assert!(

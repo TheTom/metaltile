@@ -121,11 +121,10 @@ fn licm_block(
             // Also include values from other blocks (ancestors) referenced by the loop.
             for op in &loop_body.ops {
                 for vid in op_value_refs(op) {
-                    if let Some(&def_bid) = def_block.get(&vid) {
-                        if def_bid != *body {
+                    if let Some(&def_bid) = def_block.get(&vid)
+                        && def_bid != *body {
                             invariant.insert(vid);
                         }
-                    }
                 }
             }
 
@@ -143,13 +142,12 @@ fn licm_block(
                         continue;
                     }
                     let op_refs = op_value_refs(op);
-                    if op_refs.iter().all(|v| invariant.contains(v)) {
-                        if let Some(Some(vid)) = loop_body.results.get(j) {
+                    if op_refs.iter().all(|v| invariant.contains(v))
+                        && let Some(Some(vid)) = loop_body.results.get(j) {
                             invariant.insert(*vid);
                             hoist_indices.push(j);
                             changed = true;
                         }
-                    }
                 }
                 if !changed {
                     break;

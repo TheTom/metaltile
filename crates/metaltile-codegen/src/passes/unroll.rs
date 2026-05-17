@@ -247,49 +247,118 @@ fn remap_value_ids(op: &mut Op, map: &BTreeMap<ValueId, ValueId>) {
         }
     };
     match op {
-        Op::BinOp { lhs, rhs, .. } => { s(lhs); s(rhs); }
-        Op::UnaryOp { value, .. } | Op::Activation { value, .. }
-        | Op::Cast { value, .. } | Op::Reduce { value, .. }
-        | Op::Transpose { value } | Op::Slice { value, .. }
+        Op::BinOp { lhs, rhs, .. } => {
+            s(lhs);
+            s(rhs);
+        },
+        Op::UnaryOp { value, .. }
+        | Op::Activation { value, .. }
+        | Op::Cast { value, .. }
+        | Op::Reduce { value, .. }
+        | Op::Transpose { value }
+        | Op::Slice { value, .. }
         | Op::Broadcast { value, .. } => s(value),
-        Op::Select { cond, on_true, on_false } => { s(cond); s(on_true); s(on_false); }
-        Op::Dot { a, b } => { s(a); s(b); }
+        Op::Select { cond, on_true, on_false } => {
+            s(cond);
+            s(on_true);
+            s(on_false);
+        },
+        Op::Dot { a, b } => {
+            s(a);
+            s(b);
+        },
         Op::Store { value, indices, .. } => {
             s(value);
             for ix in indices.iter_mut() {
-                if let IndexExpr::Value(v) | IndexExpr::Range(v, _) = ix { s(v); }
+                if let IndexExpr::Value(v) | IndexExpr::Range(v, _) = ix {
+                    s(v);
+                }
             }
-        }
-        Op::Loop { start, end, step, .. } => { s(start); s(end); s(step); }
+        },
+        Op::Loop { start, end, step, .. } => {
+            s(start);
+            s(end);
+            s(step);
+        },
         Op::Load { indices, .. } =>
             for ix in indices.iter_mut() {
-                if let IndexExpr::Value(v) | IndexExpr::Range(v, _) = ix { s(v); }
+                if let IndexExpr::Value(v) | IndexExpr::Range(v, _) = ix {
+                    s(v);
+                }
             },
-        Op::InlineMsl { inputs, .. } => for v in inputs { s(v); }
-        Op::FlashAttention { q, k, v, .. } => { s(q); s(k); s(v); }
-        Op::SlidingWindowAttention { q, k, v, .. } => { s(q); s(k); s(v); }
-        Op::RmsNorm { x, scale, .. } => { s(x); s(scale); }
-        Op::GatedMlp { x, gate_proj, up_proj, down_proj } => { s(x); s(gate_proj); s(up_proj); s(down_proj); }
-        Op::FusedElementwise { ops } => for o in ops { remap_value_ids(o, map); }
+        Op::InlineMsl { inputs, .. } =>
+            for v in inputs {
+                s(v);
+            },
+        Op::FlashAttention { q, k, v, .. } => {
+            s(q);
+            s(k);
+            s(v);
+        },
+        Op::SlidingWindowAttention { q, k, v, .. } => {
+            s(q);
+            s(k);
+            s(v);
+        },
+        Op::RmsNorm { x, scale, .. } => {
+            s(x);
+            s(scale);
+        },
+        Op::GatedMlp { x, gate_proj, up_proj, down_proj } => {
+            s(x);
+            s(gate_proj);
+            s(up_proj);
+            s(down_proj);
+        },
+        Op::FusedElementwise { ops } =>
+            for o in ops {
+                remap_value_ids(o, map);
+            },
         Op::VectorLoad { byte_offset, .. } => s(byte_offset),
-        Op::VectorStore { byte_offset, value, .. } => { s(byte_offset); s(value); }
-        Op::StrideReduce { offset, stride, end, .. } => { s(offset); s(stride); s(end); }
+        Op::VectorStore { byte_offset, value, .. } => {
+            s(byte_offset);
+            s(value);
+        },
+        Op::StrideReduce { offset, stride, end, .. } => {
+            s(offset);
+            s(stride);
+            s(end);
+        },
         Op::If { cond, .. } => s(cond),
         Op::ExpandDims { value, .. } | Op::Reshape { value, .. } => s(value),
-        Op::Cat { values, .. } => for v in values { s(v); }
+        Op::Cat { values, .. } =>
+            for v in values {
+                s(v);
+            },
         Op::Gather { indices, .. } => s(indices),
-        Op::Scatter { indices, value, .. } => { s(indices); s(value); }
-        Op::Atomic { index, value, .. } => { s(index); s(value); }
+        Op::Scatter { indices, value, .. } => {
+            s(indices);
+            s(value);
+        },
+        Op::Atomic { index, value, .. } => {
+            s(index);
+            s(value);
+        },
         Op::Scan { value, .. } => s(value),
-        Op::StrideScan { offset, end, .. } | Op::StrideArgReduce { offset, end, .. } => { s(offset); s(end); }
-        Op::StrideStore { offset, end, scalar, .. } => { s(offset); s(end); s(scalar); }
-        Op::Dequantize { .. } => {}
+        Op::StrideScan { offset, end, .. } | Op::StrideArgReduce { offset, end, .. } => {
+            s(offset);
+            s(end);
+        },
+        Op::StrideStore { offset, end, scalar, .. } => {
+            s(offset);
+            s(end);
+            s(scalar);
+        },
+        Op::Dequantize { .. } => {},
         Op::SimdReduce { value, .. } | Op::ArgReduce { value, .. } => s(value),
         Op::ThreadgroupLoad { index, .. } => s(index),
-        Op::ThreadgroupStore { index, value, .. } => { s(index); s(value); }
-        Op::ThreadgroupAlloc { .. } | Op::Barrier => {}
+        Op::ThreadgroupStore { index, value, .. } => {
+            s(index);
+            s(value);
+        },
+        Op::ThreadgroupAlloc { .. } | Op::Barrier => {},
         Op::DeclareLocal { value, .. } | Op::SetLocal { value, .. } => s(value),
-        _ => {}
+        _ => {},
     }
 }
 
@@ -301,48 +370,118 @@ fn max_vid_in_op(op: &Op) -> u32 {
     let mut m = 0;
     let mut push = |v: ValueId| m = m.max(v.as_u32());
     match op {
-        Op::BinOp { lhs, rhs, .. } => { push(*lhs); push(*rhs); }
-        Op::UnaryOp { value, .. } | Op::Activation { value, .. } | Op::Cast { value, .. }
-        | Op::Reduce { value, .. } | Op::Transpose { value } | Op::Slice { value, .. }
+        Op::BinOp { lhs, rhs, .. } => {
+            push(*lhs);
+            push(*rhs);
+        },
+        Op::UnaryOp { value, .. }
+        | Op::Activation { value, .. }
+        | Op::Cast { value, .. }
+        | Op::Reduce { value, .. }
+        | Op::Transpose { value }
+        | Op::Slice { value, .. }
         | Op::Broadcast { value, .. } => push(*value),
-        Op::Select { cond, on_true, on_false } => { push(*cond); push(*on_true); push(*on_false); }
-        Op::Dot { a, b } => { push(*a); push(*b); }
+        Op::Select { cond, on_true, on_false } => {
+            push(*cond);
+            push(*on_true);
+            push(*on_false);
+        },
+        Op::Dot { a, b } => {
+            push(*a);
+            push(*b);
+        },
         Op::Store { value, indices, .. } => {
             push(*value);
             for ix in indices {
-                if let IndexExpr::Value(v) | IndexExpr::Range(v, _) = ix { push(*v); }
+                if let IndexExpr::Value(v) | IndexExpr::Range(v, _) = ix {
+                    push(*v);
+                }
             }
-        }
-        Op::Loop { start, end, step, .. } => { push(*start); push(*end); push(*step); }
+        },
+        Op::Loop { start, end, step, .. } => {
+            push(*start);
+            push(*end);
+            push(*step);
+        },
         Op::Load { indices, .. } =>
             for ix in indices {
-                if let IndexExpr::Value(v) | IndexExpr::Range(v, _) = ix { push(*v); }
+                if let IndexExpr::Value(v) | IndexExpr::Range(v, _) = ix {
+                    push(*v);
+                }
             },
-        Op::InlineMsl { inputs, .. } => for v in inputs { push(*v); }
-        Op::FlashAttention { q, k, v, .. } => { push(*q); push(*k); push(*v); }
-        Op::SlidingWindowAttention { q, k, v, .. } => { push(*q); push(*k); push(*v); }
-        Op::RmsNorm { x, scale, .. } => { push(*x); push(*scale); }
-        Op::GatedMlp { x, gate_proj, up_proj, down_proj } => { push(*x); push(*gate_proj); push(*up_proj); push(*down_proj); }
-        Op::FusedElementwise { ops } => for o in ops { m = m.max(max_vid_in_op(o)); }
+        Op::InlineMsl { inputs, .. } =>
+            for v in inputs {
+                push(*v);
+            },
+        Op::FlashAttention { q, k, v, .. } => {
+            push(*q);
+            push(*k);
+            push(*v);
+        },
+        Op::SlidingWindowAttention { q, k, v, .. } => {
+            push(*q);
+            push(*k);
+            push(*v);
+        },
+        Op::RmsNorm { x, scale, .. } => {
+            push(*x);
+            push(*scale);
+        },
+        Op::GatedMlp { x, gate_proj, up_proj, down_proj } => {
+            push(*x);
+            push(*gate_proj);
+            push(*up_proj);
+            push(*down_proj);
+        },
+        Op::FusedElementwise { ops } =>
+            for o in ops {
+                m = m.max(max_vid_in_op(o));
+            },
         Op::VectorLoad { byte_offset, .. } => push(*byte_offset),
-        Op::VectorStore { byte_offset, value, .. } => { push(*byte_offset); push(*value); }
-        Op::StrideReduce { offset, stride, end, .. } => { push(*offset); push(*stride); push(*end); }
+        Op::VectorStore { byte_offset, value, .. } => {
+            push(*byte_offset);
+            push(*value);
+        },
+        Op::StrideReduce { offset, stride, end, .. } => {
+            push(*offset);
+            push(*stride);
+            push(*end);
+        },
         Op::If { cond, .. } => push(*cond),
         Op::ExpandDims { value, .. } | Op::Reshape { value, .. } => push(*value),
-        Op::Cat { values, .. } => for v in values { push(*v); }
+        Op::Cat { values, .. } =>
+            for v in values {
+                push(*v);
+            },
         Op::Gather { indices, .. } => push(*indices),
-        Op::Scatter { indices, value, .. } => { push(*indices); push(*value); }
-        Op::Atomic { index, value, .. } => { push(*index); push(*value); }
+        Op::Scatter { indices, value, .. } => {
+            push(*indices);
+            push(*value);
+        },
+        Op::Atomic { index, value, .. } => {
+            push(*index);
+            push(*value);
+        },
         Op::Scan { value, .. } => push(*value),
-        Op::StrideScan { offset, end, .. } | Op::StrideArgReduce { offset, end, .. } => { push(*offset); push(*end); }
-        Op::StrideStore { offset, end, scalar, .. } => { push(*offset); push(*end); push(*scalar); }
-        Op::Dequantize { .. } => {}
+        Op::StrideScan { offset, end, .. } | Op::StrideArgReduce { offset, end, .. } => {
+            push(*offset);
+            push(*end);
+        },
+        Op::StrideStore { offset, end, scalar, .. } => {
+            push(*offset);
+            push(*end);
+            push(*scalar);
+        },
+        Op::Dequantize { .. } => {},
         Op::SimdReduce { value, .. } | Op::ArgReduce { value, .. } => push(*value),
         Op::ThreadgroupLoad { index, .. } => push(*index),
-        Op::ThreadgroupStore { index, value, .. } => { push(*index); push(*value); }
-        Op::ThreadgroupAlloc { .. } | Op::Barrier => {}
+        Op::ThreadgroupStore { index, value, .. } => {
+            push(*index);
+            push(*value);
+        },
+        Op::ThreadgroupAlloc { .. } | Op::Barrier => {},
         Op::DeclareLocal { value, .. } | Op::SetLocal { value, .. } => push(*value),
-        _ => {}
+        _ => {},
     }
     m
 }
