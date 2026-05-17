@@ -251,7 +251,11 @@ impl MslGenerator {
                         BinOpKind::Shr => wl!(out, "{pad}auto {v} = ({l} >> {r});"),
                         BinOpKind::Add => {
                             // FMA recognition: Mul + Add → fma() (floats only)
-                            match (result_is_float, try_get_mul(*lhs, block), try_get_mul(*rhs, block)) {
+                            match (
+                                result_is_float,
+                                try_get_mul(*lhs, block),
+                                try_get_mul(*rhs, block),
+                            ) {
                                 (true, Some((ml, mr)), None) => wl!(
                                     out,
                                     "{pad}auto {v} = fma({ml}, {mr}, {r});",

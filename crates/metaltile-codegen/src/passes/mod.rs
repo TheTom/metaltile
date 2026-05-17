@@ -128,15 +128,13 @@ impl PassRegistry {
         match name {
             "type_check" => Some(Box::new(type_check::TypeCheckPass)),
             "const_fold" => Some(Box::new(const_fold::ConstFoldPass::new())),
-            "algebraic_simplify" =>
-                Some(Box::new(algebraic_simplify::AlgebraicSimplifyPass)),
+            "algebraic_simplify" => Some(Box::new(algebraic_simplify::AlgebraicSimplifyPass)),
             "copy_prop" => Some(Box::new(copy_prop::CopyPropPass)),
             "cse" => Some(Box::new(cse::CsePass)),
             "licm" => Some(Box::new(licm::LicmPass)),
             "if_conversion" => Some(Box::new(if_conversion::IfConversionPass)),
             "value_sink" => Some(Box::new(value_sink::ValueSinkPass)),
-            "tile_lowering" =>
-                Some(Box::new(tile_lowering::TileLoweringPass::default())),
+            "tile_lowering" => Some(Box::new(tile_lowering::TileLoweringPass::default())),
             "fusion" => Some(Box::new(fusion::FusionPass)),
             "unroll" => Some(Box::new(unroll::UnrollPass::default())),
             "schedule" => Some(Box::new(schedule::SchedulePass::default())),
@@ -153,10 +151,7 @@ impl PassRegistry {
 
     /// Return the standard pipeline with names attached (for debug/inspect).
     pub fn standard_with_names() -> Vec<(&'static str, Box<dyn Pass>)> {
-        Self::order()
-            .iter()
-            .filter_map(|&n| Some((n, Self::get(n)?)))
-            .collect()
+        Self::order().iter().filter_map(|&n| Some((n, Self::get(n)?))).collect()
     }
 
     /// Return sorted pass names (for usage / error messages).
@@ -178,9 +173,7 @@ pub struct PipelineBuilder {
 
 impl PipelineBuilder {
     /// Create a builder with the standard pipeline from [`PassRegistry`].
-    pub fn standard() -> Self {
-        PipelineBuilder { passes: PassRegistry::standard_pipeline() }
-    }
+    pub fn standard() -> Self { PipelineBuilder { passes: PassRegistry::standard_pipeline() } }
 
     /// Remove a pass by name from the pipeline.
     pub fn without(mut self, name: &str) -> Self {

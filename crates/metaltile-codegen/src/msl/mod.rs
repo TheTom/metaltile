@@ -41,10 +41,7 @@ impl MslGenerator {
     pub fn new(config: MslConfig) -> Self { MslGenerator { config } }
 
     /// Like [`generate`] but also returns per-pass statistics.
-    pub fn generate_with_stats(
-        &self,
-        kernel: &Kernel,
-    ) -> Result<(String, Vec<passes::PassStats>)> {
+    pub fn generate_with_stats(&self, kernel: &Kernel) -> Result<(String, Vec<passes::PassStats>)> {
         let mut k = kernel.clone();
         let stats = passes::run_passes_with_stats(&mut k, &passes::standard_pipeline())?;
         let msl = self.emit_msl(&k)?;

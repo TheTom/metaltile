@@ -207,10 +207,7 @@ pub fn run(args: &[String]) {
                     },
                     None => {
                         let valid: Vec<_> = metaltile_codegen::passes::PassRegistry::names();
-                        eprintln!(
-                            "Unknown pass: {name}. Valid: {} all",
-                            valid.join(", ")
-                        );
+                        eprintln!("Unknown pass: {name}. Valid: {} all", valid.join(", "));
                         return;
                     },
                 },
@@ -292,15 +289,14 @@ fn generate_msl(spec: &BenchSpec, dtypes: &[DType]) -> String {
 }
 
 fn print_stats_table(stats: &[metaltile_codegen::passes::PassStats]) {
-    println!("{:<20}  {:>10}  {:>9}  {:>6}  {:>7}", "pass", "ops_before", "ops_after", "delta", "time_us");
+    println!(
+        "{:<20}  {:>10}  {:>9}  {:>6}  {:>7}",
+        "pass", "ops_before", "ops_after", "delta", "time_us"
+    );
     println!("{:-<20}  {:->10}  {:->9}  {:->6}  {:->7}", "", "", "", "", "");
     for s in stats {
         let delta = s.ops_after as isize - s.ops_before as isize;
-        let delta_str = if delta == 0 {
-            "  +0".to_string()
-        } else {
-            format!("{:>+4}", delta)
-        };
+        let delta_str = if delta == 0 { "  +0".to_string() } else { format!("{:>+4}", delta) };
         println!(
             "{:<20}  {:>10}  {:>9}  {:>6}  {:>7}",
             s.name, s.ops_before, s.ops_after, delta_str, s.wall_us

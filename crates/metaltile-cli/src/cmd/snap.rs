@@ -36,7 +36,9 @@ pub fn help() {
     eprintln!("  tile snap [options]");
     eprintln!();
     eprintln!("OPTIONS:");
-    eprintln!("  --out, -o <file>    Write snapshot to <file> (default: .tile-snapshots/<sha>.json)");
+    eprintln!(
+        "  --out, -o <file>    Write snapshot to <file> (default: .tile-snapshots/<sha>.json)"
+    );
     eprintln!("  --from <file>       Promote an existing JSON file instead of re-running bench");
     eprintln!("  --note <text>       Attach a note to the snapshot");
     eprintln!("  --filter, -f <name> Only include kernels whose name contains <name>");
