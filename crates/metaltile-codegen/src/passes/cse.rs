@@ -1,14 +1,15 @@
-//! Common Subexpression Elimination (CSE) pass.
+//! Common Subexpression Elimination — local value numbering.
 //!
-//! Performs local value numbering on each block: when two ops compute the same
-//! result (identical opcode and operands), the second is eliminated and all
-//! downstream uses are rerouted to the first.
+//! Performs block-local value numbering: when two ops compute the same result
+//! (identical opcode and operands), the second is eliminated and all downstream
+//! uses are rerouted to the first.  Commutative binary ops (Add, Mul, Max, Min,
+//! BitAnd, BitOr, BitXor, CmpEq, CmpNe) are canonicalized to catch `a+b` vs `b+a`.
 //!
 //! ## CSE-eligible ops
 //!
 //! | Op | Notes |
 //! |----|-------|
-//! | `BinOp` | Commutative ops (Add, Mul, Max, Min, BitAnd, BitOr, BitXor, CmpEq, CmpNe) are canonicalized |
+//! | `BinOp` | Commutative ops are canonicalized |
 //! | `UnaryOp` | |
 //! | `Cast` | |
 //! | `Activation` | |
@@ -17,6 +18,15 @@
 //!
 //! Never eligible: `Store`, `Reduce`, `StrideReduce`, `Loop`, `Barrier`, `Atomic`,
 //! and any other op with side effects.
+//!
+//! ## References
+//! - Cocke & Schwartz (1970), "Programming Languages and their Compilers",
+//!   Courant Institute.  The original description of value numbering for CSE.
+//! - Aho, Lam, Sethi & Ullman (2006), "Compilers: Principles, Techniques, and
+//!   Tools", 2nd ed., §8.5 (global common subexpressions).
+//! - Briggs, Cooper & Simpson (1997), "Value numbering", Rice University
+//!   COMP 512 course notes.  Survey of local, superlocal, and global value
+//!   numbering algorithms.
 
 use std::collections::HashMap;
 

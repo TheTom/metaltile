@@ -1,4 +1,8 @@
-//! Pass infrastructure and optimization passes.
+//! Pass Infrastructure — trait, runner, and pass ordering.
+//!
+//! Defines the [`Pass`] trait that all optimization passes implement, the
+//! [`run_passes`] orchestration function, and [`PassStats`] for timing and
+//! IR-size tracking.  Module declarations for all passes live here.
 
 pub mod algebraic_simplify;
 pub mod block_util;

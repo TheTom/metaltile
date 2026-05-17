@@ -1,11 +1,12 @@
-//! Occupancy estimation for Metal GPU kernels.
+//! Occupancy Estimation — predict GPU thread occupancy from register pressure.
 //!
 //! Computes an estimated occupancy percentage based on register pressure,
-//! threadgroup memory usage, and threadgroup size.
+//! threadgroup memory usage, and threadgroup size.  This analysis feeds the
+//! autotuner, not the compilation pipeline directly.
 //!
 //! ## Apple GPU Context
 //!
-//! | Family | Max Threads/TG | TG Memory | Max Regs/Thread | Notes |
+//! | Family | Max Threads/TG | TG Memory | Reg Guide | Notes |
 //! |---|---|---|---|---|
 //! | Apple7 (M1) | 1024 | ~32KB | 128 | Fixed allocation |
 //! | Apple8 (M2) | 1024 | ~32KB | 128 | Similar to M1 |
@@ -14,15 +15,31 @@
 //! | Apple11 (M5) | 1024 | ~32KB | Dynamic | Smarter OMU |
 //!
 //! For M3+, register allocation is dynamically managed by the Occupancy
-//! Management Unit (OMU). Our 128-register guide is a soft heuristic —
+//! Management Unit (OMU).  Our 128-register guide is a soft heuristic —
 //! the OMU may run shaders above or below this threshold depending on
-//! cache pressure and available L1. We model register pressure as a
+//! cache pressure and available L1.  We model register pressure as a
 //! gradual degradation, not a hard ceiling.
 //!
 //! ## Usage
 //!
-//! This module is not a Pass — it runs as post-pipeline analysis that
+//! This module is not a [`Pass`] — it runs as post-pipeline analysis that
 //! feeds into the autotuner.
+//!
+//! ## References
+//! - Apple (2023), "Explore GPU advancements in M3 and A17 Pro",
+//!   WWDC Tech Talks.  Introduced the OMU and dynamic register allocation.
+//!   https://developer.apple.com/videos/play/tech-talks/111375
+//! - Apple (2021), "Create image processing apps powered by Apple silicon",
+//!   WWDC21.  Register pressure and occupancy trade-offs on Apple GPUs.
+//!   https://developer.apple.com/videos/play/wwdc2021/10153/
+//! - Apple, "Finding your Metal app's GPU occupancy", Xcode documentation.
+//!   https://developer.apple.com/documentation/xcode/finding-your-metal-apps-gpu-occupancy
+//! - Rosenzweig (2021), "Dissecting the Apple M1 GPU, part III",
+//!   Asahi Linux blog.  Reverse-engineered register file and occupancy details.
+//!   https://alyssarosenzweig.ca/blog/asahi-gpu-part-3/
+//! - Poletto & Sarkar (1999), "Linear scan register allocation",
+//!   ACM TOPLAS 21(5):895–913.  Foundation for the linear-scan liveness
+//!   model used in [`register_estimate`].
 
 use metaltile_core::ir::Kernel;
 

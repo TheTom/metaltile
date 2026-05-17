@@ -1,15 +1,15 @@
-//! Dead Store Elimination (DSE) pass.
+//! Dead Store Elimination — remove writes that are overwritten before any read.
 //!
 //! Eliminates `Op::Store` / `Op::VectorStore` operations that write to a
 //! location subsequently overwritten before any read, or writes that are never
-//! read at all.
+//! read at all.  This is block-local overwrite detection; global store-to-load
+//! forwarding is handled by a separate pass.
 //!
 //! ## Algorithm
 //!
-//! Block-local overwrite detection:
 //! 1. Collect all load locations (reads) from the block.
 //! 2. Backward scan: for each store, check if the same location is stored
-//!    again later without an intervening read. If so, the earlier store is dead.
+//!    again later without an intervening read.  If so, the earlier store is dead.
 //! 3. Never eliminate the last store to an output param.
 //! 4. Conservatively preserve masked stores (may-write semantics).
 //!
@@ -19,6 +19,13 @@
 //! - Masked stores: treated as "may write" — never eliminated.
 //! - Partial overlap: Phase 1 handles exact overlap only (same `(dst, indices)`).
 //! - Phase 2 (future): partial overlap via range analysis.
+//!
+//! ## References
+//! - Aho, Lam, Sethi & Ullman (2006), "Compilers: Principles, Techniques, and
+//!   Tools", 2nd ed., §9.1.3.  Dead-code elimination, including store removal.
+//! - Ferrante, Ottenstein & Warren (1987), "The program dependence graph and
+//!   its use in optimization", ACM TOPLAS 9(3):319–349.  PDG-based dead-store
+//!   detection.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 

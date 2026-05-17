@@ -1,17 +1,35 @@
-//! Vectorization pass: promote scalar ops to `half4`/`half8`/`float4`/`bfloat4` etc.
+//! Vectorization — promote consecutive scalar Load/Store to vector ops.
 //!
 //! Scans for consecutive scalar Load/Store ops with contiguous indices and
-//! replaces them with vectorized VectorLoad/VectorStore ops.
+//! replaces them with vectorized VectorLoad/VectorStore ops.  This reduces
+//! instruction count and improves memory bandwidth utilization on Apple GPUs,
+//! which have native support for `half4`, `float4`, and `bfloat4` (Metal 3.1+).
 //!
 //! ## v2 changes (CODEGEN_OVERHAUL §4.4)
 //!
-//! - **BF16 support**: `DType::BF16` params are now vectorizable (`bfloat4` on Metal 3.1+).
-//! - **Structural contiguity**: instead of relying on ValueId encoding heuristics,
-//!   the pass examines the defining op of each index ValueId.  After ConstFold +
-//!   CSE + LICM, consecutive loads at `base+0, base+1, …` show up as
-//!   `BinOp(Add, invariant_vid, Const(k))` with incrementing *k*.
-//! - **Width 8**: `MAX_VEC_LEN` is 8; the emitter decomposes `float8`/`half8` into
-//!   `float2x4` when the native 8-wide vector isn't available.
+//! - **BF16 support**: `DType::BF16` params are now vectorizable (`bfloat4` on
+//!   Metal 3.1+).
+//! - **Structural contiguity**: instead of relying on ValueId encoding
+//!   heuristics, the pass examines the defining op of each index ValueId.
+//!   After ConstFold + CSE + LICM, consecutive loads at `base+0, base+1, …`
+//!   show up as `BinOp(Add, invariant_vid, Const(k))` with incrementing *k*.
+//! - **Width 8**: `MAX_VEC_LEN` is 8; the emitter decomposes `float8`/`half8`
+//!   into `float2x4` when the native 8-wide vector isn't available.
+//!
+//! ## Limitations
+//!
+//! - Only handles contiguous, aligned accesses with power-of-2 element strides.
+//! - Gather/scatter patterns are not vectorized (requires SIMD permute support).
+//! - Interleaved loads (stride > 1 element) require a future stride-vectorize pass.
+//!
+//! ## References
+//! - Bacon, Graham & Sharp (1994), "Compiler Transformations for High-
+//!   Performance Computing", ACM Computing Surveys 26(4):345–420.
+//!   Surveys automatic vectorization techniques.
+//! - Nuzman, Rosen, Zaks et al. (2006), "Auto-vectorization of interleaved
+//!   data for SIMD", PLDI 2006.  Stride-based vectorization patterns.
+//! - Apple, "Metal Shading Language Specification", §2.4 (vector data types).
+//!   https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf
 
 use std::collections::BTreeMap;
 

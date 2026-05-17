@@ -1,9 +1,10 @@
-//! Loop Invariant Code Motion (LICM) pass.
+//! Loop Invariant Code Motion — hoist loop-invariant computations.
 //!
 //! Identifies computations inside loop bodies whose operands are all defined
-//! outside the loop, and hoists them to before the loop. This eliminates
+//! outside the loop, and hoists them to before the loop.  This eliminates
 //! redundant re-computation of index arithmetic and const-buffer loads
-//! across loop iterations.
+//! across loop iterations, reducing both instruction count and register
+//! pressure within the loop.
 //!
 //! ## Algorithm
 //!
@@ -12,8 +13,8 @@
 //!    before the loop (or in ancestor blocks).
 //! 2. Iterate to fixpoint: any op in the loop body whose operands are all
 //!    invariant AND which has no side effects is marked as hoistable.
-//! 3. Hoist: remove hoistable ops from the loop body and insert them before the loop
-//!    in the parent block, respecting topological order among hoisted ops.
+//! 3. Hoist: remove hoistable ops from the loop body and insert them before the
+//!    loop in the parent block, respecting topological order among hoisted ops.
 //!
 //! ## Safety
 //!
@@ -23,6 +24,14 @@
 //! - `DeclareLocal` inside loops (mutable variable declaration)
 //! - `Load` from mutable/unknown params
 //! - Any op whose operands include the loop induction variable
+//!
+//! ## References
+//! - Allen (1970), "A catalogue of optimizing transformations", in *Design and
+//!   Optimization of Compilers* (R. Rustin, ed.), Prentice-Hall.  Earliest
+//!   systematic description of loop-invariant code motion.
+//! - Aho, Lam, Sethi & Ullman (2006), "Compilers: Principles, Techniques, and
+//!   Tools", 2nd ed., §9.4.  Standard treatment of loop optimizations including
+//!   code motion.
 
 use std::collections::{BTreeMap, BTreeSet};
 

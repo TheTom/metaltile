@@ -1,13 +1,14 @@
-//! Register estimation pass.
+//! Register Estimation — conservative linear-scan liveness analysis.
 //!
-//! Performs a conservative linear-scan liveness analysis over IR blocks to
+//! Performs a conservative forward liveness analysis over IR blocks to
 //! estimate the maximum number of simultaneously-live ValueIds, which
-//! approximates register pressure per thread.
+//! approximates register pressure per thread.  Used by [`occupancy`] to
+//! compare tile size candidates.
 //!
 //! ## Caveats
 //!
-//! This is a *static estimate*. The Metal compiler performs the actual
-//! register allocation. The estimate is useful for comparing tile size
+//! This is a *static estimate*.  The Metal compiler performs the actual
+//! register allocation.  The estimate is useful for comparing tile size
 //! candidates: lower max_live → higher occupancy potential.
 //!
 //! ## Algorithm
@@ -18,8 +19,14 @@
 //! - Track the maximum live set size at each step.
 //!
 //! Phase 1 uses conservative liveness: values are never killed within a block
-//! (they remain live through the block end). This over-estimates register
+//! (they remain live through the block end).  This over-estimates register
 //! pressure, which is the safe direction for occupancy decisions.
+//!
+//! ## References
+//! - Poletto & Sarkar (1999), "Linear scan register allocation",
+//!   ACM TOPLAS 21(5):895–913.  The foundational paper on linear-scan
+//!   liveness analysis for fast register allocation.
+//!   https://dl.acm.org/doi/10.1145/330249.330250
 
 use metaltile_core::ir::{Kernel, ValueId};
 

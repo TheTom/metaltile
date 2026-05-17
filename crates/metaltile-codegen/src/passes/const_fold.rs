@@ -1,13 +1,33 @@
-//! Constant Folding & Dead Code Elimination pass.
+//! Constant Folding & Dead Code Elimination — evaluate compile-time expressions.
 //!
-//! Folds:
-//!   - `x + 0`, `0 + x`, `x - 0`         → x
-//!   - `x * 1`, `1 * x`                   → x
-//!   - `x * 0`, `0 * x`                   → Const(0)
-//!   - `Const(a) OP Const(b)`             → Const(result)  (literal-literal arithmetic)
+//! Folds literal-literal arithmetic at compile time and propagates identity
+//! operations (add/sub 0, mul/div 1).  A conservative dead-code elimination
+//! (DCE) sub-pass removes ops whose result is never referenced downstream,
+//! including across block boundaries.  Both phases recurse into loop body blocks.
 //!
-//! DCE removes ops whose result is never used downstream.
-//! Both passes recurse into loop body blocks.
+//! This is the first optimization pass in the pipeline.  Running it early
+//! reduces IR size for all subsequent passes.
+//!
+//! ## Patterns folded
+//! - `x + 0`, `0 + x`, `x - 0` → x
+//! - `x * 1`, `1 * x` → x
+//! - `x * 0`, `0 * x` → Const(0)
+//! - `Const(a) OP Const(b)` → Const(result)
+//!
+//! ## Algorithm
+//!
+//! 1. Block-local fold: scan each op; if all operands are Const, evaluate.
+//! 2. Identity elimination: replace identity-binop with its non-trivial operand.
+//! 3. Cross-block liveness: collect all ValueId uses across the entire kernel;
+//!    any ValueId defined in a block but never used is dead.
+//! 4. DCE: rebuild each block omitting dead ops, recurse into loop bodies.
+//!
+//! ## References
+//! - Cocke & Schwartz (1970), "Programming Languages and their Compilers",
+//!   Courant Institute.  Earliest description of constant folding as part of
+//!   value numbering.
+//! - Aho, Lam, Sethi & Ullman (2006), "Compilers: Principles, Techniques, and
+//!   Tools", 2nd ed., §8.4 (constant folding), §9.1.2 (dead-code elimination).
 
 use std::collections::BTreeSet;
 

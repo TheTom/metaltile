@@ -1,14 +1,23 @@
-//! Shared ValueId remapping utilities.
+//! ValueId Remapping — shared utilities for IR traversal and mutation.
 //!
-//! Provides canonical functions for:
-//! - `remap_value_ids(op, map)` — rewrite all ValueId references in an Op.
-//! - `op_value_refs(op)` — collect all ValueId references (read-only).
-//! - `max_vid_in_op(op)` — find the maximum ValueId in an Op.
-//! - `find_max_vid(kernel)` — find the maximum ValueId across a whole Kernel.
+//! Provides canonical functions for ValueId remapping, reference collection,
+//! and Op classification used by nearly every pass in the pipeline.
 //!
-//! These are used by multiple passes (Unroll, CopyProp, LICM, IfConversion,
-//! ValueSink, LoopUnswitch, TailDuplicate, ScalarReplace). Centralizing them
-//! ensures all Op variants are handled consistently.
+//! ## Core functions
+//! - [`remap_value_ids`] — rewrite all ValueId references in an Op.
+//! - [`op_value_refs`] — collect all ValueId references (read-only, for analysis).
+//! - [`max_vid_in_op`] — find the maximum ValueId in an Op.
+//! - [`find_max_vid`] — find the maximum ValueId across a whole Kernel.
+//!
+//! ## Op predicates
+//! - [`has_side_effects`] — cannot be moved, duplicated, or deleted.
+//! - [`is_unpredictable`] — cannot appear inside predicated (if-converted) code.
+//! - [`is_cheap_alu`] — eligible for rematerialization / value sinking.
+//! - [`is_load`] / [`is_store`] / [`is_barrier`] — memory classification.
+//!
+//! Centralizing these here ensures all Op variants are handled consistently
+//! across passes.  The exhaustive match arms serve as a single point of truth;
+//! a test verifies no variant is silently skipped.
 
 use std::collections::BTreeMap;
 

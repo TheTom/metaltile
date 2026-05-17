@@ -1,4 +1,4 @@
-//! If-Conversion (Predication) pass.
+//! If-Conversion — replace short branches with predicated Select chains.
 //!
 //! Converts `Op::If { cond, then_block, else_block }` blocks with short bodies
 //! into `Op::Select` chains, eliminating branch divergence on SIMD hardware.
@@ -6,9 +6,10 @@
 //! ## Motivation
 //!
 //! On Apple GPUs (SIMT execution), threads in a SIMD group execute in lockstep.
-//! When a branch diverges, the hardware serializes both paths. If-conversion
-//! replaces branches with predicated straight-line code: for regions ≤~5 ops
-//! per side, this eliminates the branch overhead and the serialization penalty.
+//! When a branch diverges, the hardware serializes both paths — effectively
+//! executing both arms sequentially with masking.  If-conversion replaces
+//! branches with predicated straight-line code; for regions ≤ ~5 ops per side,
+//! this eliminates the branch overhead and the serialization penalty.
 //!
 //! ## Algorithm
 //!
@@ -29,6 +30,14 @@
 //!   require liveness analysis to determine passthrough values — deferred.
 //! - Does not handle extended diamonds (multi-block chains in arms).
 //! - Conservatively rejects any arm with unpredictable ops.
+//!
+//! ## References
+//! - Allen, Kennedy, Porterfield & Warren (1983), "Conversion of control
+//!   dependence to data dependence", POPL 1983:177–189.
+//!   The seminal paper establishing if-conversion as a compiler technique.
+//! - Kennedy & Allen (2001), "Optimizing Compilers for Modern Architectures:
+//!   A Dependence-based Approach", Morgan Kaufmann, Ch. 7.  Comprehensive
+//!   treatment of if-conversion and predicated execution.
 
 use std::collections::BTreeMap;
 

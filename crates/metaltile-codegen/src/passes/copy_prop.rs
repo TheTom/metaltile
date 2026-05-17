@@ -1,24 +1,33 @@
-//! Copy Propagation & Identity Elimination pass.
+//! Copy Propagation — forward source values through identity operations.
 //!
-//! Eliminates no-op operations and propagates copies through the IR:
+//! Eliminates no-op operations and propagates the underlying source value
+//! through chains of copies and identity casts.  Shortens use-def chains so
+//! downstream passes (CSE, Fusion, AlgebraicSimplify) see the "real" values.
 //!
-//! ### Identity Patterns
+//! ## Identity Patterns
 //! - `Cast(dtype, x)` → `x`  when `x` is already that dtype
 //! - `Broadcast(x, [1])` → `x`  when broadcasting a scalar with shape [1]
 //! - `Reshape(x, s)` → `x`  when shapes are identical
 //! - `Select(cond, x, x)` → `x`  (also in AlgebraicSimplify, but cheap to re-check)
 //!
-//! ### Copy Forwarding
+//! ## Copy Forwarding
 //! When an op's result is used through a chain of identity operations,
 //! forward the source value through. The downstream CSE pass then eliminates the
 //! now-dead identity ops.
 //!
 //! ## Algorithm
 //!
-//! Iterates to fixpoint. Each iteration:
+//! Iterates to fixpoint.  Each iteration:
 //! 1. Find identity ops (result == source).
 //! 2. Replace all uses of the identity result with the source ValueId.
 //! 3. DCE cleans up the dead identity ops (ran after this pass).
+//!
+//! ## References
+//! - Aho, Lam, Sethi & Ullman (2006), "Compilers: Principles, Techniques, and
+//!   Tools", 2nd ed., §9.1.1.  Canonical treatment of copy propagation.
+//! - Wegman & Zadeck (1991), "Constant propagation with conditional branches",
+//!   ACM TOPLAS 13(2):181–210.  Sparse conditional constant propagation framework
+//!   that subsumes copy propagation.
 
 use std::collections::{BTreeMap, BTreeSet};
 

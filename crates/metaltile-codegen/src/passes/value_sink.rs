@@ -1,19 +1,17 @@
-//! Value Sinking pass.
+//! Value Sinking — move single-use definitions closer to their consumers.
 //!
-//! Moves the definition of a value closer to its only use. If a value is
-//! computed at position *i* in a block but only consumed at position *j* > *i*,
-//! sinking it to position *j-1* shortens the live range, reducing register
-//! pressure.
+//! If a value is computed at position *i* in a block but only consumed at
+//! position *j* > *i*, sinking it to position *j-1* shortens the live range,
+//! reducing register pressure.  This is the complement of LICM (which hoists
+//! out of loops); sinking pushes single-use definitions toward their consumers
+//! within straight-line code.
 //!
 //! ## Why It Matters
 //!
-//! MetalTile emits MSL source with `auto` variables. The Metal compiler
+//! MetalTile emits MSL source with `auto` variables.  The Metal compiler
 //! handles register allocation, but shorter live ranges in the IR correlate
-//! with lower register pressure in the generated code. On M3+, the OMU can
+//! with lower register pressure in the generated code.  On M3+, the OMU can
 //! exploit lower register pressure for higher occupancy.
-//!
-//! This is the complement of LICM — LICM hoists out of loops; sinking pushes
-//! single-use definitions toward their consumers.
 //!
 //! ## Algorithm
 //!
@@ -31,6 +29,13 @@
 //! - Ops with side effects are never moved.
 //! - Ops are never sunk across a Barrier.
 //! - Ops are never sunk across block boundaries (Phase 1 is block-local).
+//!
+//! ## References
+//! - Ferrante, Ottenstein & Warren (1987), "The program dependence graph and
+//!   its use in optimization", ACM TOPLAS 9(3):319–349.  PDG-based framework
+//!   for code motion including sinking.
+//! - Aho, Lam, Sethi & Ullman (2006), "Compilers: Principles, Techniques, and
+//!   Tools", 2nd ed., §9.5.  Partial-redundancy elimination and code sinking.
 
 use std::collections::{BTreeMap, BTreeSet};
 

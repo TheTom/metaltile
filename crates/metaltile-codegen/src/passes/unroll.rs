@@ -1,8 +1,9 @@
-//! Loop unrolling pass.
+//! Loop Unrolling — replicate loop body for known-constant trip counts.
 //!
 //! Replicates a loop body `trip_count` times when the trip count is a known
-//! compile-time constant and ≤ `MAX_UNROLL_TRIP`.  This exposes consecutive
-//! loads to the vectorizer and eliminates loop overhead.
+//! compile-time constant and ≤ `MAX_UNROLL_TRIP` (8).  This exposes consecutive
+//! loads to the vectorizer, eliminates loop overhead (induction variable
+//! updates, branch), and increases instruction-level parallelism.
 //!
 //! ## Induction variable
 //!
@@ -18,6 +19,19 @@
 //! cloned iteration.  Operands that point into the body are remapped to the
 //! clone's fresh IDs; operands pointing **outside** the body pass through
 //! unchanged.
+//!
+//! ## Limitations
+//!
+//! - Max trip count is 8; loops larger than this remain rolled.
+//! - Only handles innermost loops; nested loop unrolling is deferred.
+//! - Does not perform partial unrolling with cleanup epilogue.
+//!
+//! ## References
+//! - Bacon, Graham & Sharp (1994), "Compiler Transformations for High-
+//!   Performance Computing", ACM Computing Surveys 26(4):345–420.
+//!   Surveys loop unrolling and its interactions with other optimizations.
+//! - Aho, Lam, Sethi & Ullman (2006), "Compilers: Principles, Techniques, and
+//!   Tools", 2nd ed., §9.4.  Standard treatment of loop unrolling.
 
 use std::collections::BTreeMap;
 

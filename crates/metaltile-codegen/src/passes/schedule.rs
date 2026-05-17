@@ -1,8 +1,21 @@
-//! Scheduling pass: annotates Dot ops with tile dimensions for the autotuner.
+//! Scheduling — annotate Dot ops with tile dimensions for the autotuner.
 //!
-//! The Autotuner varies tile sizes at runtime. This pass stores the chosen
-//! tile dimensions on the Kernel so MslGenerator can read them directly,
-//! eliminating the need to modify MslConfig on every autotune iteration.
+//! The Autotuner varies tile sizes at runtime.  This pass stores the chosen
+//! tile dimensions on the Kernel so the MSL generator can read them directly,
+//! eliminating the need to modify MSL configuration on every autotune iteration.
+//!
+//! The schedule-separated design (algorithm vs. schedule) follows the Halide
+//! philosophy: the IR describes *what* to compute, the schedule describes *how*
+//! (tile size, thread mapping).
+//!
+//! ## References
+//! - Ragan-Kelley, Barnes, Adams, Paris, Durand & Amarasinghe (2013),
+//!   "Halide: A Language and Compiler for Optimizing Parallelism, Locality,
+//!   and Recomputation in Image Processing Pipelines", PLDI 2013.
+//!   Established the algorithm/schedule separation.
+//! - Bacon, Graham & Sharp (1994), "Compiler Transformations for High-
+//!   Performance Computing", ACM Computing Surveys 26(4):345–420.
+//!   Surveys loop tiling and scheduling transformations.
 
 use std::collections::BTreeMap;
 

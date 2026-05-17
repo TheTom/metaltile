@@ -1,8 +1,9 @@
-//! Algebraic Simplification pass.
+//! Algebraic Simplification — pattern-matching rewrite system.
 //!
-//! A pattern-matching rewrite system that simplifies IR operations beyond what
-//! ConstFold handles.  Each pattern is a function that tries to match an op and
-//! returns either a new op or a ValueId replacement.
+//! Simplifies IR operations beyond what ConstFold handles: identity absorption,
+//! idempotence, canonicalization, and algebraic rewrites.  After earlier passes
+//! (CopyProp, ConstFold, CSE) have cleaned the IR, this pass catches residual
+//! patterns that emerge from those transformations.
 //!
 //! ## Patterns
 //!
@@ -39,6 +40,22 @@
 //!
 //! Iterates to fixpoint over each block.  Each iteration collects rewrites
 //! (new ops or ValueId replacements), applies them, and stops when stable.
+//! This is a local (single-block) algorithm; inter-block algebraic identities
+//! require a global value-numbering framework.
+//!
+//! ## Limitations
+//!
+//! - Block-local only: algebraic identities spanning multiple blocks are not caught.
+//! - Pattern set is intentionally conservative to avoid IR bloat.
+//! - No expression reassociation (e.g. `(a + b) + c → a + (b + c)`); deferred
+//!   to a future canonicalization pass.
+//!
+//! ## References
+//! - Cocke & Schwartz (1970), "Programming Languages and their Compilers",
+//!   Courant Institute.  Early work on algebraic simplification via value numbering.
+//! - Aho, Lam, Sethi & Ullman (2006), "Compilers: Principles, Techniques, and
+//!   Tools", 2nd ed., §8.4–8.5.  Classic treatment of algebraic identities and
+//!   reduction in strength.
 
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -1,8 +1,8 @@
-//! Block manipulation helpers.
+//! Block Utilities — shared primitives for IR block manipulation.
 //!
-//! Provides common primitives for inserting, removing, and rebuilding ops
-//! within a [`Block`], used by multiple passes (Unroll, LICM, DSE,
-//! IfConversion, ValueSink).
+//! Provides `remove_ops` and `insert_ops` for safely mutating op sequences
+//! within a [`Block`].  Used by Unroll, LICM, DSE, IfConversion, ValueSink, and
+//! any pass that rewrites the op/results arrays of a block.
 
 use std::collections::BTreeSet;
 

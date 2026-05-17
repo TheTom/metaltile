@@ -1,10 +1,37 @@
-//! Fusion pass: merge adjacent elementwise operations into a single FusedElementwise op.
+//! Operator Fusion — merge adjacent elementwise operations into FusedElementwise.
 //!
-//! Algorithm:
+//! Fuses chains of elementwise ops (arithmetic, activation, cast) where each
+//! intermediate result has exactly one consumer.  The fused chain is emitted as
+//! a single Metal Shading Language expression, avoiding intermediate register
+//! spills and reducing launch overhead.
+//!
+//! This is an instance of the producer-consumer fusion pattern common in
+//! stencil and deep-learning compilers (Halide, TVM, XLA).
+//!
+//! ## Algorithm
 //! 1. Build def-use graph: for each ValueId, which op indices use it?
 //! 2. Find chains where each op produces a value used only by the next op.
 //! 3. Create an `Op::FusedElementwise` containing the whole chain.
 //! 4. Replace the original ops; the MSL emitter then emits a single expression.
+//!
+//! ## Limitations
+//! - Only elementwise ops are fused; reductions, loads, and stores are excluded.
+//! - Fused chains are limited to `MAX_FUSED_OPS` (default 8) to keep MSL
+//!   expressions debuggable.
+//! - Does not fuse across block boundaries or loop iterations.
+//!
+//! ## References
+//! - Ragan-Kelley, Barnes, Adams, Paris, Durand & Amarasinghe (2013),
+//!   "Halide: A Language and Compiler for Optimizing Parallelism, Locality,
+//!   and Recomputation in Image Processing Pipelines", PLDI 2013.
+//!   Introduced the schedule-separated operator fusion model.
+//! - Chen, Moreau, Jiang et al. (2018), "TVM: An Automated End-to-End
+//!   Optimizing Compiler for Deep Learning", OSDI 2018.  Operator fusion
+//!   in the deep-learning compiler context.
+//!   https://arxiv.org/abs/1802.04799
+//! - Google (2017), "XLA: Optimizing Compiler for Machine Learning",
+//!   TensorFlow blog.  Production operator fusion for ML workloads.
+//!   https://developers.googleblog.com/xla-tensorflow-compiled/
 
 use std::collections::{BTreeMap, BTreeSet};
 
