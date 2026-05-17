@@ -233,6 +233,10 @@ impl MslGenerator {
                     let v = self.vname(vid, block, extra_names);
                     let l = self.vname(Some(*lhs), block, extra_names);
                     let r = self.vname(Some(*rhs), block, extra_names);
+                    let result_is_float = vid
+                        .and_then(|id| type_env.get(&id))
+                        .map(|tv| matches!(tv.dtype, DType::F32 | DType::F16 | DType::BF16))
+                        .unwrap_or(false);
                     match op {
                         BinOpKind::Max | BinOpKind::Min | BinOpKind::Pow => {
                             wl!(out, "{pad}auto {v} = {}({l}, {r});", op.msl_symbol())
@@ -246,15 +250,15 @@ impl MslGenerator {
                         BinOpKind::Shl => wl!(out, "{pad}auto {v} = ({l} << {r});"),
                         BinOpKind::Shr => wl!(out, "{pad}auto {v} = ({l} >> {r});"),
                         BinOpKind::Add => {
-                            // FMA recognition: Mul + Add → fma()
-                            match (try_get_mul(*lhs, block), try_get_mul(*rhs, block)) {
-                                (Some((ml, mr)), None) => wl!(
+                            // FMA recognition: Mul + Add → fma() (floats only)
+                            match (result_is_float, try_get_mul(*lhs, block), try_get_mul(*rhs, block)) {
+                                (true, Some((ml, mr)), None) => wl!(
                                     out,
                                     "{pad}auto {v} = fma({ml}, {mr}, {r});",
                                     ml = self.vname(Some(ml), block, extra_names),
                                     mr = self.vname(Some(mr), block, extra_names),
                                 ),
-                                (None, Some((ml, mr))) => wl!(
+                                (true, None, Some((ml, mr))) => wl!(
                                     out,
                                     "{pad}auto {v} = fma({ml}, {mr}, {l});",
                                     ml = self.vname(Some(ml), block, extra_names),
@@ -264,15 +268,15 @@ impl MslGenerator {
                             }
                         },
                         BinOpKind::Sub => {
-                            // FMA recognition: Mul - X → fma() (only left side, since right-side Sub isn't fma-able)
-                            match try_get_mul(*lhs, block) {
-                                Some((ml, mr)) => wl!(
+                            // FMA recognition: Mul - X → fma() (floats only)
+                            match (result_is_float, try_get_mul(*lhs, block)) {
+                                (true, Some((ml, mr))) => wl!(
                                     out,
                                     "{pad}auto {v} = fma({ml}, {mr}, -{r});",
                                     ml = self.vname(Some(ml), block, extra_names),
                                     mr = self.vname(Some(mr), block, extra_names),
                                 ),
-                                None => wl!(out, "{pad}auto {v} = {l} - {r};"),
+                                _ => wl!(out, "{pad}auto {v} = {l} - {r};"),
                             }
                         },
                         _ => wl!(out, "{pad}auto {v} = {l} {} {r};", op.msl_symbol()),
