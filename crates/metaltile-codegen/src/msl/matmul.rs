@@ -87,8 +87,8 @@ impl super::MslGenerator {
         thrds: u32,
     ) -> crate::error::Result<()> {
         wl!(out);
-        wl!(out, "{pad}threadgroup half A_tile[{TM} * {TK}];");
-        wl!(out, "{pad}threadgroup half B_tile[{TK} * {TN}];");
+        wl!(out, "{pad}threadgroup half A_tile[{TM} * ({TK} + 1)];");
+        wl!(out, "{pad}threadgroup half B_tile[{TK} * ({TN} + 1)];");
         wl!(out, "{pad}const uint row_start = tgid.y * {TM};");
         wl!(out, "{pad}const uint col_start = tgid.x * {TN};");
         wl!(out, "{pad}float acc[{RPT}][{CPT}];");
@@ -98,15 +98,15 @@ impl super::MslGenerator {
         );
         wl!(out);
         wl!(out, "{pad}for (uint kb = 0; kb < {k}; kb += {TK}) {{");
-        wl!(out, "{pad}    for (uint i = tid.y*{THX}+tid.x; i < {TM}*{TK}; i += {thrds}) {{");
-        wl!(out, "{pad}        uint r = i/{TK}, ko = kb + (i%{TK});");
+        wl!(out, "{pad}    for (uint i = tid.y*{THX}+tid.x; i < {TM}*({TK}+1); i += {thrds}) {{");
+        wl!(out, "{pad}        uint r = i/({TK}+1), ko = kb + (i%({TK}+1));");
         wl!(
             out,
             "{pad}        A_tile[i] = (row_start+r < {m} && ko < {k}) ? {a}[(row_start+r)*{k}+ko] : 0.0h;"
         );
         wl!(out, "{pad}    }}");
-        wl!(out, "{pad}    for (uint i = tid.y*{THX}+tid.x; i < {TK}*{TN}; i += {thrds}) {{");
-        wl!(out, "{pad}        uint ko = kb + (i/{TN}), c2 = i%{TN};");
+        wl!(out, "{pad}    for (uint i = tid.y*{THX}+tid.x; i < {TK}*({TN}+1); i += {thrds}) {{");
+        wl!(out, "{pad}        uint ko = kb + (i/({TN}+1)), c2 = i%({TN}+1);");
         wl!(
             out,
             "{pad}        B_tile[i] = (ko < {k} && col_start+c2 < {n}) ? {b}[ko*{n}+col_start+c2] : 0.0h;"
@@ -121,7 +121,7 @@ impl super::MslGenerator {
         wl!(out, "{pad}            for (uint kk = 0; kk < {TK}; kk++)");
         wl!(
             out,
-            "{pad}                s += float(A_tile[lr*{TK}+kk]) * float(B_tile[kk*{TN}+lc]);"
+            "{pad}                s += float(A_tile[lr*({TK}+1)+kk]) * float(B_tile[kk*({TN}+1)+lc]);"
         );
         wl!(out, "{pad}            acc[r][c2] += s;");
         wl!(out, "{pad}        }}");
@@ -163,10 +163,11 @@ impl super::MslGenerator {
         const SGN: u32 = 4;
         const SG_COLS: u32 = 2;
 
-        let AB_SZ: u32 = TM * TK;
+        let AB_SZ: u32 = TM * (TK + 1);
+        let B_HALF_SZ: u32 = TK * (TN + 1);
         wl!(out);
-        wl!(out, "{pad}threadgroup half A_tile[2 * {TM} * {TK}];");
-        wl!(out, "{pad}threadgroup half B_tile[2 * {TK} * {TN}];");
+        wl!(out, "{pad}threadgroup half A_tile[2 * {TM} * ({TK} + 1)];");
+        wl!(out, "{pad}threadgroup half B_tile[2 * {TK} * ({TN} + 1)];");
         wl!(out, "{pad}const uint sg_x = simd_group % {SG_COLS};");
         wl!(out, "{pad}const uint sg_y = simd_group / {SG_COLS};");
 
@@ -198,12 +199,12 @@ impl super::MslGenerator {
         wl!(out, "{pad}    if (a_gm < {m} && a_cv + {VEC}u <= {k}) {{");
         wl!(
             out,
-            "{pad}        *((threadgroup uint4*)(A_tile + a_rv*{TK} + a_cv)) = *((const device uint4*)({a} + a_gm*{k} + a_cv));"
+            "{pad}        *((threadgroup uint4*)(A_tile + a_rv*({TK}+1) + a_cv)) = *((const device uint4*)({a} + a_gm*{k} + a_cv));"
         );
         wl!(out, "{pad}    }} else {{");
         wl!(
             out,
-            "{pad}        for (uint _i = 0; _i < {VEC}u; _i++) A_tile[a_rv*{TK} + a_cv + _i] = (a_gm < {m} && a_cv+_i < {k}) ? {a}[a_gm*{k} + a_cv + _i] : 0.0h;"
+            "{pad}        for (uint _i = 0; _i < {VEC}u; _i++) A_tile[a_rv*({TK}+1) + a_cv + _i] = (a_gm < {m} && a_cv+_i < {k}) ? {a}[a_gm*{k} + a_cv + _i] : 0.0h;"
         );
         wl!(out, "{pad}    }}");
         wl!(out, "{pad}}}");
@@ -212,12 +213,12 @@ impl super::MslGenerator {
         wl!(out, "{pad}    if (b_rv < {k} && b_gc + {VEC}u <= {n}) {{");
         wl!(
             out,
-            "{pad}        *((threadgroup uint4*)(B_tile + b_rv*{TN} + b_cv)) = *((const device uint4*)({b} + b_rv*{n} + b_gc));"
+            "{pad}        *((threadgroup uint4*)(B_tile + b_rv*({TN}+1) + b_cv)) = *((const device uint4*)({b} + b_rv*{n} + b_gc));"
         );
         wl!(out, "{pad}    }} else {{");
         wl!(
             out,
-            "{pad}        for (uint _i = 0; _i < {VEC}u; _i++) B_tile[b_rv*{TN} + b_cv + _i] = (b_rv < {k} && tgid.x*{TN}+b_cv+_i < {n}) ? {b}[b_rv*{n} + tgid.x*{TN}+b_cv+_i] : 0.0h;"
+            "{pad}        for (uint _i = 0; _i < {VEC}u; _i++) B_tile[b_rv*({TN}+1) + b_cv + _i] = (b_rv < {k} && tgid.x*{TN}+b_cv+_i < {n}) ? {b}[b_rv*{n} + tgid.x*{TN}+b_cv+_i] : 0.0h;"
         );
         wl!(out, "{pad}    }}");
         wl!(out, "{pad}}}");
@@ -227,9 +228,9 @@ impl super::MslGenerator {
         wl!(out, "{pad}for (uint kb = 0; kb < {k}; kb += {TK}) {{");
         wl!(out, "{pad}    uint nxt_buf = cur_buf ^ 1;");
         wl!(out, "{pad}    uint ca = cur_buf * {AB_SZ};");
-        wl!(out, "{pad}    uint cb = cur_buf * {AB_SZ};");
+        wl!(out, "{pad}    uint cb = cur_buf * {B_HALF_SZ};");
         wl!(out, "{pad}    uint na = nxt_buf * {AB_SZ};");
-        wl!(out, "{pad}    uint nb = nxt_buf * {AB_SZ};");
+        wl!(out, "{pad}    uint nb = nxt_buf * {B_HALF_SZ};");
         wl!(out, "{pad}    if (kb + {TK} < {k}) {{");
         wl!(out, "{pad}        {{");
         wl!(out, "{pad}            const uint a_gm = tgid.y*{TM} + a_rv;");
@@ -237,12 +238,12 @@ impl super::MslGenerator {
         wl!(out, "{pad}            if (a_gm < {m} && a_kc + {VEC}u <= {k}) {{");
         wl!(
             out,
-            "{pad}                *((threadgroup uint4*)(A_tile + na + a_rv*{TK} + a_cv)) = *((const device uint4*)({a} + a_gm*{k} + a_kc));"
+            "{pad}                *((threadgroup uint4*)(A_tile + na + a_rv*({TK}+1) + a_cv)) = *((const device uint4*)({a} + a_gm*{k} + a_kc));"
         );
         wl!(out, "{pad}            }} else {{");
         wl!(
             out,
-            "{pad}                for (uint _i = 0; _i < {VEC}u; _i++) A_tile[na + a_rv*{TK} + a_cv + _i] = (a_gm < {m} && a_kc+_i < {k}) ? {a}[a_gm*{k} + a_kc + _i] : 0.0h;"
+            "{pad}                for (uint _i = 0; _i < {VEC}u; _i++) A_tile[na + a_rv*({TK}+1) + a_cv + _i] = (a_gm < {m} && a_kc+_i < {k}) ? {a}[a_gm*{k} + a_kc + _i] : 0.0h;"
         );
         wl!(out, "{pad}            }}");
         wl!(out, "{pad}        }}");
@@ -252,12 +253,12 @@ impl super::MslGenerator {
         wl!(out, "{pad}            if (b_kr < {k} && b_gc + {VEC}u <= {n}) {{");
         wl!(
             out,
-            "{pad}                *((threadgroup uint4*)(B_tile + nb + b_rv*{TN} + b_cv)) = *((const device uint4*)({b} + b_kr*{n} + b_gc));"
+            "{pad}                *((threadgroup uint4*)(B_tile + nb + b_rv*({TN}+1) + b_cv)) = *((const device uint4*)({b} + b_kr*{n} + b_gc));"
         );
         wl!(out, "{pad}            }} else {{");
         wl!(
             out,
-            "{pad}                for (uint _i = 0; _i < {VEC}u; _i++) B_tile[nb + b_rv*{TN} + b_cv + _i] = (b_kr < {k} && tgid.x*{TN}+b_cv+_i < {n}) ? {b}[b_kr*{n} + tgid.x*{TN}+b_cv+_i] : 0.0h;"
+            "{pad}                for (uint _i = 0; _i < {VEC}u; _i++) B_tile[nb + b_rv*({TN}+1) + b_cv + _i] = (b_kr < {k} && tgid.x*{TN}+b_cv+_i < {n}) ? {b}[b_kr*{n} + tgid.x*{TN}+b_cv+_i] : 0.0h;"
         );
         wl!(out, "{pad}            }}");
         wl!(out, "{pad}        }}");
@@ -269,14 +270,14 @@ impl super::MslGenerator {
             wl!(out, "{pad}        simdgroup_half8x8 bv{fj};");
             wl!(
                 out,
-                "{pad}        simdgroup_load(bv{fj}, B_tile + cb + kk*{TN} + (sg_x*{SGN}+{fj})*8, {TN}, ulong2(0,0), false);"
+                "{pad}        simdgroup_load(bv{fj}, B_tile + cb + kk*({TN}+1) + (sg_x*{SGN}+{fj})*8, {TN}+1, ulong2(0,0), false);"
             );
         }
         for fi in 0..SGM {
             wl!(out, "{pad}        simdgroup_half8x8 av{fi};");
             wl!(
                 out,
-                "{pad}        simdgroup_load(av{fi}, A_tile + ca + (sg_y*{SGM}+{fi})*8*{TK} + kk, {TK}, ulong2(0,0), false);"
+                "{pad}        simdgroup_load(av{fi}, A_tile + ca + (sg_y*{SGM}+{fi})*8*({TK}+1) + kk, {TK}+1, ulong2(0,0), false);"
             );
             for fj in 0..SGN {
                 let idx = fi * SGN + fj;
