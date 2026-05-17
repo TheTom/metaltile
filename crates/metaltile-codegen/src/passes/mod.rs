@@ -1,6 +1,8 @@
 //! Pass infrastructure and optimization passes.
 
+pub mod algebraic_simplify;
 pub mod const_fold;
+pub mod copy_prop;
 pub mod cse;
 pub mod fusion;
 pub mod licm;
@@ -97,14 +99,16 @@ pub struct PipelineBuilder {
 }
 
 impl PipelineBuilder {
-    /// Create a builder with the standard 9-pass pipeline:
+    /// Create a builder with the standard 12-pass pipeline:
     ///
-    /// TypeCheck → ConstFold → CSE → LICM → TileLowering → Fusion → Unroll → Schedule → Vectorize
+    /// TypeCheck → ConstFold → AlgebraicSimplify → CopyProp → CSE → LICM → TileLowering → Fusion → Unroll → Schedule → Vectorize
     pub fn standard() -> Self {
         PipelineBuilder {
             passes: vec![
                 Box::new(type_check::TypeCheckPass),
                 Box::new(const_fold::ConstFoldPass::new()),
+                Box::new(algebraic_simplify::AlgebraicSimplifyPass),
+                Box::new(copy_prop::CopyPropPass),
                 Box::new(cse::CsePass),
                 Box::new(licm::LicmPass),
                 Box::new(tile_lowering::TileLoweringPass::default()),
@@ -142,5 +146,5 @@ impl PipelineBuilder {
 /// Standard optimization pipeline.
 ///
 /// Order (CODEGEN_OVERHAUL.md §3):
-///   TypeCheck → ConstFold → CSE → LICM → TileLowering → Fusion → Unroll → Schedule → Vectorize
+///   TypeCheck → ConstFold → AlgebraicSimplify → CopyProp → CSE → LICM → TileLowering → Fusion → Unroll → Schedule → Vectorize
 pub fn standard_pipeline() -> Vec<Box<dyn Pass>> { PipelineBuilder::standard().build() }
