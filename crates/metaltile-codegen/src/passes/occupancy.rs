@@ -13,8 +13,11 @@
 //! | Apple10 (M4) | 1024 | ~32KB | Dynamic | Improved OMU |
 //! | Apple11 (M5) | 1024 | ~32KB | Dynamic | Smarter OMU |
 //!
-//! For M3+, register allocation is dynamic; we use 128 as a conservative
-//! heuristic since the OMU is opaque to us.
+//! For M3+, register allocation is dynamically managed by the Occupancy
+//! Management Unit (OMU). Our 128-register guide is a soft heuristic —
+//! the OMU may run shaders above or below this threshold depending on
+//! cache pressure and available L1. We model register pressure as a
+//! gradual degradation, not a hard ceiling.
 //!
 //! ## Usage
 //!
@@ -32,25 +35,34 @@ pub struct GpuLimits {
     pub max_threads_per_tg: u32,
     /// Threadgroup memory in bytes.
     pub tg_memory_bytes: u32,
-    /// Maximum registers per thread (conservative for M3+).
-    pub max_regs_per_thread: u32,
+    /// Soft register guide (not a hard ceiling on M3+ where the OMU
+    /// dynamically allocates registers).
+    pub regs_per_thread_guide: u32,
 }
 
 impl Default for GpuLimits {
     fn default() -> Self {
-        GpuLimits { max_threads_per_tg: 1024, tg_memory_bytes: 32 * 1024, max_regs_per_thread: 128 }
+        GpuLimits {
+            max_threads_per_tg: 1024,
+            tg_memory_bytes: 32 * 1024,
+            regs_per_thread_guide: 128,
+        }
     }
 }
 
 /// Bottleneck preventing higher occupancy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bottleneck {
-    /// Register file is the limiting factor.
+    /// Register pressure is degrading occupancy.
     RegisterLimited,
-    /// Threadgroup memory is the limiting factor.
+    /// Threadgroup memory size is the limiting factor.
     MemoryLimited,
     /// Thread count is the limiting factor.
     ThreadLimited,
+    /// Tile working set exceeds likely on-chip cache.
+    /// The OMU may throttle occupancy to prevent L1 thrashing.
+    /// (Set by the autotuner when tile dims are known; not computed in estimate_occupancy.)
+    CachePressure,
 }
 
 /// Occupancy estimate for a kernel with a given threadgroup size.
@@ -60,7 +72,10 @@ pub struct OccupancyEstimate {
     pub occupancy_pct: f64,
     /// The primary bottleneck.
     pub bottleneck: Bottleneck,
-    /// Maximum simultaneous threadgroups per compute unit, if estimable.
+    /// Upper bound on simultaneous threadgroups per shader core.
+    ///
+    /// Computed from the simple resource model. The actual count is decided
+    /// by the OMU at runtime and may be lower due to cache pressure.
     pub max_tgs_per_cu: Option<u32>,
 }
 
@@ -76,38 +91,53 @@ pub fn estimate_occupancy(
     let limits = GpuLimits::default();
     let reg_est = register_estimate::estimate_registers(kernel);
 
-    // Register-limited occupancy.
-    let reg_occ = limits.max_regs_per_thread as f64 / reg_est.regs_per_thread as f64;
-    let reg_occ = reg_occ.min(1.0); // can't exceed 100%
+    // --- Register pressure (soft degradation, not a hard ceiling) ---
+    //
+    // On M3+, the OMU dynamically allocates registers. High register usage
+    // degrades occupancy gradually rather than hitting a hard cliff at 128.
+    // At ≤ the guide value, no penalty. Beyond that, linear degradation
+    // to 10% at double the guide (i.e., at 256 regs/thr).
+    let reg_occ = if reg_est.regs_per_thread <= limits.regs_per_thread_guide as usize {
+        1.0
+    } else {
+        let excess = reg_est.regs_per_thread as f64 - limits.regs_per_thread_guide as f64;
+        (1.0 - excess / limits.regs_per_thread_guide as f64).max(0.1)
+    };
 
-    // Thread-limited occupancy.
+    // --- Thread-limited occupancy ---
+    //
+    // Hard ceiling: max 1024 threads per threadgroup on Apple GPUs.
     let thr_occ = limits.max_threads_per_tg as f64 / threadgroup_size as f64;
     let thr_occ = thr_occ.min(1.0);
 
-    // Memory-limited occupancy.
+    // --- Threadgroup memory ---
+    //
+    // Hard ceiling: max 32 KB per threadgroup on Apple GPUs.
     let mem_occ = if let Some(mem_used) = tg_mem_usage_bytes {
         if mem_used == 0 { 1.0 } else { (limits.tg_memory_bytes as f64 / mem_used as f64).min(1.0) }
     } else {
         1.0
     };
 
-    // Find the minimum → that's the occupancy.
+    // Occupancy is the minimum across all dimensions.
     let mut occ = reg_occ.min(thr_occ).min(mem_occ);
-    // Round to avoid floating-point noise.
     occ = (occ * 1000.0).round() / 1000.0;
 
+    // --- Bottleneck identification ---
+    //
+    // Pick the strictest limiter. When multiple limiters are within rounding
+    // tolerance of each other, we report the most actionable one (register
+    // pressure > memory > thread count).
     let bottleneck = if occ >= 0.999 {
-        // At or near 100%, the thread count is the hard ceiling.
         Bottleneck::ThreadLimited
-    } else if (occ - reg_occ).abs() < 0.001 {
+    } else if reg_occ <= mem_occ && reg_occ <= thr_occ || (reg_occ - occ).abs() < 0.002 {
         Bottleneck::RegisterLimited
-    } else if (occ - mem_occ).abs() < 0.001 {
+    } else if mem_occ <= thr_occ || (mem_occ - occ).abs() < 0.002 {
         Bottleneck::MemoryLimited
     } else {
         Bottleneck::ThreadLimited
     };
 
-    // Max TGs per CU: if occupancy is 25%, 4 TGs can fit.
     let max_tgs = if occ > 0.0 { Some((1.0 / occ).round() as u32) } else { None };
 
     OccupancyEstimate { occupancy_pct: occ * 100.0, bottleneck, max_tgs_per_cu: max_tgs }

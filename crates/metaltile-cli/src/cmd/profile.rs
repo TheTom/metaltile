@@ -82,7 +82,7 @@ pub fn run(args: &[String]) {
             paint_stdout("MetalTile Occupancy Profile", Style::new().fg(Color::BrightWhite).bold(),),
         );
         println!(
-            "{}  max-threads/tg=1024  tg-mem=32KB  max-regs=128",
+            "{}  max-threads/tg=1024  tg-mem=32KB  regs-guide=128 (soft; M3+ dynamic)",
             paint_stdout("GPU limits:", Style::new().fg(Color::BrightBlack),),
         );
         println!();
@@ -119,8 +119,8 @@ pub fn run(args: &[String]) {
 
         if sweep_flag {
             // Full per-size table.
-            println!("  {:<10} {:>6}  {:>6}  {:<22}", "tg_size", "occ%", "max_tgs", "bottleneck");
-            println!("  {:-<10} {:-<6}  {:-<6}  {:-<22}", "", "", "", "");
+            println!("  {:<10} {:>6}  {:>8}  {:<22}", "tg_size", "occ%", "~max_tgs", "bottleneck");
+            println!("  {:-<10} {:-<6}  {:-<8}  {:-<22}", "", "", "", "");
             for &tg_size in TG_SWEEP {
                 let est = occupancy::estimate_occupancy(&k, tg_size, None);
                 let pct = paint_stdout(
@@ -133,9 +133,9 @@ pub fn run(args: &[String]) {
                         Style::new().fg(Color::Red)
                     },
                 );
-                let tgs = est.max_tgs_per_cu.map(|n| n.to_string()).unwrap_or_else(|| "—".into());
+                let tgs = est.max_tgs_per_cu.map(|n| format!("~{n}")).unwrap_or_else(|| "—".into());
                 let bn = bottle_label(est.bottleneck);
-                println!("  {:<10} {}  {:>6}  {}", tg_size, pct, tgs, bn);
+                println!("  {:<10} {}  {:>8}  {}", tg_size, pct, tgs, bn);
             }
         }
 
@@ -156,10 +156,7 @@ pub fn run(args: &[String]) {
         }
     } else {
         // Compact table: best result per kernel.
-        println!(
-            "  {:<24} {:>5}  {:>6}  {:>7}  {}",
-            "kernel", "tg", "occ%", "regs/th", "bottleneck"
-        );
+        println!("  {:<24} {:>5}  {:>6}  {:>7}  bottleneck", "kernel", "tg", "occ%", "regs/th");
         println!("  {:-<24} {:-<5}  {:-<6}  {:-<7}  {:-<22}", "", "", "", "", "");
 
         for (name, (spec, dtypes)) in &matched {
@@ -236,6 +233,8 @@ fn bottle_label(bn: Bottleneck) -> String {
             paint_stdout("register-limited", Style::new().fg(Color::Yellow)).to_string(),
         Bottleneck::MemoryLimited =>
             paint_stdout("memory-limited", Style::new().fg(Color::Magenta)).to_string(),
+        Bottleneck::CachePressure =>
+            paint_stdout("cache-pressure", Style::new().fg(Color::Magenta)).to_string(),
         Bottleneck::ThreadLimited =>
             paint_stdout("thread-limited", Style::new().fg(Color::Green)).to_string(),
     }
