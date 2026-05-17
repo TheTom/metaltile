@@ -957,10 +957,14 @@ impl MslGenerator {
                         (4, DType::F16) => "half4".into(),
                         (4, DType::F32) => "float4".into(),
                         (8, DType::F16) => "half8".into(),
+                        (4, DType::BF16) if self.config.native_bfloat => "bfloat4".into(),
+                        (2, DType::BF16) if self.config.native_bfloat => "bfloat2".into(),
                         (2, _) => format!("{}2", scalar_t),
                         (4, _) => format!("{}4", scalar_t),
                         _ => format!("{}4", scalar_t),
                     };
+                    // For compat bfloat (no vector types), fall back to scalar loads.
+                    // The vectorizer won't create BF16 vectors in compat mode.
                     wl!(
                         out,
                         "{pad}{vec_t} {v} = *((device {vec_t}*)((device {scalar_t}*){src} + {bo}));"
@@ -981,6 +985,8 @@ impl MslGenerator {
                         (4, DType::F16) => "half4".into(),
                         (4, DType::F32) => "float4".into(),
                         (8, DType::F16) => "half8".into(),
+                        (4, DType::BF16) if self.config.native_bfloat => "bfloat4".into(),
+                        (2, DType::BF16) if self.config.native_bfloat => "bfloat2".into(),
                         (2, _) => format!("{}2", scalar_t),
                         (4, _) => format!("{}4", scalar_t),
                         _ => format!("{}4", scalar_t),

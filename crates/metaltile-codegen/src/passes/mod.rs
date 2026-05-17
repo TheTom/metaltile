@@ -7,6 +7,7 @@ pub mod licm;
 pub mod schedule;
 pub mod tile_lowering;
 pub mod type_check;
+pub mod unroll;
 pub mod vectorize;
 
 use std::time::Instant;
@@ -78,7 +79,7 @@ pub fn run_passes_with_stats(
 }
 
 /// Count all ops across the kernel body and all nested blocks.
-fn count_total_ops(kernel: &Kernel) -> usize {
+pub fn count_total_ops(kernel: &Kernel) -> usize {
     let mut total = kernel.body.ops.len();
     for block in kernel.blocks.values() {
         total += block.ops.len();
@@ -96,7 +97,9 @@ pub struct PipelineBuilder {
 }
 
 impl PipelineBuilder {
-    /// Create a builder with the standard 9-pass pipeline.
+    /// Create a builder with the standard 9-pass pipeline:
+    ///
+    /// TypeCheck → ConstFold → CSE → LICM → TileLowering → Fusion → Unroll → Schedule → Vectorize
     pub fn standard() -> Self {
         PipelineBuilder {
             passes: vec![
@@ -106,6 +109,7 @@ impl PipelineBuilder {
                 Box::new(licm::LicmPass),
                 Box::new(tile_lowering::TileLoweringPass::default()),
                 Box::new(fusion::FusionPass),
+                Box::new(unroll::UnrollPass::default()),
                 Box::new(schedule::SchedulePass::default()),
                 Box::new(vectorize::VectorizePass),
             ],
@@ -118,10 +122,17 @@ impl PipelineBuilder {
         self
     }
 
-    /// Override the unroll factor (available after LoopUnroll pass is added).
-    pub fn with_unroll_factor(self, _factor: u32) -> Self {
-        // TODO: wire up UnrollPass when it's added in PR 2.
-        self
+    /// Override the unroll factor.
+    pub fn with_unroll_factor(self, factor: u32) -> Self {
+        let mut passes = self.passes;
+        // Replace the UnrollPass with a new one at the specified factor.
+        for p in passes.iter_mut() {
+            if p.name() == "unroll" {
+                *p = Box::new(unroll::UnrollPass::new(factor));
+                break;
+            }
+        }
+        PipelineBuilder { passes }
     }
 
     /// Build the final pass list.
@@ -131,7 +142,5 @@ impl PipelineBuilder {
 /// Standard optimization pipeline.
 ///
 /// Order (CODEGEN_OVERHAUL.md §3):
-///   TypeCheck -> ConstFold -> CSE -> LICM -> TileLowering -> Fusion -> Schedule -> Vectorize
-///
-/// (LoopUnroll will be added between Fusion and Schedule in a follow-up PR.)
+///   TypeCheck → ConstFold → CSE → LICM → TileLowering → Fusion → Unroll → Schedule → Vectorize
 pub fn standard_pipeline() -> Vec<Box<dyn Pass>> { PipelineBuilder::standard().build() }
