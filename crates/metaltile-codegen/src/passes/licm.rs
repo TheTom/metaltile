@@ -70,16 +70,18 @@ impl super::Pass for LicmPass {
         // Take all blocks out so we can mutate them freely.
         let mut blocks = std::mem::take(&mut kernel.blocks);
 
-        // Process the body first, then nested blocks.
-        // Nested blocks are processed inside-out (post-order): child loops first.
-        licm_block(&mut kernel.body, &mut blocks, &def_block, &read_only);
-
-        // Process each block. We need to handle them in post-order:
-        // blocks that are children of other blocks should be processed first.
-        // Collect them all, sort by dependency depth.
-        let mut block_ids: Vec<BlockId> = blocks.keys().copied().collect();
-        // Simple heuristic: sort by BlockId descending (newer blocks have higher IDs)
-        // This isn't perfect but works for typical linear block allocation.
+        // Process nested blocks first (inside-out / post-order), then kernel.body last.
+        // BlockIds are allocated in order, so higher IDs are deeper-nested children.
+        // Sorting descending ensures children are processed before their parents,
+        // allowing multi-level hoisting (e.g. b3→b2→b1→b0) in a single pass.
+        //
+        // Exclude kernel.body.id: kernel.blocks may contain an entry with the same
+        // BlockId as kernel.body (when the root block is stored there). Processing it
+        // here would operate on the wrong Block object and empty child blocks before
+        // the explicit kernel.body call below.
+        let body_id = kernel.body.id;
+        let mut block_ids: Vec<BlockId> =
+            blocks.keys().copied().filter(|&bid| bid != body_id).collect();
         block_ids.sort_by_key(|bid| -(bid.as_u32() as i32));
 
         for bid in block_ids {
@@ -88,7 +90,10 @@ impl super::Pass for LicmPass {
             blocks.insert(bid, block);
         }
 
+        // kernel.body processed last so it can hoist ops that were themselves
+        // hoisted into direct child blocks by the inner-block passes above.
         kernel.blocks = blocks;
+        licm_block(&mut kernel.body, &mut kernel.blocks, &def_block, &read_only);
         Ok(())
     }
 }

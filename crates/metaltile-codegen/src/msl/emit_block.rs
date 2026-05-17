@@ -305,7 +305,7 @@ impl MslGenerator {
                     let vc = self.vname(Some(*cond), block, extra_names);
                     let vt = self.vname(Some(*on_true), block, extra_names);
                     let vf = self.vname(Some(*on_false), block, extra_names);
-                    wl!(out, "{pad}auto {v} = select({vf}, {vt}, bool({vc}));");
+                    wl!(out, "{pad}auto {v} = bool({vc}) ? {vt} : {vf};");
                 },
 
                 Op::Broadcast { value, shape } => {

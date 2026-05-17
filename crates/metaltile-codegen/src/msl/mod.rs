@@ -438,8 +438,8 @@ mod tests {
             ValueId::new(3),
         );
         let msl = MslGenerator::default().generate(&k).unwrap();
-        assert!(msl.contains("select("), "select call");
         assert!(msl.contains("bool("), "bool cast on condition");
+        assert!(msl.contains("? v1 : v2"), "ternary select");
     }
 
     #[test]
