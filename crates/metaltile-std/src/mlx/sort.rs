@@ -17,7 +17,7 @@ use metaltile::{bench_kernel, kernel};
 pub fn mt_sort<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
     let block_id = program_id::<0>();
     let t = tid;
-    threadgroup_alloc("shared", 1024);
+    threadgroup_alloc("shared", 1024, T);
     let base = block_id * n;
     threadgroup_store("shared", t * 4u32, load(inp[base + t * 4u32]));
     threadgroup_store("shared", t * 4u32 + 1u32, load(inp[base + t * 4u32 + 1u32]));

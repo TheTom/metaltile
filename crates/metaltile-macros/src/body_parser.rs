@@ -1258,18 +1258,22 @@ impl DslBodyParser {
         let size: usize = usize_lit_from_expr(args.get(1).copied());
         let size_u32 = size as u32;
         let dtype_ts = if let Some(ty_arg) = args.get(2) {
-            // Explicit dtype: `T` resolves to kernel generic, anything else via parse_dtype_generic
+            // Explicit dtype: `T` resolves to kernel generic type.
             let ty_str = quote! { #ty_arg }.to_string();
-            if ty_str.trim() == "T" {
-                if let Some(tok) = self.type_vars.get("T") {
-                    tok.clone()
-                } else {
-                    quote! { DType::F32 }
-                }
-            } else {
-                // Parse as a concrete type name
-                let ty: syn::Type = syn::parse_str(&ty_str.trim().replace(' ', "")).unwrap_or_else(|_| syn::parse_str("f32").unwrap());
-                parse_dtype_generic(&ty, &self.type_vars)
+            match ty_str.trim() {
+                "T" => {
+                    if let Some(tok) = self.type_vars.get("T") {
+                        tok.clone()
+                    } else {
+                        quote! { DType::F32 }
+                    }
+                },
+                "f32" => quote! { DType::F32 },
+                "f16" => quote! { DType::F16 },
+                "bf16" => quote! { DType::BF16 },
+                "i32" => quote! { DType::I32 },
+                "u32" => quote! { DType::U32 },
+                _ => quote! { DType::F32 },
             }
         } else {
             quote! { DType::F32 }
