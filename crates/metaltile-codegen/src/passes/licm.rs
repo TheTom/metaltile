@@ -255,11 +255,9 @@ fn licm_block(
     // and nested blocks can't resolve them into inner_names.
     for plan in &plans {
         if let Some(loop_body) = blocks.get(&plan.body_id) {
-            for result in &plan.hoisted_results {
-                if let Some(vid) = result {
-                    if let Some(name) = loop_body.names.get(vid) {
-                        block.names.insert(*vid, name.clone());
-                    }
+            for vid in plan.hoisted_results.iter().flatten() {
+                if let Some(name) = loop_body.names.get(vid) {
+                    block.names.insert(*vid, name.clone());
                 }
             }
         }

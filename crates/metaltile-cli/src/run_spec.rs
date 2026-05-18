@@ -1688,6 +1688,7 @@ fn run_sdpa_vector(
 
 // ── SteelGemm (simdgroup tiled GEMM) ────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn run_steel_gemm(
     spec: &BenchSpec,
     runner: &GpuRunner,
@@ -1721,7 +1722,7 @@ fn run_steel_gemm(
     // Compile MLX reference kernel with function constants
     let mlx_k = spec.mlx_src.and_then(|src| {
         spec.mlx_pattern.and_then(|pat| {
-            let name = pat.replace("{tn}", &DtypeCtx::elementwise(dt).tn.to_string());
+            let name = pat.replace("{tn}", DtypeCtx::elementwise(dt).tn);
             // has_batch(10)=false, use_out_source(100)=false, do_axpby(110)=false,
             // align_M(200)=true, align_N(201)=true, align_K(202)=true
             runner.compile_with_bool_constants(
