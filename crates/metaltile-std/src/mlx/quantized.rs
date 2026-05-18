@@ -23,15 +23,15 @@ static QUANTIZED_SHAPES: &[(usize, usize)] =
     tol=1e-3,
     mlx="affine_qmv_fast_float16_t_gs_64_b_4_batch_0",
     metal_file="quantized.metal",
-    dtypes=crate::spec::F32_ONLY,
+    dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16],
 )]
 #[kernel]
-pub fn mt_qmv_f32(
+pub fn mt_qmv<T>(
     w: Tensor<u32>,
-    scales: Tensor<f32>,
-    biases: Tensor<f32>,
-    x: Tensor<f32>,
-    out: Tensor<f32>,
+    scales: Tensor<T>,
+    biases: Tensor<T>,
+    x: Tensor<T>,
+    out: Tensor<T>,
     #[constexpr] k: u32,
     #[constexpr] gs_per_row: u32,
 ) {
@@ -107,22 +107,24 @@ pub fn mt_qmv_f32(
         // Incremental xs accumulator from raw loads — saves 12 muls vs the
         // reconstruction-from-scaled approach. Raw x dies right after the
         // scale + xs accumulator both consume it.
-        let x0 = load(x[xi0]);
-        let x1_raw = load(x[xi1]);
-        let x2_raw = load(x[xi2]);
-        let x3_raw = load(x[xi3]);
-        let x4 = load(x[xi4]);
-        let x5_raw = load(x[xi5]);
-        let x6_raw = load(x[xi6]);
-        let x7_raw = load(x[xi7]);
-        let x8 = load(x[xi8]);
-        let x9_raw = load(x[xi9]);
-        let x10_raw = load(x[xi10]);
-        let x11_raw = load(x[xi11]);
-        let x12 = load(x[xi12]);
-        let x13_raw = load(x[xi13]);
-        let x14_raw = load(x[xi14]);
-        let x15_raw = load(x[xi15]);
+        // Cast T-typed X to f32 at load time for the inner FMA chain;
+        // accumulators stay in f32 regardless of T. Identity for T=f32.
+        let x0 = load(x[xi0]).cast::<f32>();
+        let x1_raw = load(x[xi1]).cast::<f32>();
+        let x2_raw = load(x[xi2]).cast::<f32>();
+        let x3_raw = load(x[xi3]).cast::<f32>();
+        let x4 = load(x[xi4]).cast::<f32>();
+        let x5_raw = load(x[xi5]).cast::<f32>();
+        let x6_raw = load(x[xi6]).cast::<f32>();
+        let x7_raw = load(x[xi7]).cast::<f32>();
+        let x8 = load(x[xi8]).cast::<f32>();
+        let x9_raw = load(x[xi9]).cast::<f32>();
+        let x10_raw = load(x[xi10]).cast::<f32>();
+        let x11_raw = load(x[xi11]).cast::<f32>();
+        let x12 = load(x[xi12]).cast::<f32>();
+        let x13_raw = load(x[xi13]).cast::<f32>();
+        let x14_raw = load(x[xi14]).cast::<f32>();
+        let x15_raw = load(x[xi15]).cast::<f32>();
         let xs = x0 + x1_raw + x2_raw + x3_raw + x4 + x5_raw + x6_raw + x7_raw
             + x8 + x9_raw + x10_raw + x11_raw + x12 + x13_raw + x14_raw + x15_raw;
         let x1 = x1_raw * s_16;
@@ -148,8 +150,8 @@ pub fn mt_qmv_f32(
         let p01 = load(w[w_base0 + pack_off + 1u32]);
         let p00_hi = p00 >> 16u32;
         let p01_hi = p01 >> 16u32;
-        let s0 = load(scales[sb_base0 + g]);
-        let bi0 = load(biases[sb_base0 + g]);
+        let s0 = load(scales[sb_base0 + g]).cast::<f32>();
+        let bi0 = load(biases[sb_base0 + g]).cast::<f32>();
         // Lo half (nibbles 0-3): mask 0xf, 0xf0, 0xf00, 0xf000 — values *1, *16, *256, *4096.
         // Multiplied against pre-scaled x[0..3] (*1, *1/16, *1/256, *1/4096) → q*x.
         let q00 = (p00 & 15u32).cast::<f32>();
@@ -191,8 +193,8 @@ pub fn mt_qmv_f32(
         let p11 = load(w[w_base1 + pack_off + 1u32]);
         let p10_hi = p10 >> 16u32;
         let p11_hi = p11 >> 16u32;
-        let s1 = load(scales[sb_base1 + g]);
-        let bi1 = load(biases[sb_base1 + g]);
+        let s1 = load(scales[sb_base1 + g]).cast::<f32>();
+        let bi1 = load(biases[sb_base1 + g]).cast::<f32>();
         let q10 = (p10 & 15u32).cast::<f32>();
         let q11 = (p10 & 240u32).cast::<f32>();
         let q12 = (p10 & 3840u32).cast::<f32>();
@@ -232,8 +234,8 @@ pub fn mt_qmv_f32(
         let p21 = load(w[w_base2 + pack_off + 1u32]);
         let p20_hi = p20 >> 16u32;
         let p21_hi = p21 >> 16u32;
-        let s2 = load(scales[sb_base2 + g]);
-        let bi2 = load(biases[sb_base2 + g]);
+        let s2 = load(scales[sb_base2 + g]).cast::<f32>();
+        let bi2 = load(biases[sb_base2 + g]).cast::<f32>();
         let q20 = (p20 & 15u32).cast::<f32>();
         let q21 = (p20 & 240u32).cast::<f32>();
         let q22 = (p20 & 3840u32).cast::<f32>();
@@ -273,8 +275,8 @@ pub fn mt_qmv_f32(
         let p31 = load(w[w_base3 + pack_off + 1u32]);
         let p30_hi = p30 >> 16u32;
         let p31_hi = p31 >> 16u32;
-        let s3 = load(scales[sb_base3 + g]);
-        let bi3 = load(biases[sb_base3 + g]);
+        let s3 = load(scales[sb_base3 + g]).cast::<f32>();
+        let bi3 = load(biases[sb_base3 + g]).cast::<f32>();
         let q30 = (p30 & 15u32).cast::<f32>();
         let q31 = (p30 & 240u32).cast::<f32>();
         let q32 = (p30 & 3840u32).cast::<f32>();
@@ -316,10 +318,10 @@ pub fn mt_qmv_f32(
     let r2 = simd_sum(acc2);
     let r3 = simd_sum(acc3);
     if lane == 0u32 {
-        store(out[row0], r0);
-        store(out[row1], r1);
-        store(out[row2], r2);
-        store(out[row3], r3);
+        store(out[row0], r0.cast::<T>());
+        store(out[row1], r1.cast::<T>());
+        store(out[row2], r2.cast::<T>());
+        store(out[row3], r3.cast::<T>());
     }
 }
 

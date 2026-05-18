@@ -798,13 +798,13 @@ fn run_fp_quantized(
 fn run_quantized_mat_vec(
     spec: &BenchSpec,
     runner: &GpuRunner,
-    _dt: DType,
+    dt: DType,
     bench: &OpBench,
     shapes: &[(usize, usize)],
     group_size: usize,
     tpg: usize,
 ) -> Vec<OpResult> {
-    let msl = match msl_reduction(spec, DType::F32) {
+    let msl = match msl_reduction(spec, dt) {
         Some(s) => s,
         None => return vec![],
     };
@@ -814,12 +814,40 @@ fn run_quantized_mat_vec(
     };
     let ref_kernel = compile_mlx(runner, spec.mlx_src, spec.mlx_pattern, "");
     let mut results = Vec::new();
+    let dtype_bytes: usize = match dt {
+        DType::F16 => 2,
+        _ => 4,
+    };
+    let dtype_label = match dt {
+        DType::F16 => "f16",
+        _ => "f32",
+    };
+    let f32_to_dtype = |v: f32| -> Vec<u8> {
+        match dt {
+            DType::F16 => half::f16::from_f32(v).to_bits().to_le_bytes().to_vec(),
+            _ => v.to_le_bytes().to_vec(),
+        }
+    };
+    let read_mt_out = |runner: &GpuRunner, buf: &GpuBuffer, n: usize| -> Vec<f32> {
+        match dt {
+            DType::F16 => runner
+                .read_bytes(buf, n * 2)
+                .chunks_exact(2)
+                .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+                .collect(),
+            _ => runner.read_f32_slice(buf, n),
+        }
+    };
+    let make_buf = |runner: &GpuRunner, data: &[f32]| -> GpuBuffer {
+        let bytes: Vec<u8> = data.iter().flat_map(|&v| f32_to_dtype(v)).collect();
+        runner.buffer_bytes(&bytes)
+    };
     for &(m, k) in shapes {
         let w_elems = m * k / 8;
         let sb_elems = m * k / group_size;
         let gs_per_row = k / group_size;
         // Correctness check: M=8 rows × K=512 (one TG = 2 SG × 4 rows × 8 groups).
-        // mt_qmv_f32 requires K%512==0 (block_size = 16 X × 32 lanes).
+        // mt_qmv requires K%512==0 (block_size = 16 X × 32 lanes).
         let cm = 8usize;
         let ck = 512usize;
         let cgs_per_row = ck / group_size;
@@ -835,18 +863,50 @@ fn run_quantized_mat_vec(
         let s_check: Vec<f32> = (0..cm * cgs_per_row).map(|i| 0.1 + (i as f32) * 0.001).collect();
         let b_check = vec![0.0f32; cm * cgs_per_row];
         let x_check: Vec<f32> = (0..ck).map(|i| 1.0 + (i as f32) * 0.001).collect();
+        // Compute ref through the kernel dtype's rounding so f16 doesn't fail equiv
+        // against an f32-perfect oracle.
+        let s_dt: Vec<f32> = s_check
+            .iter()
+            .map(|&v| {
+                if dt == DType::F16 {
+                    half::f16::from_f32(v).to_f32()
+                } else {
+                    v
+                }
+            })
+            .collect();
+        let b_dt: Vec<f32> = b_check
+            .iter()
+            .map(|&v| {
+                if dt == DType::F16 {
+                    half::f16::from_f32(v).to_f32()
+                } else {
+                    v
+                }
+            })
+            .collect();
+        let x_dt: Vec<f32> = x_check
+            .iter()
+            .map(|&v| {
+                if dt == DType::F16 {
+                    half::f16::from_f32(v).to_f32()
+                } else {
+                    v
+                }
+            })
+            .collect();
         let ref_out: Vec<f32> = (0..cm)
             .map(|row| {
                 let mut acc = 0.0f32;
                 for g in 0..cgs_per_row {
-                    let s = s_check[row * cgs_per_row + g];
-                    let bias = b_check[row * cgs_per_row + g];
+                    let s = s_dt[row * cgs_per_row + g];
+                    let bias = b_dt[row * cgs_per_row + g];
                     for p in 0..8usize {
                         let packed = w_check[row * ck / 8 + g * 8 + p];
                         for bit in 0..8u32 {
                             let int4_val = ((packed >> (bit * 4)) & 0xF) as f32;
                             acc += (s * int4_val + bias)
-                                * x_check[g * group_size + p * 8 + bit as usize];
+                                * x_dt[g * group_size + p * 8 + bit as usize];
                         }
                     }
                 }
@@ -855,13 +915,13 @@ fn run_quantized_mat_vec(
             .collect();
         let w_bytes: Vec<u8> = w_check.iter().flat_map(|v| v.to_le_bytes()).collect();
         let w_buf_c = runner.buffer_bytes(&w_bytes);
-        let s_buf_c = runner.buffer_f32(&s_check);
-        let b_buf_c = runner.buffer_f32(&b_check);
-        let x_buf_c = runner.buffer_f32(&x_check);
-        let out_c = runner.buffer_zeros(cm * 4);
+        let s_buf_c = make_buf(runner, &s_check);
+        let b_buf_c = make_buf(runner, &b_check);
+        let x_buf_c = make_buf(runner, &x_check);
+        let out_c = runner.buffer_zeros(cm * dtype_bytes);
         let k_buf_c = runner.buffer_u32(ck as u32);
         let gpr_buf_c = runner.buffer_u32(cgs_per_row as u32);
-        // mt_qmv_f32 processes 8 output rows per TG (2 SG × 4 rows).
+        // mt_qmv processes 8 output rows per TG (2 SG × 4 rows).
         const ROWS_PER_TG: usize = 8;
         runner.measure(
             &mk,
@@ -871,9 +931,11 @@ fn run_quantized_mat_vec(
             0,
             1,
         );
-        let mt_out_c = runner.read_f32_slice(&out_c, cm);
+        let mt_out_c = read_mt_out(runner, &out_c, cm);
+        // f16 has ~3 decimal digits of precision; tolerance must match dtype.
+        let tol: f32 = if dt == DType::F16 { 1.0 } else { 1e-3 };
         let n_bad =
-            ref_out.iter().zip(mt_out_c.iter()).filter(|(r, m)| (*r - *m).abs() > 1e-3).count();
+            ref_out.iter().zip(mt_out_c.iter()).filter(|(r, m)| (*r - *m).abs() > tol).count();
         let equiv = EquivResult {
             n_checked: cm,
             max_abs_err: if n_bad == 0 { 0.0 } else { f32::INFINITY },
@@ -886,14 +948,15 @@ fn run_quantized_mat_vec(
         let biases_f32 = vec![0.0f32; sb_elems];
         let x_f32: Vec<f32> = (0..k).map(|i| (i % 8) as f32 * 0.01 + 0.5).collect();
         let w_mt_buf = runner.buffer_bytes(&w_data);
-        let s_mt_buf = runner.buffer_f32(&scales_f32);
-        let b_mt_buf = runner.buffer_f32(&biases_f32);
-        let x_mt_buf = runner.buffer_f32(&x_f32);
+        let s_mt_buf = make_buf(runner, &scales_f32);
+        let b_mt_buf = make_buf(runner, &biases_f32);
+        let x_mt_buf = make_buf(runner, &x_f32);
         let k_buf = runner.buffer_u32(k as u32);
         let gpr_buf = runner.buffer_u32(gs_per_row as u32);
-        let bytes_mt = (m * k / 2 + sb_elems * 4 * 2 + k * 4 + m * 4) as f64;
+        let bytes_mt =
+            (m * k / 2 + sb_elems * dtype_bytes * 2 + k * dtype_bytes + m * dtype_bytes) as f64;
         let mt_perf = {
-            let out_buf = runner.buffer_zeros(m * 4);
+            let out_buf = runner.buffer_zeros(m * dtype_bytes);
             bench_gbps_only(
                 runner,
                 &mk,
@@ -946,7 +1009,7 @@ fn run_quantized_mat_vec(
         });
         results.push(bench.result_sub(
             Some(spec.subop),
-            format!("M={m} K={k} f32 gs{group_size} b4"),
+            format!("M={m} K={k} {dtype_label} gs{group_size} b4"),
             ref_perf,
             mt_perf,
             Some(equiv),

@@ -15,8 +15,6 @@ metaltile-core.workspace = true
 metaltile-codegen.workspace = true
 metaltile-runtime.workspace = true
 inventory.workspace = true
-
-[dev-dependencies]
 half.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
