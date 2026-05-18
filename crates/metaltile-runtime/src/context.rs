@@ -845,11 +845,16 @@ impl Context {
 
         let mut pipes: Vec<Retained<Pso>> = Vec::with_capacity(specs.len());
         for (spec, msl) in specs.iter().zip(msl_sources.iter()) {
+            // Mirror MSL_CACHE key shape: (name, first-param dtype, fn_consts).
+            // MSL source is deterministic per that key, so re-hashing the
+            // 5–50 KB source string per dispatch is pure waste (~10–30 µs).
             let cache_key = {
                 let mut h = FNV_OFFSET;
                 fnv1a_extend(&mut h, spec.kernel.name.as_bytes());
                 fnv1a_extend(&mut h, b":");
-                fnv1a_extend(&mut h, msl.as_bytes());
+                if let Some(p) = spec.kernel.params.first() {
+                    fnv1a_extend(&mut h, &(p.dtype.size_bytes() as u64).to_le_bytes());
+                }
                 for (n, v) in spec.fn_consts {
                     fnv1a_extend(&mut h, n.as_bytes());
                     fnv1a_extend(&mut h, &v.to_le_bytes());
