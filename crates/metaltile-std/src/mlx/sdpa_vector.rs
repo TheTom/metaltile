@@ -52,12 +52,16 @@ pub fn mt_sdpa_vector<T>(
 
     // 32 slots per simdgroup-reduction array; 1024 slots per output
     // accumulator (one per thread). Matches mt_sdpa exactly.
+    // Single 1024-float tg array reused 4× in the output reduction loop.
+    // Mirrors MLX's pattern (~4 KB tg memory vs our previous 16 KB across
+    // 4 separate arrays). On M2 with 32 KB tg memory per SM, this lifts
+    // concurrent TGs/SM from 2 → 7 — the missing occupancy factor that
+    // capped bf16 single-pass at 62% MT despite vectorized loads firing
+    // correctly. f16 and f32 also benefit but less (cast cost wasn't the
+    // limit there).
     threadgroup_alloc("tg_max", 32);
     threadgroup_alloc("tg_sum", 32);
-    threadgroup_alloc("tg_out0", 1024);
-    threadgroup_alloc("tg_out1", 1024);
-    threadgroup_alloc("tg_out2", 1024);
-    threadgroup_alloc("tg_out3", 1024);
+    threadgroup_alloc("tg_out", 1024);
 
     let q_off = q_head * head_dim;
     let kv_base = kv_head * n_kv * head_dim;
@@ -143,42 +147,58 @@ pub fn mt_sdpa_vector<T>(
     }
     threadgroup_barrier();
 
-    // ── Cross-simdgroup reduction: outputs ─────────────────────────
+    // ── Cross-simdgroup reduction: outputs (one shared tg array, 4 iters) ─
+    //
+    // Mirrors MLX's `sdpa_vector` reduction. Each iteration handles one of
+    // the 4 output elements per lane:
+    //   1. Every (lane, sg) writes its partial to tg_out[lane*ns + sg]
+    //   2. barrier
+    //   3. transpose-load (read tg_out[sg*ns + lane]) × per-sg factor,
+    //      then simd_sum across the 32 lanes of THIS simdgroup
+    //   4. lane 0 of each sg holds the reduced value for output position
+    //      sg*4 + i (i is the loop variable below) — same layout as the
+    //      input load pattern (each lane covers head_dim/32 = 4 elements
+    //      indexed by lane*4)
+    //
+    // Per-iter f32 store + 32-lane simd_sum reduction = 1 KB tg memory
+    // touched, reused 4 times. vs the old layout which pre-allocated 4 KB ×
+    // 4 arrays = 16 KB resident throughout the kernel.
     let g_max = threadgroup_load("tg_max", 0);
     let g_sum = threadgroup_load("tg_sum", 0);
-    let rescale = exp(run_max - g_max) / g_sum;
-    let idx = lane * ns + sg;
-    threadgroup_store("tg_out0", idx, o0 * rescale);
-    threadgroup_store("tg_out1", idx, o1 * rescale);
-    threadgroup_store("tg_out2", idx, o2 * rescale);
-    threadgroup_store("tg_out3", idx, o3 * rescale);
+    let factor_g = exp(run_max - g_max);
+    let inv_sum = select(g_sum > 0.0f32, 1.0f32 / g_sum, 0.0f32);
+
+    threadgroup_store("tg_out", lane * ns + sg, o0);
+    threadgroup_barrier();
+    let r0_in = threadgroup_load("tg_out", sg * ns + lane) * factor_g;
+    let red0 = simd_sum(r0_in) * inv_sum;
     threadgroup_barrier();
 
-    // Simdgroup 0 sums the per-simdgroup contributions (one accumulator
-    // per lane, n_simd entries each) and writes the final quartile.
-    if sg == 0 {
-        let mut so0 = 0.0f32;
-        let mut so1 = 0.0f32;
-        let mut so2 = 0.0f32;
-        let mut so3 = 0.0f32;
-        for _g in range(0u32, ns, 1u32) {
-            let ri = lane * ns + _g;
-            so0 = so0 + threadgroup_load("tg_out0", ri);
-            so1 = so1 + threadgroup_load("tg_out1", ri);
-            so2 = so2 + threadgroup_load("tg_out2", ri);
-            so3 = so3 + threadgroup_load("tg_out3", ri);
-        }
-        // f32→T narrowing happens implicitly at the MSL Store
-        // (`dst[i] = val;` for f16/f32, `dst[i] = bfloat(val);` for bf16).
-        // An explicit `.cast::<T>()` here would (a) emit an extra `Op::Cast`
-        // between the 4 Stores — breaking vectorize's 4-consecutive-Store
-        // window — and (b) on bf16, double-wrap (`bfloat(bfloat(val))`)
-        // since both Op::Cast and the bf16 Store emit `bfloat(...)`. Same
-        // lesson as `partial_o` in sdpa_decode_2pass.
-        let out_off = q_off + d0;
-        store(out[out_off], so0);
-        store(out[out_off + 1u32], so1);
-        store(out[out_off + 2u32], so2);
-        store(out[out_off + 3u32], so3);
+    threadgroup_store("tg_out", lane * ns + sg, o1);
+    threadgroup_barrier();
+    let r1_in = threadgroup_load("tg_out", sg * ns + lane) * factor_g;
+    let red1 = simd_sum(r1_in) * inv_sum;
+    threadgroup_barrier();
+
+    threadgroup_store("tg_out", lane * ns + sg, o2);
+    threadgroup_barrier();
+    let r2_in = threadgroup_load("tg_out", sg * ns + lane) * factor_g;
+    let red2 = simd_sum(r2_in) * inv_sum;
+    threadgroup_barrier();
+
+    threadgroup_store("tg_out", lane * ns + sg, o3);
+    threadgroup_barrier();
+    let r3_in = threadgroup_load("tg_out", sg * ns + lane) * factor_g;
+    let red3 = simd_sum(r3_in) * inv_sum;
+
+    // lane 0 of each simdgroup writes its 4 elements. The output position
+    // is sg-indexed now (was lane-indexed in the old layout), matching
+    // MLX. f32→T narrowing is implicit at the MSL Store.
+    if lane == 0u32 {
+        let out_off = q_off + sg * 4u32;
+        store(out[out_off], red0);
+        store(out[out_off + 1u32], red1);
+        store(out[out_off + 2u32], red2);
+        store(out[out_off + 3u32], red3);
     }
 }
