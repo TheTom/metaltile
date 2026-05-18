@@ -1739,28 +1739,31 @@ fn run_steel_gemm(
     let k_buf = buffer_typed(runner, &[check_k as f32], DType::U32);
 
     // Build GEMMParams for MLX reference
-    // struct { int M,N,K; int lda,ldb,ldd; int tiles_n,tiles_m;
-    //   int64_t pad_or_stride[3]; int swizzle_log,gemm_k_iter, batch_ndim; }
+    // C++ struct layout (Metal = C++ ABI):
+    //   int M,N,K,lda,ldb,ldd; int tiles_n,tiles_m;  (8×4 = 32 bytes, aligned to 8)
+    //   int64_t batch_stride_a,b,d;                   (3×8 = 24 bytes)
+    //   int swizzle_log, gemm_k_iter, batch_ndim;    (3×4 = 12 bytes)
+    // Total: 68 bytes, no padding needed (32 is 8-aligned)
     let lda = check_k as i32;
     let ldb = check_n as i32;
     let ldd = check_n as i32;
     let params_bytes: Vec<u8> = {
-        let mut v = Vec::with_capacity(80);
-        v.extend_from_slice(&(check_m as i32).to_le_bytes());   // M
-        v.extend_from_slice(&(check_n as i32).to_le_bytes());   // N
-        v.extend_from_slice(&(check_k as i32).to_le_bytes());   // K
-        v.extend_from_slice(&lda.to_le_bytes());                 // lda
-        v.extend_from_slice(&ldb.to_le_bytes());                 // ldb
-        v.extend_from_slice(&ldd.to_le_bytes());                 // ldd
+        let mut v = Vec::with_capacity(72);
+        v.extend_from_slice(&(check_m as i32).to_le_bytes());  // M
+        v.extend_from_slice(&(check_n as i32).to_le_bytes());  // N
+        v.extend_from_slice(&(check_k as i32).to_le_bytes());  // K
+        v.extend_from_slice(&lda.to_le_bytes());                // lda
+        v.extend_from_slice(&ldb.to_le_bytes());                // ldb
+        v.extend_from_slice(&ldd.to_le_bytes());                // ldd
         v.extend_from_slice(&((check_n / bn) as i32).to_le_bytes()); // tiles_n
         v.extend_from_slice(&((check_m / bm) as i32).to_le_bytes()); // tiles_m
-        v.extend_from_slice(&[0u8; 8]);                          // padding for int64 alignment
-        v.extend_from_slice(&0i64.to_le_bytes());                // batch_stride_a
-        v.extend_from_slice(&0i64.to_le_bytes());                // batch_stride_b
-        v.extend_from_slice(&0i64.to_le_bytes());                // batch_stride_d
-        v.extend_from_slice(&0i32.to_le_bytes());                // swizzle_log
-        v.extend_from_slice(&((check_k) as i32).to_le_bytes()); // gemm_k_iterations_aligned = K/BK = K/K = 1
-        v.extend_from_slice(&0i32.to_le_bytes());                // batch_ndim
+        // No padding: offset 32 is already 8-byte aligned
+        v.extend_from_slice(&0i64.to_le_bytes());               // batch_stride_a
+        v.extend_from_slice(&0i64.to_le_bytes());               // batch_stride_b
+        v.extend_from_slice(&0i64.to_le_bytes());               // batch_stride_d
+        v.extend_from_slice(&0i32.to_le_bytes());               // swizzle_log
+        v.extend_from_slice(&((check_k / 16) as i32).to_le_bytes()); // gemm_k_iterations_aligned
+        v.extend_from_slice(&0i32.to_le_bytes());               // batch_ndim
         v
     };
     let params_buf = runner.buffer_bytes(&params_bytes);
