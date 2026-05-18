@@ -22,6 +22,7 @@
 use std::collections::BTreeMap;
 
 use metaltile_core::ir::{IndexExpr, Kernel, Op, ValueId};
+use smallvec::SmallVec;
 
 // ---------------------------------------------------------------------------
 // remap_value_ids — mutate ValueId references in an Op
@@ -226,8 +227,12 @@ pub fn remap_value_ids(op: &mut Op, map: &BTreeMap<ValueId, ValueId>) {
 // ---------------------------------------------------------------------------
 
 /// Return all `ValueId` references in `op` (for liveness, use-count, invariant analysis).
-pub fn op_value_refs(op: &Op) -> Vec<ValueId> {
-    let mut refs = Vec::new();
+///
+/// Modal cardinality is 1–3 (BinOp=2, UnaryOp=1, Select=3, Load≤2 typically),
+/// so the inline `[T; 4]` covers every elementwise/scalar op without spilling
+/// to the heap. Variadic ops (`InlineMsl`, `FusedElementwise`, `Cat`) spill.
+pub fn op_value_refs(op: &Op) -> SmallVec<[ValueId; 4]> {
+    let mut refs = SmallVec::new();
 
     match op {
         // ── arithmetic / logic ────────────────────────────────────────────
@@ -310,7 +315,7 @@ pub fn op_value_refs(op: &Op) -> Vec<ValueId> {
 
         // ── inline / fused ───────────────────────────────────────────────
         Op::InlineMsl { inputs, .. } => {
-            refs.extend(inputs);
+            refs.extend(inputs.iter().copied());
         },
         Op::FusedElementwise { ops } =>
             for sub in ops {
@@ -395,7 +400,7 @@ pub fn op_value_refs(op: &Op) -> Vec<ValueId> {
             refs.push(*value);
         },
         Op::Cat { values, .. } => {
-            refs.extend(values.iter());
+            refs.extend(values.iter().copied());
         },
 
         // ── no ValueId refs ──────────────────────────────────────────────
