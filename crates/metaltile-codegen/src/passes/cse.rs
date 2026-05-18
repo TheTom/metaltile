@@ -28,8 +28,6 @@
 //!   COMP 512 course notes.  Survey of local, superlocal, and global value
 //!   numbering algorithms.
 
-use std::collections::HashMap;
-
 use metaltile_core::{
     dtype::DType,
     error::Result,
@@ -46,6 +44,7 @@ use metaltile_core::{
         ValueId,
     },
 };
+use rustc_hash::FxHashMap;
 
 /// A structural key for CSE: captures the opcode and operands in a hashable form.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -106,12 +105,12 @@ impl super::Pass for CsePass {
 fn cse_block(
     block: &mut Block,
     read_only: &std::collections::BTreeSet<String>,
-) -> HashMap<ValueId, ValueId> {
+) -> FxHashMap<ValueId, ValueId> {
     let n = block.ops.len();
 
     // Phase 1: find duplicates and build old_vid -> replacement_vid map.
-    let mut table: HashMap<OpKey, ValueId> = HashMap::new();
-    let mut old_to_new: HashMap<ValueId, ValueId> = HashMap::new();
+    let mut table: FxHashMap<OpKey, ValueId> = FxHashMap::default();
+    let mut old_to_new: FxHashMap<ValueId, ValueId> = FxHashMap::default();
     let mut skip: Vec<bool> = vec![false; n];
 
     for (i, op) in block.ops.iter().enumerate() {
@@ -206,7 +205,7 @@ fn canonicalize_binop(op: BinOpKind, lhs: u32, rhs: u32) -> (u32, u32) {
 }
 
 /// Replace all ValueId references in `op` using the remapping map.
-fn replace_values(op: &mut Op, map: &HashMap<ValueId, ValueId>) {
+fn replace_values(op: &mut Op, map: &FxHashMap<ValueId, ValueId>) {
     let s = |v: &mut ValueId| {
         if let Some(&new_v) = map.get(v) {
             *v = new_v;

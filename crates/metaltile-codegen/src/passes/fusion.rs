@@ -37,8 +37,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use metaltile_core::{
     error::Result,
-    ir::{Block, BlockId, IndexExpr, Kernel, Op, ValueId},
+    ir::{Block, BlockId, Kernel, Op, ValueId},
 };
+
+use super::remap::op_value_refs;
 
 /// Mask for encoding internal sub-op references within FusedElementwise chains.
 pub const SUB_OP_FLAG: u32 = 0x8000_0000;
@@ -330,154 +332,6 @@ fn is_fusible(op: &Op) -> bool {
             | Op::Splat { .. }
             | Op::Broadcast { .. }
     )
-}
-
-/// Return all ValueId references in an op.
-fn op_value_refs(op: &Op) -> Vec<ValueId> {
-    let mut refs = Vec::new();
-    match op {
-        Op::BinOp { lhs, rhs, .. } => {
-            refs.push(*lhs);
-            refs.push(*rhs);
-        },
-        Op::UnaryOp { value, .. }
-        | Op::Activation { value, .. }
-        | Op::Cast { value, .. }
-        | Op::Reduce { value, .. }
-        | Op::Transpose { value }
-        | Op::Slice { value, .. }
-        | Op::Broadcast { value, .. } => {
-            refs.push(*value);
-        },
-        Op::Select { cond, on_true, on_false } => {
-            refs.push(*cond);
-            refs.push(*on_true);
-            refs.push(*on_false);
-        },
-        Op::Dot { a, b } => {
-            refs.push(*a);
-            refs.push(*b);
-        },
-        Op::Load { indices, mask, .. } => {
-            for ix in indices {
-                if let IndexExpr::Value(v) | IndexExpr::Range(v, _) = ix {
-                    refs.push(*v);
-                }
-            }
-            if let Some(m) = mask {
-                refs.push(*m);
-            }
-        },
-        Op::Store { indices, value, mask, .. } => {
-            for ix in indices {
-                if let IndexExpr::Value(v) | IndexExpr::Range(v, _) = ix {
-                    refs.push(*v);
-                }
-            }
-            refs.push(*value);
-            if let Some(m) = mask {
-                refs.push(*m);
-            }
-        },
-        Op::Loop { start, end, step, .. } => {
-            refs.push(*start);
-            refs.push(*end);
-            refs.push(*step);
-        },
-        Op::InlineMsl { inputs, .. } => {
-            refs.extend(inputs);
-        },
-        Op::FlashAttention { q, k, v, .. } => {
-            refs.push(*q);
-            refs.push(*k);
-            refs.push(*v);
-        },
-        Op::SlidingWindowAttention { q, k, v, .. } => {
-            refs.push(*q);
-            refs.push(*k);
-            refs.push(*v);
-        },
-        Op::RmsNorm { x, scale, .. } => {
-            refs.push(*x);
-            refs.push(*scale);
-        },
-        Op::GatedMlp { x, gate_proj, up_proj, down_proj } => {
-            refs.push(*x);
-            refs.push(*gate_proj);
-            refs.push(*up_proj);
-            refs.push(*down_proj);
-        },
-        Op::FusedElementwise { ops } =>
-            for sub in ops {
-                refs.extend(op_value_refs(sub));
-            },
-        Op::VectorLoad { byte_offset, .. } => {
-            refs.push(*byte_offset);
-        },
-        Op::VectorStore { byte_offset, value, .. } => {
-            refs.push(*byte_offset);
-            refs.push(*value);
-        },
-        Op::StrideReduce { offset, stride, end, .. } => {
-            refs.push(*offset);
-            refs.push(*stride);
-            refs.push(*end);
-        },
-        Op::If { cond, .. } => {
-            refs.push(*cond);
-        },
-        Op::ExpandDims { value, .. } => {
-            refs.push(*value);
-        },
-        Op::Reshape { value, .. } => {
-            refs.push(*value);
-        },
-        Op::Cat { values, .. } => {
-            refs.extend(values);
-        },
-        Op::Gather { indices, .. } => {
-            refs.push(*indices);
-        },
-        Op::Scatter { indices, value, .. } => {
-            refs.push(*indices);
-            refs.push(*value);
-        },
-        Op::Atomic { index, value, .. } => {
-            refs.push(*index);
-            refs.push(*value);
-        },
-        Op::Scan { value, .. } => {
-            refs.push(*value);
-        },
-        Op::StrideScan { offset, end, .. } => {
-            refs.push(*offset);
-            refs.push(*end);
-        },
-        Op::StrideArgReduce { offset, end, .. } => {
-            refs.push(*offset);
-            refs.push(*end);
-        },
-        Op::DeclareLocal { value, .. } | Op::SetLocal { value, .. } => {
-            refs.push(*value);
-        },
-        Op::StrideStore { offset, end, scalar, .. } => {
-            refs.push(*offset);
-            refs.push(*end);
-            refs.push(*scalar);
-        },
-        Op::ThreadgroupLoad { index, .. } => {
-            refs.push(*index);
-        },
-        Op::ThreadgroupStore { index, value, .. } => {
-            refs.push(*index);
-            refs.push(*value);
-        },
-        Op::SimdReduce { value, .. } | Op::ArgReduce { value, .. } => {
-            refs.push(*value);
-        },
-        _ => {},
-    }
-    refs
 }
 
 /// Return the first ValueId input of an op (used to trace the chain backward).
