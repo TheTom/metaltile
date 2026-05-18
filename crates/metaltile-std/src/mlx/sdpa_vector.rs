@@ -80,22 +80,48 @@ pub fn mt_sdpa_vector<T>(
     // simd_sum reduces the per-lane quartile dot product into a full
     // score, then we apply the online-softmax update and accumulate
     // the V quartile.
+    //
+    // Pre-compute the 4 KV element indices BEFORE the loads so the four
+    // Op::Load ops land consecutively in IR. Vectorize requires the loads
+    // to be back-to-back (no BinOp/Const/Arith interleaved between them).
+    // Cast the raw loads to f32 in a separate 4-op run after — same shape
+    // as `sdpa_decode_2pass_pass1`. Without this, the K loads ended up
+    // interleaved with `q_i * cast(...)` arithmetic, vectorize never fired,
+    // and bf16 stayed at ~35% MT of MLX on M2 mini.
     for _t in range(sg, n_kv, ns) {
         let base = kv_base + _t * head_dim;
-        let partial = q0 * load(k[base + d0]).cast::<f32>()
-            + q1 * load(k[base + d0 + 1u32]).cast::<f32>()
-            + q2 * load(k[base + d0 + 2u32]).cast::<f32>()
-            + q3 * load(k[base + d0 + 3u32]).cast::<f32>();
+        let kv_idx = base + d0;
+        let kv0 = kv_idx;
+        let kv1 = kv_idx + 1u32;
+        let kv2 = kv_idx + 2u32;
+        let kv3 = kv_idx + 3u32;
+        let k0_raw = load(k[kv0]);
+        let k1_raw = load(k[kv1]);
+        let k2_raw = load(k[kv2]);
+        let k3_raw = load(k[kv3]);
+        let k0 = k0_raw.cast::<f32>();
+        let k1 = k1_raw.cast::<f32>();
+        let k2 = k2_raw.cast::<f32>();
+        let k3 = k3_raw.cast::<f32>();
+        let partial = q0 * k0 + q1 * k1 + q2 * k2 + q3 * k3;
         let score = simd_sum(partial);
         let new_max = select(score > run_max, score, run_max);
         let factor = exp(run_max - new_max);
         let weight = exp(score - new_max);
         run_sum = run_sum * factor + weight;
         run_max = new_max;
-        o0 = o0 * factor + weight * load(v[base + d0]).cast::<f32>();
-        o1 = o1 * factor + weight * load(v[base + d0 + 1u32]).cast::<f32>();
-        o2 = o2 * factor + weight * load(v[base + d0 + 2u32]).cast::<f32>();
-        o3 = o3 * factor + weight * load(v[base + d0 + 3u32]).cast::<f32>();
+        let v0_raw = load(v[kv0]);
+        let v1_raw = load(v[kv1]);
+        let v2_raw = load(v[kv2]);
+        let v3_raw = load(v[kv3]);
+        let v0 = v0_raw.cast::<f32>();
+        let v1 = v1_raw.cast::<f32>();
+        let v2 = v2_raw.cast::<f32>();
+        let v3 = v3_raw.cast::<f32>();
+        o0 = o0 * factor + weight * v0;
+        o1 = o1 * factor + weight * v1;
+        o2 = o2 * factor + weight * v2;
+        o3 = o3 * factor + weight * v3;
     }
 
     // ── Cross-simdgroup reduction: max + sum_exp ───────────────────
@@ -142,10 +168,17 @@ pub fn mt_sdpa_vector<T>(
             so2 = so2 + threadgroup_load("tg_out2", ri);
             so3 = so3 + threadgroup_load("tg_out3", ri);
         }
+        // f32→T narrowing happens implicitly at the MSL Store
+        // (`dst[i] = val;` for f16/f32, `dst[i] = bfloat(val);` for bf16).
+        // An explicit `.cast::<T>()` here would (a) emit an extra `Op::Cast`
+        // between the 4 Stores — breaking vectorize's 4-consecutive-Store
+        // window — and (b) on bf16, double-wrap (`bfloat(bfloat(val))`)
+        // since both Op::Cast and the bf16 Store emit `bfloat(...)`. Same
+        // lesson as `partial_o` in sdpa_decode_2pass.
         let out_off = q_off + d0;
-        store(out[out_off], so0.cast::<T>());
-        store(out[out_off + 1u32], so1.cast::<T>());
-        store(out[out_off + 2u32], so2.cast::<T>());
-        store(out[out_off + 3u32], so3.cast::<T>());
+        store(out[out_off], so0);
+        store(out[out_off + 1u32], so1);
+        store(out[out_off + 2u32], so2);
+        store(out[out_off + 3u32], so3);
     }
 }
