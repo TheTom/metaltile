@@ -1208,8 +1208,18 @@ mod tests {
         // Every Mac that compiles + runs this test is at least Apple7
         // (M1). The exact level depends on which Mac runs CI, so just
         // assert the lower bound + the cumulative ordering.
+        //
+        // GitHub Actions' hosted macOS runners report no Apple GPU family
+        // (virtualized / non-Apple GPU), so `chip_family()` is `None` there.
+        // Treat that as a pass — real hardware still gets the strict check.
         let ctx = Context::new().expect("Context::new should succeed on macOS");
-        let level = ctx.chip_family().expect("macOS Context must report a family");
+        let Some(level) = ctx.chip_family() else {
+            assert!(
+                std::env::var_os("CI").is_some(),
+                "macOS Context must report a family on real hardware",
+            );
+            return;
+        };
         assert!(level >= 7, "Apple GPU family level should be >=7 on M-series, got {level}");
         assert!(level <= 20, "level looks unreasonably high; bound is sanity-only ({level})");
     }
@@ -1226,8 +1236,14 @@ mod tests {
         // Sanity: the helper compiles + runs on every target. On macOS
         // it returns Some(>=7); elsewhere it returns None. The specific
         // arm is asserted by the cfg-gated tests above.
+        //
+        // GitHub Actions' hosted macOS runners have no Apple GPU, so the
+        // helper returns `None` there — accept that when `CI` is set.
         let level = detect_apple_family();
         if cfg!(target_os = "macos") {
+            if level.is_none() && std::env::var_os("CI").is_some() {
+                return;
+            }
             assert!(matches!(level, Some(l) if (7..=20).contains(&l)));
         } else {
             assert!(level.is_none());
