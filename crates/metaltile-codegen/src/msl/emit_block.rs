@@ -855,7 +855,9 @@ impl MslGenerator {
                     let av = self.vname(Some(*a), block, extra_names);
                     let bv = self.vname(Some(*b), block, extra_names);
                     let cv = self.vname(Some(*c), block, extra_names);
-                    wl!(out, "{pad}simdgroup_multiply_accumulate({av}, {bv}, {cv});");
+                    // simdgroup_multiply_accumulate(dst, A, B, C) — 4 args:
+                    //   dst = result, C = addend (both are the accumulator cv)
+                    wl!(out, "{pad}simdgroup_multiply_accumulate({cv}, {av}, {bv}, {cv});");
                 },
 
                 // ---- simd prefix scan -------------------------------------

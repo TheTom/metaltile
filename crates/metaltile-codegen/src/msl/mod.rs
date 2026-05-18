@@ -77,7 +77,7 @@ impl MslGenerator {
         if feat.needs_bf16_struct && !self.config.native_bfloat {
             self.emit_bf16_preamble(&mut out);
         }
-        if self.config.use_simd_matrix {
+        if self.config.use_simd_matrix || feat.needs_simdgroup_matrix {
             wl!(out);
             wl!(out, "#include <metal_simdgroup_matrix>");
         }

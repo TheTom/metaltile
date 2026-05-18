@@ -1337,11 +1337,11 @@ impl DslBodyParser {
     fn parse_simdgroup_elem_load(&mut self, call: &ExprCall) -> u32 {
         let args: Vec<_> = call.args.iter().collect();
         let sm_vid = args.first().map(|a| self.parse_expr(a)).unwrap_or(0);
-        let idx = args.get(1).map(|a| self.parse_expr(a)).unwrap_or(0);
+        let idx = args.get(1).map(|a| literal_u32(a)).unwrap_or(0);
         let result = self.alloc_vid();
         self.push_op(
             quote! {
-                Op::SimdgroupElemLoad { value: ValueId::new(#sm_vid), index: #idx as u32 }
+                Op::SimdgroupElemLoad { value: ValueId::new(#sm_vid), index: #idx }
             },
             result,
         );
@@ -1352,12 +1352,12 @@ impl DslBodyParser {
     fn parse_simdgroup_elem_store(&mut self, call: &ExprCall) -> u32 {
         let args: Vec<_> = call.args.iter().collect();
         let sm_vid = args.first().map(|a| self.parse_expr(a)).unwrap_or(0);
-        let idx = args.get(1).map(|a| self.parse_expr(a)).unwrap_or(0);
+        let idx = args.get(1).map(|a| literal_u32(a)).unwrap_or(0);
         let data_vid = args.get(2).map(|a| self.parse_expr(a)).unwrap_or(0);
         self.push_op_no_result(quote! {
             Op::SimdgroupElemStore {
                 value: ValueId::new(#sm_vid),
-                index: #idx as u32,
+                index: #idx,
                 data: ValueId::new(#data_vid),
             }
         });
@@ -1517,6 +1517,19 @@ fn extract_turbofish_dtype_and_mn(expr: &Expr) -> Option<(proc_macro2::TokenStre
         }
     }
     None
+}
+
+/// Extract a u32 from a literal expression (e.g. `0u32`, `1u32`).
+fn literal_u32(expr: &Expr) -> u32 {
+    if let Expr::Lit(lit) = expr {
+        match &lit.lit {
+            syn::Lit::Int(n) => n.base10_parse::<u32>().unwrap_or(0),
+            syn::Lit::Float(f) => f.base10_parse::<f64>().map(|v| v as u32).unwrap_or(0),
+            _ => 0,
+        }
+    } else {
+        0
+    }
 }
 
 /// Extract a string literal from an expression like `"my_name"`.

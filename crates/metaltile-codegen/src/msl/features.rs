@@ -19,6 +19,7 @@ pub(super) struct KernelFeatures {
     pub is_matmul: bool,
     pub needs_simd_lane: bool,
     pub needs_simd_group: bool,
+    pub needs_simdgroup_matrix: bool,
     pub needs_bf16_struct: bool,
     pub needs_silu: bool,
     pub needs_gelu: bool,
@@ -36,6 +37,7 @@ impl MslGenerator {
             is_matmul: false,
             needs_simd_lane: false,
             needs_simd_group: false,
+            needs_simdgroup_matrix: false,
             needs_bf16_struct: false,
             needs_silu: false,
             needs_gelu: false,
@@ -99,13 +101,14 @@ impl MslGenerator {
                 },
                 Op::UnaryOp { op: UnaryOpKind::Erf, .. } => feat.needs_erf = true,
                 Op::UnaryOp { op: UnaryOpKind::ErfInv, .. } => feat.needs_erfinv = true,
-                // simdgroup matrix ops need both simd_lane and simd_group built-ins
+                // simdgroup matrix ops need simd built-ins and the simdgroup_matrix header
                 Op::SimdgroupAlloc { .. }
                 | Op::SimdgroupElemLoad { .. }
                 | Op::SimdgroupElemStore { .. }
                 | Op::SimdgroupMatMul { .. } => {
                     feat.needs_simd_lane = true;
                     feat.needs_simd_group = true;
+                    feat.needs_simdgroup_matrix = true;
                 },
                 Op::SimdLaneId => feat.needs_simd_lane = true,
                 Op::SimdGroupId => feat.needs_simd_group = true,

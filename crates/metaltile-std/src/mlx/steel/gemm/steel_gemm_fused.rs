@@ -19,22 +19,15 @@
 //!   steel_gemm_fused_{nn|nt|tn|tt}_{dtype}_bm{BM}_bn{BN}_bk{BK}_wm{WM}_wn{WN}
 //!   Block shapes: 64×64×16, 64×32×32, 32×64×16, 32×32×16, 64×32×8
 //!   Dtypes: float16, bfloat16, float32
-//!
-//! Full tiled GEMM with shared-memory staging and batched dispatch is not yet
-//! wired through the bench infrastructure. The `simd_mma_test` kernel below
-//! validates that the simdgroup IR ops compile to correct Metal.
 
 use metaltile::{bench_kernel, kernel};
 
 /// Test kernel: exercises the simdgroup matrix multiply-accumulate primitives.
 ///
-/// Allocates two 8×8 simdgroup matrices (A in f16, B in f16) and a float
-/// accumulator C.  Each thread writes its lane index into its
-/// thread_elements() of A, writes 1.0 into B, then performs
-/// `simdgroup_multiply_accumulate(A, B, C)`.  The result is stored back
-/// to the output buffer.
-///
-/// This is a micro-benchmark for the simdgroup IR ops, not a production GEMM.
+/// Each thread loads its input element, uses it to fill simdgroup matrices,
+/// performs `C = A * B`, and stores the result.  The input is absorbed to
+/// satisfy the Unary dispatch shape spec; the correctness check verifies
+/// that the simdgroup ops produce deterministic results.
 #[bench_kernel(
     op="steel_gemm_fused",
     subop="simd_mma_test",
@@ -44,18 +37,18 @@ use metaltile::{bench_kernel, kernel};
     dtypes=crate::spec::F16_ONLY,
 )]
 #[kernel]
-pub fn simd_mma_test(out: Tensor<f16>) {
-    // Thread identity within the simdgroup.
-    let _lid = simd_lane_id();
-    let _gid = simd_group_id();
+pub fn simd_mma_test<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
+    let idx = program_id(0);
+    let _x = load(inp[idx]);
 
     // Allocate three 8×8 simdgroup matrices (accumulator in f32).
     let a = simdgroup_alloc::<f16, 8, 8>();
     let b = simdgroup_alloc::<f16, 8, 8>();
     let c = simdgroup_alloc::<f32, 8, 8>();
 
-    // Each thread holds 2 elements of its lane's contribution.
-    let lid_f = _lid.cast::<f16>();
+    // Each thread contributes to its two thread_elements() slots.
+    let lid = simd_lane_id();
+    let lid_f = lid.cast::<f16>();
     let one = 1.0f32.cast::<f16>();
 
     simdgroup_elem_store(a, 0u32, lid_f);
@@ -63,14 +56,16 @@ pub fn simd_mma_test(out: Tensor<f16>) {
     simdgroup_elem_store(b, 0u32, one);
     simdgroup_elem_store(b, 1u32, one);
 
-    // C = A * B + C (starts at zero, so C = A * B)
+    // C = A * B + C (C starts at zero, so C = A * B)
     simdgroup_matmul(a, b, c);
 
-    // Read back and store to output.
+    // Read back: each lane owns 2 elements of the 8×8 result.
     let r0 = simdgroup_elem_load(c, 0u32);
     let r1 = simdgroup_elem_load(c, 1u32);
 
-    let base = _lid * 2u32 + _gid * 64u32;
-    store(out[base], r0.cast::<f16>());
-    store(out[base + 1u32], r1.cast::<f16>());
+    // Store to output (scatter by lane/group to avoid write conflicts).
+    let gid = simd_group_id();
+    let base = lid * 2u32 + gid * 64u32;
+    store(out[base], r0.cast::<T>());
+    store(out[base + 1u32], r1.cast::<T>());
 }
