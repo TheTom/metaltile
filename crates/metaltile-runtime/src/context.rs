@@ -1153,6 +1153,62 @@ mod tests {
     // name. Pre-change (`format!("{}_shape", …)` + `format!("{}_strides", …)`)
     // allocates two Strings per call; post-change reuses a single pre-sized
     // String via in-place suffix rewrite.
+    // Perf microbench — run with:
+    //   cargo test --release -p metaltile-runtime perf_dispatch_chain_pso_key \
+    //     -- --ignored --nocapture
+    //
+    // Times the per-pass PSO cache key computation in `dispatch_chain_metal`.
+    // Pre-fix: FNV-1a over the full MSL source string (5–50 KB per pass).
+    // Post-fix: FNV-1a over the kernel name + first-param dtype size + sorted
+    // fn_consts (~30–60 bytes). The actual fix is a one-line edit in the hot
+    // loop; this bench just times the underlying FNV cost on the two payload
+    // sizes so the savings are visible without a GPU.
+    #[test]
+    #[ignore = "perf microbench"]
+    fn perf_dispatch_chain_pso_key() {
+        // Representative MSL source size for a real metaltile kernel:
+        // sdpa_decode_2pass_pass1 generates ~12 KB; sdpa_vector ~6 KB. Use a
+        // mid-size 10 KB blob for the comparison.
+        let msl_bytes: Vec<u8> = (0..10_240).map(|i| (i as u8).wrapping_add(0x42)).collect();
+        // Post-fix payload: kernel name (~24 bytes) + dtype-size discriminator
+        // (8 bytes) + a handful of fn_const name/value pairs (~20 bytes).
+        let small_bytes: Vec<u8> =
+            b"sdpa_decode_2pass_pass1\0\x04\0\0\0\0\0\0\0gqa\0\x04\0\0\0".to_vec();
+
+        const ITERS: usize = 1_000_000;
+        // Warmup.
+        for _ in 0..10_000 {
+            let mut h = FNV_OFFSET;
+            fnv1a_extend(&mut h, std::hint::black_box(&msl_bytes));
+            std::hint::black_box(h);
+        }
+
+        let start = std::time::Instant::now();
+        for _ in 0..ITERS {
+            let mut h = FNV_OFFSET;
+            fnv1a_extend(&mut h, std::hint::black_box(&msl_bytes));
+            std::hint::black_box(h);
+        }
+        let pre = start.elapsed();
+
+        let start = std::time::Instant::now();
+        for _ in 0..ITERS {
+            let mut h = FNV_OFFSET;
+            fnv1a_extend(&mut h, std::hint::black_box(&small_bytes));
+            std::hint::black_box(h);
+        }
+        let post = start.elapsed();
+
+        let pre_ns = pre.as_nanos() as f64 / ITERS as f64;
+        let post_ns = post.as_nanos() as f64 / ITERS as f64;
+        let saved_ns = pre_ns - post_ns;
+        println!(
+            "pre-fix  (FNV over 10 KB MSL):  {pre:?}  ({pre_ns:.0} ns/call)\n\
+             post-fix (FNV over ~50 B key):  {post:?}  ({post_ns:.0} ns/call)\n\
+             saved per dispatch_chain pass:  {saved_ns:.0} ns",
+        );
+    }
+
     #[test]
     #[ignore = "perf microbench"]
     fn perf_resolve_strided_metadata() {
