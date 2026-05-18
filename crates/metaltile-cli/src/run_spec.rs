@@ -1725,10 +1725,16 @@ fn run_steel_gemm(
             let name = pat.replace("{tn}", DtypeCtx::elementwise(dt).tn);
             // has_batch(10)=false, use_out_source(100)=false, do_axpby(110)=false,
             // align_M(200)=true, align_N(201)=true, align_K(202)=true
-            runner.compile_with_bool_constants(
-                src, &name,
-                &[(10, false), (100, false), (110, false), (200, true), (201, true), (202, true)],
-            ).ok()
+            runner
+                .compile_with_bool_constants(src, &name, &[
+                    (10, false),
+                    (100, false),
+                    (110, false),
+                    (200, true),
+                    (201, true),
+                    (202, true),
+                ])
+                .ok()
         })
     });
 
@@ -1752,21 +1758,21 @@ fn run_steel_gemm(
     let ldd = check_n as i32;
     let params_bytes: Vec<u8> = {
         let mut v = Vec::with_capacity(72);
-        v.extend_from_slice(&(check_m as i32).to_le_bytes());  // M
-        v.extend_from_slice(&(check_n as i32).to_le_bytes());  // N
-        v.extend_from_slice(&(check_k as i32).to_le_bytes());  // K
-        v.extend_from_slice(&lda.to_le_bytes());                // lda
-        v.extend_from_slice(&ldb.to_le_bytes());                // ldb
-        v.extend_from_slice(&ldd.to_le_bytes());                // ldd
+        v.extend_from_slice(&(check_m as i32).to_le_bytes()); // M
+        v.extend_from_slice(&(check_n as i32).to_le_bytes()); // N
+        v.extend_from_slice(&(check_k as i32).to_le_bytes()); // K
+        v.extend_from_slice(&lda.to_le_bytes()); // lda
+        v.extend_from_slice(&ldb.to_le_bytes()); // ldb
+        v.extend_from_slice(&ldd.to_le_bytes()); // ldd
         v.extend_from_slice(&((check_n / bn) as i32).to_le_bytes()); // tiles_n
         v.extend_from_slice(&((check_m / bm) as i32).to_le_bytes()); // tiles_m
         // No padding: offset 32 is already 8-byte aligned
-        v.extend_from_slice(&0i64.to_le_bytes());               // batch_stride_a
-        v.extend_from_slice(&0i64.to_le_bytes());               // batch_stride_b
-        v.extend_from_slice(&0i64.to_le_bytes());               // batch_stride_d
-        v.extend_from_slice(&0i32.to_le_bytes());               // swizzle_log
+        v.extend_from_slice(&0i64.to_le_bytes()); // batch_stride_a
+        v.extend_from_slice(&0i64.to_le_bytes()); // batch_stride_b
+        v.extend_from_slice(&0i64.to_le_bytes()); // batch_stride_d
+        v.extend_from_slice(&0i32.to_le_bytes()); // swizzle_log
         v.extend_from_slice(&((check_k / 16) as i32).to_le_bytes()); // gemm_k_iterations_aligned
-        v.extend_from_slice(&0i32.to_le_bytes());               // batch_ndim
+        v.extend_from_slice(&0i32.to_le_bytes()); // batch_ndim
         v
     };
     let params_buf = runner.buffer_bytes(&params_bytes);
@@ -1777,14 +1783,33 @@ fn run_steel_gemm(
     let grid = [check_n / bn, check_m / bm, 1];
     let tpg_arr = [tpg, 1, 1];
     let all_bufs: [&GpuBuffer; 6] = [&a_buf, &b_buf, &d_buf, &m_buf, &n_buf, &k_buf];
-    let mlx_bufs: [&GpuBuffer; 8] = [&a_buf, &b_buf, &mlx_d_buf, &mlx_d_buf, &params_buf, &addmm_buf, &batch_shape_buf, &batch_strides_buf];
+    let mlx_bufs: [&GpuBuffer; 8] = [
+        &a_buf,
+        &b_buf,
+        &mlx_d_buf,
+        &mlx_d_buf,
+        &params_buf,
+        &addmm_buf,
+        &batch_shape_buf,
+        &batch_strides_buf,
+    ];
 
     // Run MLX reference
     let ref_perf = mlx_k.as_ref().and_then(|rk| {
         runner.measure(rk, &mlx_bufs, grid, tpg_arr, 0, 1);
-        bench_gbps(runner, rk, &mlx_bufs, grid, tpg_arr, ((check_m * check_k + check_k * check_n + check_m * check_n) * ctx.eb) as f64)
+        bench_gbps(
+            runner,
+            rk,
+            &mlx_bufs,
+            grid,
+            tpg_arr,
+            ((check_m * check_k + check_k * check_n + check_m * check_n) * ctx.eb) as f64,
+        )
     });
-    let ref_vals: Vec<f32> = mlx_k.as_ref().map(|_| read_typed(runner, &mlx_d_buf, check_m * check_n, dt)).unwrap_or_else(|| (0..check_m * check_n).map(|_| check_k as f32).collect());
+    let ref_vals: Vec<f32> = mlx_k
+        .as_ref()
+        .map(|_| read_typed(runner, &mlx_d_buf, check_m * check_n, dt))
+        .unwrap_or_else(|| (0..check_m * check_n).map(|_| check_k as f32).collect());
 
     // Run MT
     runner.measure(&mk, &all_bufs, grid, tpg_arr, 0, 1);
@@ -1793,7 +1818,11 @@ fn run_steel_gemm(
     let equiv = check_equiv(&ref_vals, &mt_vals, 1e-2);
     let label = format!("M={m} N={n} K={k} BM={bm} BN={bn} {}", ctx.label);
     let mt_perf = bench_gbps(
-        runner, &mk, &all_bufs, grid, tpg_arr,
+        runner,
+        &mk,
+        &all_bufs,
+        grid,
+        tpg_arr,
         ((check_m * check_k + check_k * check_n + check_m * check_n) * ctx.eb) as f64,
     );
 
