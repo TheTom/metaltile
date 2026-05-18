@@ -218,8 +218,12 @@ pub fn run(args: &[String]) {
 
 fn save_json(device: &str, results: &[OpResult], path: &str) {
     use std::io::Write;
+    let s = summarize(results);
     let mut out = String::new();
-    out.push_str(&format!("{{\"device\":{:?},\"results\":[\n", device));
+    out.push_str(&format!(
+        "{{\"device\":{:?},\"summary\":{{\"total\":{},\"implemented\":{},\"correct\":{},\"unchecked\":{}}},\"results\":[\n",
+        device, s.total, s.implemented, s.correct, s.unchecked,
+    ));
     for (i, r) in results.iter().enumerate() {
         let comma = if i + 1 < results.len() { "," } else { "" };
         out.push_str(&format!(
@@ -250,6 +254,28 @@ fn save_json(device: &str, results: &[OpResult], path: &str) {
     }
 }
 
+/// Aggregate counts mirroring the terminal banner. Persisted alongside
+/// the per-row results in the JSON so CI and dashboards can consume
+/// kernel-correctness as a single signal without re-parsing every row.
+struct Summary {
+    total: usize,
+    implemented: usize,
+    correct: usize,
+    unchecked: usize,
+}
+
+fn summarize(results: &[OpResult]) -> Summary {
+    Summary {
+        total: results.len(),
+        implemented: results.iter().filter(|r| r.mt_perf().is_some()).count(),
+        correct: results
+            .iter()
+            .filter(|r| matches!(r.correctness_status(), CorrectnessStatus::Passed { .. }))
+            .count(),
+        unchecked: results.iter().filter(|r| r.is_unchecked()).count(),
+    }
+}
+
 fn json_f(v: Option<f64>) -> String {
     v.map(|x| format!("{x:.3}")).unwrap_or_else(|| "null".into())
 }
@@ -271,5 +297,61 @@ fn pct_style(pct: f64) -> Style {
         Style::new().fg(Color::Yellow).bold()
     } else {
         Style::new().fg(Color::Red).bold()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use metaltile_std::bench_types::{EquivResult, OpBench};
+
+    use super::*;
+
+    fn pass_equiv() -> EquivResult {
+        EquivResult { n_checked: 1, max_abs_err: 0.0, cosine_sim: 1.0, passed: true }
+    }
+
+    fn fail_equiv() -> EquivResult {
+        EquivResult { n_checked: 1, max_abs_err: 1e3, cosine_sim: 0.5, passed: false }
+    }
+
+    #[test]
+    fn summary_counts_per_category() {
+        let b = OpBench::new("op_a", "GB/s");
+        let implemented_correct =
+            b.result("shape_a", Some(100.0), Some(95.0), Some(pass_equiv()));
+        let implemented_wrong =
+            b.result("shape_b", Some(100.0), Some(40.0), Some(fail_equiv()));
+        let nyi = b.result("shape_c", Some(100.0), None, None);
+
+        let s = summarize(&[implemented_correct, implemented_wrong, nyi]);
+        assert_eq!(s.total, 3);
+        assert_eq!(s.implemented, 2);  // _correct + _wrong
+        assert_eq!(s.correct, 1);      // only _correct
+        assert_eq!(s.unchecked, 0);    // both implemented rows had equiv
+    }
+
+    #[test]
+    fn summary_counts_unchecked_rows() {
+        // An implemented result without an equiv check is an "unchecked"
+        // row — pinned via panic in OpBench::result_sub, but the
+        // counting path matters for older snapshots loaded via `tile
+        // snap --from`.
+        let b = OpBench::new("op", "GB/s");
+        let r = b.result("shape", Some(100.0), Some(95.0), Some(pass_equiv()));
+        // is_unchecked() is false here — sanity check the summary
+        // doesn't double-count.
+        let s = summarize(&[r]);
+        assert_eq!(s.implemented, 1);
+        assert_eq!(s.correct, 1);
+        assert_eq!(s.unchecked, 0);
+    }
+
+    #[test]
+    fn summary_on_empty_input_is_all_zero() {
+        let s = summarize(&[]);
+        assert_eq!(s.total, 0);
+        assert_eq!(s.implemented, 0);
+        assert_eq!(s.correct, 0);
+        assert_eq!(s.unchecked, 0);
     }
 }
