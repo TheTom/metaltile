@@ -50,15 +50,11 @@ pub fn mt_sdpa_vector<T>(
     let lane = simd_lane;
     let ns = n_simd;
 
-    // 32 slots per simdgroup-reduction array; 1024 slots per output
-    // accumulator (one per thread). Matches mt_sdpa exactly.
-    // Single 1024-float tg array reused 4× in the output reduction loop.
-    // Mirrors MLX's pattern (~4 KB tg memory vs our previous 16 KB across
-    // 4 separate arrays). On M2 with 32 KB tg memory per SM, this lifts
-    // concurrent TGs/SM from 2 → 7 — the missing occupancy factor that
-    // capped bf16 single-pass at 62% MT despite vectorized loads firing
-    // correctly. f16 and f32 also benefit but less (cast cost wasn't the
-    // limit there).
+    // 32-slot scalars for the cross-simdgroup max/sum + a 1024-slot output
+    // buffer reused 4× in the reduction loop below. Matches MLX's layout:
+    // 4 KB tg memory total. On M2 (32 KB tg/SM) that's 7 concurrent TGs/SM
+    // vs the 2 we got from the old 16 KB / 4-array layout — the missing
+    // occupancy factor that capped bf16 at 62% MT despite vectorized loads.
     threadgroup_alloc("tg_max", 32);
     threadgroup_alloc("tg_sum", 32);
     threadgroup_alloc("tg_out", 1024);
@@ -80,25 +76,16 @@ pub fn mt_sdpa_vector<T>(
     let mut o2 = 0.0f32;
     let mut o3 = 0.0f32;
 
-    // Each simdgroup walks every (n_simd)th KV position. Per iteration:
-    // simd_sum reduces the per-lane quartile dot product into a full
-    // score, then we apply the online-softmax update and accumulate
-    // the V quartile.
-    //
-    // Pre-compute the 4 KV element indices BEFORE the loads so the four
-    // Op::Load ops land consecutively in IR. Vectorize requires the loads
-    // to be back-to-back (no BinOp/Const/Arith interleaved between them).
-    // Cast the raw loads to f32 in a separate 4-op run after — same shape
-    // as `sdpa_decode_2pass_pass1`. Without this, the K loads ended up
-    // interleaved with `q_i * cast(...)` arithmetic, vectorize never fired,
-    // and bf16 stayed at ~35% MT of MLX on M2 mini.
-    for _t in range(sg, n_kv, ns) {
-        let base = kv_base + _t * head_dim;
-        let kv_idx = base + d0;
-        let kv0 = kv_idx;
-        let kv1 = kv_idx + 1u32;
-        let kv2 = kv_idx + 2u32;
-        let kv3 = kv_idx + 3u32;
+    // Per iter: dot Q with one K row → online-softmax update → accumulate V row.
+    // Pre-computing the 4 KV indices and issuing the 4 loads as a single run
+    // (no BinOp/Cast interleaved) is what lets the vectorize pass collapse
+    // them into one bfloat4 / half4 / float4 load — same shape as
+    // `sdpa_decode_2pass_pass1`. Inline'd loads + casts broke the run before.
+    for t in range(sg, n_kv, ns) {
+        let kv0 = kv_base + t * head_dim + d0;
+        let kv1 = kv0 + 1u32;
+        let kv2 = kv0 + 2u32;
+        let kv3 = kv0 + 3u32;
         let k0_raw = load(k[kv0]);
         let k1_raw = load(k[kv1]);
         let k2_raw = load(k[kv2]);
@@ -107,8 +94,7 @@ pub fn mt_sdpa_vector<T>(
         let k1 = k1_raw.cast::<f32>();
         let k2 = k2_raw.cast::<f32>();
         let k3 = k3_raw.cast::<f32>();
-        let partial = q0 * k0 + q1 * k1 + q2 * k2 + q3 * k3;
-        let score = simd_sum(partial);
+        let score = simd_sum(q0 * k0 + q1 * k1 + q2 * k2 + q3 * k3);
         let new_max = select(score > run_max, score, run_max);
         let factor = exp(run_max - new_max);
         let weight = exp(score - new_max);
@@ -147,22 +133,13 @@ pub fn mt_sdpa_vector<T>(
     }
     threadgroup_barrier();
 
-    // ── Cross-simdgroup reduction: outputs (one shared tg array, 4 iters) ─
+    // ── Cross-simdgroup reduction: outputs ─────────────────────────
     //
-    // Mirrors MLX's `sdpa_vector` reduction. Each iteration handles one of
-    // the 4 output elements per lane:
-    //   1. Every (lane, sg) writes its partial to tg_out[lane*ns + sg]
-    //   2. barrier
-    //   3. transpose-load (read tg_out[sg*ns + lane]) × per-sg factor,
-    //      then simd_sum across the 32 lanes of THIS simdgroup
-    //   4. lane 0 of each sg holds the reduced value for output position
-    //      sg*4 + i (i is the loop variable below) — same layout as the
-    //      input load pattern (each lane covers head_dim/32 = 4 elements
-    //      indexed by lane*4)
-    //
-    // Per-iter f32 store + 32-lane simd_sum reduction = 1 KB tg memory
-    // touched, reused 4 times. vs the old layout which pre-allocated 4 KB ×
-    // 4 arrays = 16 KB resident throughout the kernel.
+    // Per output element: write per-(lane, sg) partial, barrier, transpose-
+    // load (sg*ns + lane) × per-sg `factor_g`, simd_sum across the 32 lanes.
+    // lane 0 of each sg then holds the reduced value for output position
+    // `sg*4 + i`. Reuses the single 1 KB `tg_out` array for all 4 iters —
+    // see the `threadgroup_alloc` comment above for the occupancy rationale.
     let g_max = threadgroup_load("tg_max", 0);
     let g_sum = threadgroup_load("tg_sum", 0);
     let factor_g = exp(run_max - g_max);
@@ -170,30 +147,28 @@ pub fn mt_sdpa_vector<T>(
 
     threadgroup_store("tg_out", lane * ns + sg, o0);
     threadgroup_barrier();
-    let r0_in = threadgroup_load("tg_out", sg * ns + lane) * factor_g;
-    let red0 = simd_sum(r0_in) * inv_sum;
+    let red0 = simd_sum(threadgroup_load("tg_out", sg * ns + lane) * factor_g) * inv_sum;
     threadgroup_barrier();
 
     threadgroup_store("tg_out", lane * ns + sg, o1);
     threadgroup_barrier();
-    let r1_in = threadgroup_load("tg_out", sg * ns + lane) * factor_g;
-    let red1 = simd_sum(r1_in) * inv_sum;
+    let red1 = simd_sum(threadgroup_load("tg_out", sg * ns + lane) * factor_g) * inv_sum;
     threadgroup_barrier();
 
     threadgroup_store("tg_out", lane * ns + sg, o2);
     threadgroup_barrier();
-    let r2_in = threadgroup_load("tg_out", sg * ns + lane) * factor_g;
-    let red2 = simd_sum(r2_in) * inv_sum;
+    let red2 = simd_sum(threadgroup_load("tg_out", sg * ns + lane) * factor_g) * inv_sum;
     threadgroup_barrier();
 
     threadgroup_store("tg_out", lane * ns + sg, o3);
     threadgroup_barrier();
-    let r3_in = threadgroup_load("tg_out", sg * ns + lane) * factor_g;
-    let red3 = simd_sum(r3_in) * inv_sum;
+    let red3 = simd_sum(threadgroup_load("tg_out", sg * ns + lane) * factor_g) * inv_sum;
 
-    // lane 0 of each simdgroup writes its 4 elements. The output position
-    // is sg-indexed now (was lane-indexed in the old layout), matching
-    // MLX. f32→T narrowing is implicit at the MSL Store.
+    // lane 0 of each simdgroup writes its 4 elements at `q_off + sg*4`.
+    // Output assignment is sg-indexed (was lane-indexed pre-occupancy fix),
+    // matching MLX. f32→T narrowing is implicit at the MSL Store — adding
+    // a `.cast::<T>()` would break the 4-consecutive-Store vectorize window
+    // and double-wrap bf16 (`bfloat(bfloat(val))`).
     if lane == 0u32 {
         let out_off = q_off + sg * 4u32;
         store(out[out_off], red0);
