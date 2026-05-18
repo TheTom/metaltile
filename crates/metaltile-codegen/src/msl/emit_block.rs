@@ -270,6 +270,7 @@ impl MslGenerator {
                         BinOpKind::BitXor => wl!(out, "{pad}auto {v} = ({l} ^ {r});"),
                         BinOpKind::Shl => wl!(out, "{pad}auto {v} = ({l} << {r});"),
                         BinOpKind::Shr => wl!(out, "{pad}auto {v} = ({l} >> {r});"),
+                        BinOpKind::Mod => wl!(out, "{pad}auto {v} = ({l} % {r});"),
                         BinOpKind::Add => {
                             // FMA recognition: Mul + Add → fma() (floats only)
                             match (

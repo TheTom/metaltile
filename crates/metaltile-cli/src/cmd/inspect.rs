@@ -222,7 +222,8 @@ pub fn run(args: &[String]) {
             }
         } else {
             // Default: print MSL
-            let eff_dt = dtype_override.unwrap_or_else(|| dtypes.first().copied().unwrap_or(DType::F32));
+            let eff_dt =
+                dtype_override.unwrap_or_else(|| dtypes.first().copied().unwrap_or(DType::F32));
             let msl = generate_msl_dt(spec, eff_dt);
             if let Some(ref d) = dir {
                 let path = format!("{}/{}.metal", d, name);

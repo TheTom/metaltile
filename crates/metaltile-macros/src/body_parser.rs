@@ -447,6 +447,7 @@ impl DslBodyParser {
             syn::BinOp::BitXor(_) => quote! { BinOpKind::BitXor },
             syn::BinOp::Shl(_) => quote! { BinOpKind::Shl },
             syn::BinOp::Shr(_) => quote! { BinOpKind::Shr },
+            syn::BinOp::Rem(_) => quote! { BinOpKind::Mod },
             syn::BinOp::And(_) => quote! { BinOpKind::And },
             syn::BinOp::Or(_) => quote! { BinOpKind::Or },
             _ => quote! { BinOpKind::Add },

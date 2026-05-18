@@ -78,7 +78,9 @@ pub fn run(spec: &BenchSpec, runner: &GpuRunner, dt: DType) -> Vec<OpResult> {
                 *tpg,
             ),
         BenchDispatch::SteelGemm { m, n, k, check_m, check_n, check_k, bm, bn, tpg } =>
-            run_steel_gemm(spec, runner, dt, &bench, *m, *n, *k, *check_m, *check_n, *check_k, *bm, *bn, *tpg),
+            run_steel_gemm(
+                spec, runner, dt, &bench, *m, *n, *k, *check_m, *check_n, *check_k, *bm, *bn, *tpg,
+            ),
     }
 }
 
@@ -1729,16 +1731,16 @@ fn run_steel_gemm(
     runner.measure(&mk, &all_bufs, grid, tpg_arr, 0, 1);
     let mt_vals = read_typed(runner, &d_buf, check_m * check_n, dt);
 
-    let ref_vals: Vec<f32> = (0..check_m * check_n)
-        .map(|_| check_k as f32)
-        .collect();
+    let ref_vals: Vec<f32> = (0..check_m * check_n).map(|_| check_k as f32).collect();
 
     let equiv = check_equiv(&ref_vals, &mt_vals, 1e-2);
     let label = format!("M={m} N={n} K={k} BM={bm} BN={bn} {}", ctx.label);
     let mt_perf = bench_gbps(
-        runner, &mk,
+        runner,
+        &mk,
         &all_bufs,
-        grid, tpg_arr,
+        grid,
+        tpg_arr,
         ((check_m * check_k + check_k * check_n + check_m * check_n) * ctx.eb) as f64,
     );
 

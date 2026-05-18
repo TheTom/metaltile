@@ -27,6 +27,7 @@ pub fn first_mode(spec: &BenchSpec) -> KernelMode {
         | BenchDispatch::FpQuantized { .. }
         | BenchDispatch::AffineDequantize { .. } => KernelMode::Elementwise,
         BenchDispatch::Rope { .. } | BenchDispatch::StridedCopy { .. } => KernelMode::Grid3D,
+        BenchDispatch::SteelGemm { .. } => KernelMode::SimdGroup2D,
     }
 }
 

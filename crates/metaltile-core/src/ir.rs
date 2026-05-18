@@ -265,6 +265,8 @@ pub enum BinOpKind {
     BitOr,
     /// Bitwise XOR (integer).
     BitXor,
+    /// Integer modulo: `a % b`.
+    Mod,
 }
 
 impl BinOpKind {
@@ -293,6 +295,7 @@ impl BinOpKind {
             BinOpKind::BitAnd => "&",
             BinOpKind::BitOr => "|",
             BinOpKind::BitXor => "^",
+            BinOpKind::Mod => "%",
         }
     }
 

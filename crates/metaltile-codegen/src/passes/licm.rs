@@ -121,7 +121,7 @@ fn licm_block(
     let mut plans: Vec<HoistPlan> = Vec::new();
 
     for i in 0..n {
-        if let Op::Loop { body, .. } = &block.ops[i] {
+        if let Op::Loop { var, body, .. } = &block.ops[i] {
             let Some(loop_body) = blocks.get(body) else {
                 continue;
             };
@@ -135,15 +135,30 @@ fn licm_block(
                 }
             }
             // Also include values from other blocks (ancestors) referenced by the loop.
+            // Exclude values from descendants (inner loops) — those were hoisted
+            // here and are still loop-variant at this level.
+            let body_id_u32 = body.as_u32();
             for op in &loop_body.ops {
                 for vid in remap::op_value_refs(op) {
-                    if let Some(&def_bid) = def_block.get(&vid)
-                        && def_bid != *body
-                    {
-                        invariant.insert(vid);
+                    if let Some(&def_bid) = def_block.get(&vid) {
+                        let def_u32 = def_bid.as_u32();
+                        // Ancestor blocks have lower IDs (allocated before body).
+                        // Descendant blocks have higher IDs — exclude them.
+                        if def_u32 < body_id_u32 {
+                            invariant.insert(vid);
+                        }
                     }
                 }
             }
+
+            // Mark loop iteration variable as variant (NOT invariant).
+            // The loop variable is synthesized with ValueId(var.as_u32() + 1000)
+            // or ValueId(0xC000_0000 | var.as_u32()) by the codegen.
+            // Anything that depends on it must stay in the loop body.
+            let loop_vid_a = ValueId::new(var.as_u32() + 1000);
+            let loop_vid_b = ValueId::new(0xC000_0000 | var.as_u32());
+            invariant.remove(&loop_vid_a);
+            invariant.remove(&loop_vid_b);
 
             // Fixpoint: find hoistable ops.
             let mut hoist_indices: Vec<usize> = Vec::new();
