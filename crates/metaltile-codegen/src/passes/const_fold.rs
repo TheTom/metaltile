@@ -166,6 +166,7 @@ fn eval_binop(op: BinOpKind, a: i64, b: i64) -> Option<i64> {
         BinOpKind::BitAnd => Some(a & b),
         BinOpKind::BitOr => Some(a | b),
         BinOpKind::BitXor => Some(a ^ b),
+        BinOpKind::ATan2 | BinOpKind::Rem => None, // floating-point; not folded
     }
 }
 

@@ -492,6 +492,19 @@ impl DslBodyParser {
             "erf" => self.parse_unary_call(call, "erf"),
             "sign" => self.parse_unary_call(call, "sign"),
             "round" => self.parse_unary_call(call, "round"),
+            "sinh" => self.parse_unary_call(call, "sinh"),
+            "cosh" => self.parse_unary_call(call, "cosh"),
+            "tan" => self.parse_unary_call(call, "tan"),
+            "asin" => self.parse_unary_call(call, "asin"),
+            "atan" => self.parse_unary_call(call, "atan"),
+            "asinh" => self.parse_unary_call(call, "asinh"),
+            "acosh" => self.parse_unary_call(call, "acosh"),
+            "atanh" => self.parse_unary_call(call, "atanh"),
+            "expm1" => self.parse_unary_call(call, "expm1"),
+            "log10" => self.parse_unary_call(call, "log10"),
+            "erfinv" => self.parse_unary_call(call, "erfinv"),
+            "atan2" => self.parse_binary_call(call, "ATan2"),
+            "remainder" => self.parse_binary_call(call, "Rem"),
             "max" => self.parse_binary_call(call, "Max"),
             "min" => self.parse_binary_call(call, "Min"),
             "cast" => self.parse_cast_call(call),
@@ -608,7 +621,8 @@ impl DslBodyParser {
         let result = self.alloc_vid();
         match fn_name {
             "exp" | "exp2" | "log" | "log2" | "sqrt" | "rsqrt" | "abs" | "sin" | "cos" | "ceil"
-            | "floor" | "recip" | "erf" | "sign" | "round" => {
+            | "floor" | "recip" | "erf" | "sign" | "round" 
+            | "sinh" | "cosh" | "tan" | "asin" | "atan" | "asinh" | "acosh" | "atanh" | "expm1" | "log10" | "erfinv" => {
                 let op_tokens = match fn_name {
                     "exp" => quote! { UnaryOpKind::Exp },
                     "exp2" => quote! { UnaryOpKind::Exp2 },
@@ -625,6 +639,17 @@ impl DslBodyParser {
                     "erf" => quote! { UnaryOpKind::Erf },
                     "sign" => quote! { UnaryOpKind::Sign },
                     "round" => quote! { UnaryOpKind::Round },
+                    "sinh" => quote! { UnaryOpKind::Sinh },
+                    "cosh" => quote! { UnaryOpKind::Cosh },
+                    "tan" => quote! { UnaryOpKind::Tan },
+                    "asin" => quote! { UnaryOpKind::Asin },
+                    "atan" => quote! { UnaryOpKind::Atan },
+                    "asinh" => quote! { UnaryOpKind::Asinh },
+                    "acosh" => quote! { UnaryOpKind::Acosh },
+                    "atanh" => quote! { UnaryOpKind::Atanh },
+                    "expm1" => quote! { UnaryOpKind::Expm1 },
+                    "log10" => quote! { UnaryOpKind::Log10 },
+                    "erfinv" => quote! { UnaryOpKind::ErfInv },
                     _ => quote! { UnaryOpKind::Exp },
                 };
                 self.push_op(
@@ -685,6 +710,8 @@ impl DslBodyParser {
             "Max" => quote! { BinOpKind::Max },
             "Min" => quote! { BinOpKind::Min },
             "Pow" => quote! { BinOpKind::Pow },
+            "ATan2" => quote! { BinOpKind::ATan2 },
+            "Rem" => quote! { BinOpKind::Rem },
             _ => quote! { BinOpKind::Add },
         };
         self.push_op(

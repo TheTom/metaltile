@@ -12,6 +12,7 @@ use metaltile::{bench_kernel, kernel};
     d=128,
     n_per_group=4,
     tol=0.01,
+    mlx="rope_{tn}",
     metal_file="rope.metal",
     dtypes=crate::spec::F16_ONLY,
 )]

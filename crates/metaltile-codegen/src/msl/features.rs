@@ -25,6 +25,7 @@ pub(super) struct KernelFeatures {
     pub needs_relu: bool,
     pub needs_sigmoid: bool,
     pub needs_erf: bool,
+    pub needs_erfinv: bool,
 }
 
 impl MslGenerator {
@@ -40,6 +41,7 @@ impl MslGenerator {
             needs_relu: false,
             needs_sigmoid: false,
             needs_erf: false,
+            needs_erfinv: false,
         };
         for p in &kernel.params {
             if p.dtype == DType::BF16 {
@@ -86,6 +88,7 @@ impl MslGenerator {
                     ActKind::Tanh => {},
                 },
                 Op::UnaryOp { op: UnaryOpKind::Erf, .. } => feat.needs_erf = true,
+                Op::UnaryOp { op: UnaryOpKind::ErfInv, .. } => feat.needs_erfinv = true,
                 _ => {},
             }
         }

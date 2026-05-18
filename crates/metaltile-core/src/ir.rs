@@ -133,6 +133,28 @@ pub enum UnaryOpKind {
     Sign,
     Round,
     Trunc,
+    /// Hyperbolic sine: `sinh(x)`.
+    Sinh,
+    /// Hyperbolic cosine: `cosh(x)`.
+    Cosh,
+    /// Tangent: `tan(x)`.
+    Tan,
+    /// Arc sine: `asin(x)`.
+    Asin,
+    /// Arc tangent: `atan(x)`.
+    Atan,
+    /// Inverse hyperbolic sine: `asinh(x)`.
+    Asinh,
+    /// Inverse hyperbolic cosine: `acosh(x)`.
+    Acosh,
+    /// Inverse hyperbolic tangent: `atanh(x)`.
+    Atanh,
+    /// exp(x)-1 with high precision for small x: `expm1(x)`.
+    Expm1,
+    /// Base-10 logarithm: `log10(x)`.
+    Log10,
+    /// Inverse error function: `erfinv(x)`.
+    ErfInv,
 }
 
 impl UnaryOpKind {
@@ -159,6 +181,17 @@ impl UnaryOpKind {
             // ~2× slower. MLX also uses rint() for its Round op (see unary.metal).
             UnaryOpKind::Round => format!("rint({arg})"),
             UnaryOpKind::Trunc => format!("trunc({arg})"),
+            UnaryOpKind::Sinh => format!("sinh({arg})"),
+            UnaryOpKind::Cosh => format!("cosh({arg})"),
+            UnaryOpKind::Tan => format!("tan({arg})"),
+            UnaryOpKind::Asin => format!("asin({arg})"),
+            UnaryOpKind::Atan => format!("atan({arg})"),
+            UnaryOpKind::Asinh => format!("asinh({arg})"),
+            UnaryOpKind::Acosh => format!("acosh({arg})"),
+            UnaryOpKind::Atanh => format!("atanh({arg})"),
+            UnaryOpKind::Expm1 => format!("expm1({arg})"),
+            UnaryOpKind::Log10 => format!("log10({arg})"),
+            UnaryOpKind::ErfInv => format!("mt_erfinv_impl({arg})"),
         }
     }
 }
@@ -215,6 +248,10 @@ pub enum BinOpKind {
     CmpNe,
     /// Power: a^b (maps to MSL `pow(a, b)`).
     Pow,
+    /// Arc tangent of y/x: `atan2(y, x)`.
+    ATan2,
+    /// Floating-point remainder: `fmod(a, b)`.
+    Rem,
     /// Left shift: a << b.
     Shl,
     /// Right shift: a >> b.
@@ -246,6 +283,8 @@ impl BinOpKind {
             BinOpKind::CmpEq => "==",
             BinOpKind::CmpNe => "!=",
             BinOpKind::Pow => "pow",
+            BinOpKind::ATan2 => "atan2",
+            BinOpKind::Rem => "fmod",
             BinOpKind::Shl => "<<",
             BinOpKind::Shr => ">>",
             BinOpKind::BitAnd => "&",
@@ -269,7 +308,7 @@ impl BinOpKind {
 
     /// Whether this op is emitted as `fn(a, b)` rather than infix `a op b`.
     pub fn is_fn_call(self) -> bool {
-        matches!(self, BinOpKind::Max | BinOpKind::Min | BinOpKind::Pow)
+        matches!(self, BinOpKind::Max | BinOpKind::Min | BinOpKind::Pow | BinOpKind::ATan2 | BinOpKind::Rem)
     }
 }
 

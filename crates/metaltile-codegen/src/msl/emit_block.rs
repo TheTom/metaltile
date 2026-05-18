@@ -246,7 +246,8 @@ impl MslGenerator {
                         .map(|tv| matches!(tv.dtype, DType::F32 | DType::F16 | DType::BF16))
                         .unwrap_or(false);
                     match op {
-                        BinOpKind::Max | BinOpKind::Min | BinOpKind::Pow => {
+                        BinOpKind::Max | BinOpKind::Min | BinOpKind::Pow
+                        | BinOpKind::ATan2 | BinOpKind::Rem => {
                             wl!(out, "{pad}auto {v} = {}({l}, {r});", op.msl_symbol())
                         },
                         BinOpKind::And => wl!(out, "{pad}auto {v} = ({l} && {r});"),
