@@ -192,7 +192,7 @@ impl UnaryOpKind {
             UnaryOpKind::Acos => format!("acos({arg})"),
             UnaryOpKind::Acosh => format!("acosh({arg})"),
             UnaryOpKind::Atanh => format!("atanh({arg})"),
-            UnaryOpKind::Expm1 => format!("expm1({arg})"),
+            UnaryOpKind::Expm1 => format!("mt_expm1_impl({arg})"),
             UnaryOpKind::Log10 => format!("log10({arg})"),
             UnaryOpKind::ErfInv => format!("mt_erfinv_impl({arg})"),
         }
@@ -682,6 +682,10 @@ pub enum KernelMode {
     /// `uint2 tid [[thread_position_in_threadgroup]] + uint2 tgid`
     /// Used for tiled 2-D kernels (gemv, matmul).
     Tile2D,
+    /// `uint3 tid [[threadgroup_position_in_grid]]` + `uint3 lid` +
+    /// `uint simd_lane` + `uint simd_group`.
+    /// Used for tiled simdgroup-matmul kernels (steel GEMM).
+    SimdGroup2D,
 }
 
 // ---------------------------------------------------------------------------
@@ -823,6 +827,7 @@ impl std::fmt::Display for Kernel {
             KernelMode::Reduction => "Reduction",
             KernelMode::Grid3D => "Grid3D",
             KernelMode::Tile2D => "Tile2D",
+            KernelMode::SimdGroup2D => "SimdGroup2D",
         };
         let params_str: Vec<String> = self
             .params

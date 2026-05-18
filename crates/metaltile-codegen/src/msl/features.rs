@@ -27,6 +27,7 @@ pub(super) struct KernelFeatures {
     pub needs_sigmoid: bool,
     pub needs_erf: bool,
     pub needs_erfinv: bool,
+    pub needs_expm1: bool,
     pub needs_simd_product: bool,
 }
 
@@ -45,6 +46,7 @@ impl MslGenerator {
             needs_sigmoid: false,
             needs_erf: false,
             needs_erfinv: false,
+            needs_expm1: false,
             needs_simd_product: false,
         };
         for p in &kernel.params {
@@ -101,6 +103,7 @@ impl MslGenerator {
                 },
                 Op::UnaryOp { op: UnaryOpKind::Erf, .. } => feat.needs_erf = true,
                 Op::UnaryOp { op: UnaryOpKind::ErfInv, .. } => feat.needs_erfinv = true,
+                Op::UnaryOp { op: UnaryOpKind::Expm1, .. } => feat.needs_expm1 = true,
                 // simdgroup matrix ops need simd built-ins and the simdgroup_matrix header
                 Op::SimdgroupAlloc { .. }
                 | Op::SimdgroupElemLoad { .. }

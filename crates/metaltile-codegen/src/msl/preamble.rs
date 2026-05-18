@@ -122,6 +122,18 @@ impl super::MslGenerator {
             wl!(out, "template<typename T>");
             wl!(out, "inline T mt_erfinv_impl(T x) {{ return T(mt_erfinv_impl(float(x))); }}");
         }
+        if feat.needs_expm1 {
+            wl!(out);
+            // Metal stdlib lacks expm1(); implement via Taylor for |x| < 1e-4
+            // (avoids catastrophic cancellation) and exp(x)-1 elsewhere.
+            wl!(out, "// Metal lacks expm1(); accurate for small x via Taylor series.");
+            wl!(out, "inline float mt_expm1_impl(float x) {{");
+            wl!(out, "    if (fabs(x) < 1.0e-4f) return x + 0.5f * x * x;");
+            wl!(out, "    return exp(x) - 1.0f;");
+            wl!(out, "}}");
+            wl!(out, "template<typename T>");
+            wl!(out, "inline T mt_expm1_impl(T x) {{ return T(mt_expm1_impl(float(x))); }}");
+        }
         if feat.needs_simd_product {
             wl!(out);
             // simd_size is only accessible as a kernel attribute, not in free functions.

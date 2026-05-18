@@ -75,6 +75,12 @@ impl MslGenerator {
                             1 => wl!(out, "{pad}uint {v} = tgid.y;"),
                             _ => wl!(out, "{pad}uint {v} = 0;"),
                         },
+                        KernelMode::SimdGroup2D => match axis {
+                            0 => wl!(out, "{pad}uint {v} = tid.x;"),
+                            1 => wl!(out, "{pad}uint {v} = tid.y;"),
+                            2 => wl!(out, "{pad}uint {v} = tid.z;"),
+                            _ => wl!(out, "{pad}uint {v} = 0;"),
+                        },
                     }
                 },
 
@@ -112,7 +118,11 @@ impl MslGenerator {
                 // ---- memory --------------------------------------------
                 Op::Load { src, indices, .. } => {
                     let v = self.vname(vid, block, extra_names);
-                    let src_dtype = kernel.params.iter().find(|p| p.name == *src).map(|p| p.dtype);
+                    // `simd_id` is a DSL alias for the simdgroup index; the
+                    // Metal kernel parameter is named `simd_group`.
+                    let src = if src.as_str() == "simd_id" { "simd_group" } else { src.as_str() };
+                    let src_dtype =
+                        kernel.params.iter().find(|p| p.name == src).map(|p| p.dtype);
                     let promote_bf16 = self.config.native_bfloat
                         && src_dtype == Some(DType::BF16)
                         && kernel.mode == KernelMode::Elementwise;
