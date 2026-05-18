@@ -124,7 +124,10 @@ impl MslGenerator {
                     let src_dtype = kernel.params.iter().find(|p| p.name == src).map(|p| p.dtype);
                     let promote_bf16 = self.config.native_bfloat
                         && src_dtype == Some(DType::BF16)
-                        && matches!(kernel.mode, KernelMode::Elementwise | KernelMode::SimdGroup2D);
+                        && matches!(
+                            kernel.mode,
+                            KernelMode::Elementwise | KernelMode::SimdGroup2D
+                        );
                     if indices.is_empty() {
                         if promote_bf16 {
                             wl!(out, "{pad}float {v} = float({src});");
@@ -534,6 +537,14 @@ impl MslGenerator {
                             wl!(out, "{pad}auto {v} = {expr};");
                         }
                     }
+                },
+
+                Op::VectorExtract { vec, lane } => {
+                    let v = self.vname(vid, block, extra_names);
+                    let src = self.vname(Some(*vec), block, extra_names);
+                    // Use array-index syntax — Metal vec types support
+                    // operator[] returning scalar of the element type.
+                    wl!(out, "{pad}auto {v} = {src}[{lane}];");
                 },
 
                 // ---- vectorised data movement ---------------------------
