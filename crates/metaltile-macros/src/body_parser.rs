@@ -1250,14 +1250,33 @@ impl DslBodyParser {
     }
 
     /// `threadgroup_alloc("name", size)` → Op::ThreadgroupAlloc (no result).
+    /// Optional third argument: `T` uses kernel's generic type, any other type
+    /// name (`f32`, `f16`, etc.) uses that specific dtype. Defaults to F32.
     fn parse_threadgroup_alloc(&mut self, call: &ExprCall) -> u32 {
         let args: Vec<_> = call.args.iter().collect();
         let name = string_lit_from_expr(args.first().unwrap_or(&&*call.func));
         let size: usize = usize_lit_from_expr(args.get(1).copied());
         let size_u32 = size as u32;
+        let dtype_ts = if let Some(ty_arg) = args.get(2) {
+            // Explicit dtype: `T` resolves to kernel generic, anything else via parse_dtype_generic
+            let ty_str = quote! { #ty_arg }.to_string();
+            if ty_str.trim() == "T" {
+                if let Some(tok) = self.type_vars.get("T") {
+                    tok.clone()
+                } else {
+                    quote! { DType::F32 }
+                }
+            } else {
+                // Parse as a concrete type name
+                let ty: syn::Type = syn::parse_str(&ty_str.trim().replace(' ', "")).unwrap_or_else(|_| syn::parse_str("f32").unwrap());
+                parse_dtype_generic(&ty, &self.type_vars)
+            }
+        } else {
+            quote! { DType::F32 }
+        };
         self.push_op_no_result(quote! {
             Op::ThreadgroupAlloc {
-                dtype: DType::F32,
+                dtype: #dtype_ts,
                 size: #size_u32,
                 name: #name.to_string(),
             }

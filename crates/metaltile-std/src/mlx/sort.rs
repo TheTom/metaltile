@@ -19,10 +19,10 @@ pub fn mt_sort<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
     let t = tid;
     threadgroup_alloc("shared", 1024);
     let base = block_id * n;
-    threadgroup_store("shared", t * 4u32, load(inp[base + t * 4u32]).cast::<f32>());
-    threadgroup_store("shared", t * 4u32 + 1u32, load(inp[base + t * 4u32 + 1u32]).cast::<f32>());
-    threadgroup_store("shared", t * 4u32 + 2u32, load(inp[base + t * 4u32 + 2u32]).cast::<f32>());
-    threadgroup_store("shared", t * 4u32 + 3u32, load(inp[base + t * 4u32 + 3u32]).cast::<f32>());
+    threadgroup_store("shared", t * 4u32, load(inp[base + t * 4u32]));
+    threadgroup_store("shared", t * 4u32 + 1u32, load(inp[base + t * 4u32 + 1u32]));
+    threadgroup_store("shared", t * 4u32 + 2u32, load(inp[base + t * 4u32 + 2u32]));
+    threadgroup_store("shared", t * 4u32 + 3u32, load(inp[base + t * 4u32 + 3u32]));
     threadgroup_barrier();
     for _k in range(1u32, 11u32, 1u32) {
         for _jb in range(0u32, _k, 1u32) {
@@ -45,8 +45,8 @@ pub fn mt_sort<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
         }
     }
     threadgroup_barrier();
-    store(out[base + t * 4u32], threadgroup_load("shared", t * 4u32).cast::<T>());
-    store(out[base + t * 4u32 + 1u32], threadgroup_load("shared", t * 4u32 + 1u32).cast::<T>());
-    store(out[base + t * 4u32 + 2u32], threadgroup_load("shared", t * 4u32 + 2u32).cast::<T>());
-    store(out[base + t * 4u32 + 3u32], threadgroup_load("shared", t * 4u32 + 3u32).cast::<T>());
+    store(out[base + t * 4u32], threadgroup_load("shared", t * 4u32));
+    store(out[base + t * 4u32 + 1u32], threadgroup_load("shared", t * 4u32 + 1u32));
+    store(out[base + t * 4u32 + 2u32], threadgroup_load("shared", t * 4u32 + 2u32));
+    store(out[base + t * 4u32 + 3u32], threadgroup_load("shared", t * 4u32 + 3u32));
 }
