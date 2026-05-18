@@ -27,12 +27,13 @@
 //!   its use in optimization", ACM TOPLAS 9(3):319–349.  PDG-based dead-store
 //!   detection.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::BTreeSet;
 
 use metaltile_core::{
     error::Result,
     ir::{Block, BlockId, IndexExpr, Kernel, Op, ValueId},
 };
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::block_util;
 
@@ -102,8 +103,10 @@ fn dse_block(block: &mut Block, output_params: &BTreeSet<String>) {
         return;
     }
 
-    // Phase 1: collect all load locations (reads).
-    let mut reads: HashSet<StoreKey> = HashSet::new();
+    // Phase 1: collect all load locations (reads). Pre-size to op count —
+    // upper bound on distinct load locations, avoids the 4 → 8 → 16 → … grow
+    // sequence on every block.
+    let mut reads: FxHashSet<StoreKey> = FxHashSet::with_capacity_and_hasher(n, Default::default());
     for op in &block.ops {
         if let Some(key) = StoreKey::from_load(op) {
             reads.insert(key);
@@ -114,7 +117,8 @@ fn dse_block(block: &mut Block, output_params: &BTreeSet<String>) {
     let mut dead: Vec<usize> = Vec::new();
     // Maps a StoreKey to (position of most recent store seen, is_alive).
     // Scanned backwards: "most recent" = earliest in execution order.
-    let mut last_store_at: HashMap<StoreKey, (usize, bool)> = HashMap::new();
+    let mut last_store_at: FxHashMap<StoreKey, (usize, bool)> =
+        FxHashMap::with_capacity_and_hasher(n, Default::default());
 
     for i in (0..n).rev() {
         let op = &block.ops[i];

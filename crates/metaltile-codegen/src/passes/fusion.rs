@@ -33,12 +33,13 @@
 //!   TensorFlow blog.  Production operator fusion for ML workloads.
 //!   https://developers.googleblog.com/xla-tensorflow-compiled/
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use metaltile_core::{
     error::Result,
     ir::{Block, BlockId, Kernel, Op, ValueId},
 };
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::remap::op_value_refs;
 
@@ -56,7 +57,7 @@ impl super::Pass for FusionPass {
 
     fn run(&self, kernel: &mut Kernel) -> Result<()> {
         // Build a map: ValueId → the BlockId that defines (produces) it.
-        let mut def_block: BTreeMap<ValueId, BlockId> = BTreeMap::new();
+        let mut def_block: FxHashMap<ValueId, BlockId> = FxHashMap::default();
         for vid in kernel.body.results.iter().flatten() {
             def_block.insert(*vid, kernel.body.id);
         }
@@ -67,7 +68,7 @@ impl super::Pass for FusionPass {
         }
 
         // Build a map: ValueId → set of BlockIds that reference (use) it.
-        let mut used_in: BTreeMap<ValueId, BTreeSet<BlockId>> = BTreeMap::new();
+        let mut used_in: FxHashMap<ValueId, FxHashSet<BlockId>> = FxHashMap::default();
         for op in &kernel.body.ops {
             for vid in op_value_refs(op) {
                 used_in.entry(vid).or_default().insert(kernel.body.id);
@@ -85,7 +86,7 @@ impl super::Pass for FusionPass {
         // defined in B but used in at least one other block (i.e. a child block).
         // Pinned values must not be fused away — they need a standalone declaration
         // so that child blocks can reference the variable by name.
-        let mut pinned_per_block: BTreeMap<BlockId, BTreeSet<ValueId>> = BTreeMap::new();
+        let mut pinned_per_block: FxHashMap<BlockId, BTreeSet<ValueId>> = FxHashMap::default();
         for (vid, def_bid) in &def_block {
             if let Some(use_bids) = used_in.get(vid) {
                 for &use_bid in use_bids {
@@ -121,7 +122,7 @@ impl super::Pass for FusionPass {
 fn fuse_block(block: &mut Block, pinned: &BTreeSet<ValueId>) {
     // Phase 1: build def-use graph.
     // uses[vid] = set of op indices that reference vid.
-    let mut uses: BTreeMap<ValueId, Vec<usize>> = BTreeMap::new();
+    let mut uses: FxHashMap<ValueId, Vec<usize>> = FxHashMap::default();
     for (i, op) in block.ops.iter().enumerate() {
         for vid in op_value_refs(op) {
             uses.entry(vid).or_default().push(i);
@@ -132,7 +133,7 @@ fn fuse_block(block: &mut Block, pinned: &BTreeSet<ValueId>) {
     // A chain ends at an op C where C does NOT have exactly one user.
     // Walk backward from the last op, collecting fusible producers.
     let n = block.ops.len();
-    let mut fused: BTreeSet<usize> = BTreeSet::new(); // op indices already in a fused chain.
+    let mut fused: FxHashSet<usize> = FxHashSet::default(); // op indices already in a fused chain.
     let mut chains: Vec<Vec<usize>> = Vec::new();
 
     for i in (0..n).rev() {
@@ -200,7 +201,7 @@ fn fuse_block(block: &mut Block, pinned: &BTreeSet<ValueId>) {
 
     // Build a mapping: old op index → new ValueId for its result (if it survives).
     // For ops in fused chains, their results are replaced by the chain's output vid.
-    let mut chain_result_map: BTreeMap<usize, ValueId> = BTreeMap::new();
+    let mut chain_result_map: FxHashMap<usize, ValueId> = FxHashMap::default();
 
     // Pre-compute: for each chain, what is its output ValueId?
     // The output ValueId is the result of the LAST op in the chain.
@@ -215,7 +216,7 @@ fn fuse_block(block: &mut Block, pinned: &BTreeSet<ValueId>) {
 
     // Also track which old indices should be skipped (they're in a fused chain,
     // but not the last one — only the last one gets emitted).
-    let mut skip_indices: BTreeSet<usize> = BTreeSet::new();
+    let mut skip_indices: FxHashSet<usize> = FxHashSet::default();
     for chain in &chains {
         for &idx in chain.iter().take(chain.len() - 1) {
             skip_indices.insert(idx);
@@ -227,7 +228,7 @@ fn fuse_block(block: &mut Block, pinned: &BTreeSet<ValueId>) {
     // it should reference the chain's output ValueId.
     fn remap_value(
         v: &mut ValueId,
-        chain_map: &BTreeMap<usize, ValueId>,
+        chain_map: &FxHashMap<usize, ValueId>,
         old_results: &[Option<ValueId>],
     ) {
         for (&old_idx, &new_vid) in chain_map {
@@ -240,7 +241,7 @@ fn fuse_block(block: &mut Block, pinned: &BTreeSet<ValueId>) {
 
     fn remap_op(
         op: &mut Op,
-        chain_map: &BTreeMap<usize, ValueId>,
+        chain_map: &FxHashMap<usize, ValueId>,
         old_results: &[Option<ValueId>],
     ) {
         match op {
