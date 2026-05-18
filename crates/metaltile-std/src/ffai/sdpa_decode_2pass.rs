@@ -89,7 +89,7 @@ pub fn sdpa_decode_2pass_pass1<T>(
     q: Tensor<T>,
     k: Tensor<T>,
     v: Tensor<T>,
-    mut partial_o: Tensor<f32>,
+    mut partial_o: Tensor<T>,
     mut partial_m: Tensor<f32>,
     mut partial_l: Tensor<f32>,
     #[constexpr] head_dim: u32,
@@ -170,6 +170,9 @@ pub fn sdpa_decode_2pass_pass1<T>(
     let po1 = out_block_off + 1u32;
     let po2 = out_block_off + 2u32;
     let po3 = out_block_off + 3u32;
+    // f32→T narrowing happens implicitly at the MSL Store (`dst[i] = val`),
+    // so we don't add a Cast op here — that would introduce an extra
+    // rounding step + break the 4-consecutive-Store window vectorize needs.
     let so0 = o0;
     let so1 = o1;
     let so2 = o2;
@@ -189,7 +192,7 @@ pub fn sdpa_decode_2pass_pass1<T>(
 
 #[kernel]
 pub fn sdpa_decode_2pass_pass2<T>(
-    partial_o: Tensor<f32>,
+    partial_o: Tensor<T>,
     partial_m: Tensor<f32>,
     partial_l: Tensor<f32>,
     mut out: Tensor<T>,
@@ -242,10 +245,17 @@ pub fn sdpa_decode_2pass_pass2<T>(
         let po1 = po + 1u32;
         let po2 = po + 2u32;
         let po3 = po + 3u32;
-        let p0 = load(partial_o[po0]);
-        let p1 = load(partial_o[po1]);
-        let p2 = load(partial_o[po2]);
-        let p3 = load(partial_o[po3]);
+        // Four consecutive Loads → vectorize collapses to one TxN
+        // load. Cast each lane to f32 AFTER the loads so the Load run
+        // stays uninterrupted; the running accumulators stay f32.
+        let p0_raw = load(partial_o[po0]);
+        let p1_raw = load(partial_o[po1]);
+        let p2_raw = load(partial_o[po2]);
+        let p3_raw = load(partial_o[po3]);
+        let p0 = p0_raw.cast::<f32>();
+        let p1 = p1_raw.cast::<f32>();
+        let p2 = p2_raw.cast::<f32>();
+        let p3 = p3_raw.cast::<f32>();
         o0 = o0 + factor * p0;
         o1 = o1 + factor * p1;
         o2 = o2 + factor * p2;

@@ -1806,8 +1806,12 @@ fn run_sdpa_vector_2pass(
     let k_buf = buffer_typed(runner, &vals[..n_kv_heads * n_kv * head_dim], dt);
     let v_buf = buffer_typed(runner, &vals[..n_kv_heads * n_kv * head_dim], dt);
 
-    // Pass 1 partials — kept in fp32 regardless of storage dtype (private staging).
-    let partial_o = runner.buffer_zeros(n_q_heads * blocks * head_dim * 4);
+    // Pass 1 partials: `partial_o` is Tensor<T> (matches MLX sdpa_vector_2pass —
+    // post-softmax-weighted values are bounded so storage in T loses no useful
+    // bits and halves bandwidth at f16/bf16). `partial_max` / `partial_sum`
+    // stay f32 — the online-softmax running sum of `exp()` can blow past f16's
+    // ~6.5e4 ceiling on long n_kv.
+    let partial_o = runner.buffer_zeros(n_q_heads * blocks * head_dim * ctx.eb);
     let partial_max = runner.buffer_zeros(n_q_heads * blocks * 4);
     let partial_sum = runner.buffer_zeros(n_q_heads * blocks * 4);
     let mt_out_buf = zeros_typed(runner, n_q_heads * head_dim, dt);
