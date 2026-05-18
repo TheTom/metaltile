@@ -107,7 +107,21 @@ fn msl_for_mode(spec: &BenchSpec, dt: DType, mode: KernelMode) -> Option<String>
 
 fn mlx_name(pat: &str, tn: &str) -> String { pat.replace("{tn}", tn) }
 fn compile_mt(runner: &GpuRunner, msl: &str, name: &str) -> Option<crate::runner::CompiledKernel> {
-    runner.compile(msl, name).ok()
+    match runner.compile(msl, name) {
+        Ok(k) => Some(k),
+        Err(e) => {
+            eprintln!(
+                "{} compile '{}': {}",
+                crate::term::paint_stderr(
+                    "[error]",
+                    crate::term::Style::new().fg(crate::term::Color::Red).bold(),
+                ),
+                name,
+                e,
+            );
+            None
+        }
+    }
 }
 fn compile_mlx(
     runner: &GpuRunner,
