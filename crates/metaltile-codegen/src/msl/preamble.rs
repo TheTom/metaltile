@@ -124,11 +124,16 @@ impl super::MslGenerator {
         }
         if feat.needs_simd_product {
             wl!(out);
-            wl!(out, "// Manual SIMD-group product reduction (Metal lacks simd_product).");
+            // simd_size is only accessible as a kernel attribute, not in free functions.
+            // Apple Silicon always has SIMD width 32, so unroll the butterfly statically.
+            wl!(out, "// Manual SIMD-group product reduction (Metal has no simd_product builtin).");
+            wl!(out, "// Unrolled butterfly for Apple Silicon's fixed SIMD width of 32.");
             wl!(out, "inline float __mt_simd_product(float v) {{");
-            wl!(out, "    for (int i = simd_size / 2; i > 0; i >>= 1) {{");
-            wl!(out, "        v *= simd_shuffle_down(v, i);");
-            wl!(out, "    }}");
+            wl!(out, "    v *= simd_shuffle_down(v, 16u);");
+            wl!(out, "    v *= simd_shuffle_down(v, 8u);");
+            wl!(out, "    v *= simd_shuffle_down(v, 4u);");
+            wl!(out, "    v *= simd_shuffle_down(v, 2u);");
+            wl!(out, "    v *= simd_shuffle_down(v, 1u);");
             wl!(out, "    return v;");
             wl!(out, "}}");
         }

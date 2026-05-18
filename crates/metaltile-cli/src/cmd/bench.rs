@@ -109,7 +109,9 @@ pub fn run(args: &[String]) {
                     "{} {}",
                     paint_stderr("[error]", Style::new().fg(Color::Red).bold()),
                     paint_stderr(
-                        format!("Kernel matched --filter {pattern:?} but all shapes failed to compile or run"),
+                        format!(
+                            "Kernel matched --filter {pattern:?} but all shapes failed to compile or run"
+                        ),
                         Style::new().fg(Color::BrightWhite),
                     ),
                 );

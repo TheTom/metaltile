@@ -120,7 +120,7 @@ fn compile_mt(runner: &GpuRunner, msl: &str, name: &str) -> Option<crate::runner
                 e,
             );
             None
-        }
+        },
     }
 }
 fn compile_mlx(
