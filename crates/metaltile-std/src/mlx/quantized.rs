@@ -717,12 +717,13 @@ pub fn mt_qmm<T>(
     // also benefit (W reload halved); M=1 should keep dispatching
     // mt_qmm (v2) since the BM=2 tile would burn TG slots on unused
     // outputs.
-    // M=8 is bm2's sweet spot: 4 M-tiles × N-tiles fits L2 W cache so
-    // each W load reuses across both BM=2 M-rows. Measured M5 Max:
-    // 171-251% MT MLX (1.7-2.5× over `affine_qmm_t`). M=32 still
-    // regresses (41-67% MT) — 16 M-tiles overflow L2 W cache, needs
-    // BM=4/BM=8 to land (see #55 follow-up). v2 keeps M=1-4 (wins
-    // 3-4× there). Dispatch routing lives in `mt_qmm_for`.
+    // M=8 is bm2's peak speedup-vs-v2 cell (median-of-5 head-to-head
+    // on M5 + M2 mini, 2026-05-19): bm2/v2 ~1.27× on M5, ~1.39× on
+    // M2. vs MLX `affine_qmm_t` the win is 1.7-2.5× on M5 / 1.4-1.7×
+    // f16 on M2. bm2 beats v2 at EVERY even M from 2 to 32 inclusive;
+    // selector `mt_qmm_for` routes accordingly. Neither kernel beats
+    // MLX at M ≥ 16 (MLX's BM=BN=32 simdgroup-matrix tile dominates
+    // at large M) — closing that gap is the BM=4/BM=8 follow-up.
     m=8,
     group_size=64,
     tpg=64,
@@ -1595,27 +1596,33 @@ pub fn mt_affine_dequantize_int6<T>(
 /// kernel IR ready to dispatch. Caller still owns grid sizing — see
 /// the table in the docstring for the per-route grid shape.
 ///
-/// Routing (Apple M5 Max, measured 2026-05-19):
+/// Routing — anywhere `m % 2 == 0 && m >= 2`, `mt_qmm_bm2` wins. The
+/// W-bandwidth-halving from BM=2 W-reuse is the dominant factor
+/// across the whole M-range we tested (1 ≤ M ≤ 32); the only
+/// constraint is that bm2's hand-unrolled BM=2 tile requires even M.
+/// Odd M and M=1 fall back to v2 (where bm2 is undefined / wastes
+/// half the output slots).
 ///
-/// | M       | Route       | Grid                | M5 MT% MLX |
-/// |---------|-------------|---------------------|-----------:|
-/// | 1–3     | `mt_qmm`    | `[n/8, m, 1]`       |  ~395%     |
-/// | 4–12    | `mt_qmm_bm2`| `[n/8, m/2, 1]`     |  171–251%  |
-/// | 16–32+  | `mt_qmm`    | `[n/8, m, 1]`       |  41–67% †  |
+/// Head-to-head bm2/v2 speedup (median of 5 reruns, WARMUP=20 +
+/// ITERS=50 per kernel, resident-buffer harness, both rigs):
 ///
-/// † M ≥ 16 is the open regression cell. `mt_qmm_bm2` doesn't help
-/// here — at BM=2, 16 M-tiles overflow the L2 W cache and per-byte
-/// throughput collapses to ~60 GB/s (vs MLX 110-120). The follow-up
-/// kernel `mt_qmm_bm4` (or `bm8` with TG-memory W cache) is tracked
-/// in issue #55 Item 1; until it lands, M ≥ 16 falls back to
-/// `mt_qmm` to avoid the cache-thrash floor of `bm2`.
+/// | M  | M5 Max bm2/v2 speedup | M2 mini bm2/v2 speedup |
+/// |---:|----------------------:|-----------------------:|
+/// |  2 | ~1.05×                | ~1.04×                 |
+/// |  4 | ~1.18×                | ~1.20×                 |
+/// |  6 | ~1.18×                | ~1.12×                 |
+/// |  8 | **~1.27×**            | **~1.39×**             |
+/// | 12 | ~1.23×                | ~1.39×                 |
+/// | 16 | ~1.23×                | ~1.30×                 |
+/// | 32 | ~1.23×                | ~1.43×                 |
 ///
-/// Apple M2 mini numbers TBD — cutoffs may shift if M2's L2 sizing
-/// differs significantly from M5; if so, tighten the `mt_qmm_bm2`
-/// route bound.
+/// Both kernels still trail MLX `affine_qmm_t` at M ≥ 16 (MLX's
+/// BM=BN=32 simdgroup-matrix tile dominates at large M); the bm2
+/// route just gives us the better of our two kernels everywhere.
+/// Closing the MLX gap at M ≥ 16 needs the BM=4/BM=8 follow-up.
 pub fn mt_qmm_for(dtype: metaltile_core::dtype::DType, m: u32) -> metaltile_core::ir::Kernel {
     use metaltile_core::ir::KernelMode;
-    let mut k = if (4..=12).contains(&m) {
+    let mut k = if m >= 2 && m.is_multiple_of(2) {
         mt_qmm_bm2::kernel_ir_for(dtype)
     } else {
         mt_qmm::kernel_ir_for(dtype)
@@ -1632,27 +1639,31 @@ mod qmm_selector_tests {
     use metaltile_core::dtype::DType;
 
     #[test]
-    fn selector_picks_bm2_at_m_8() {
-        let k = mt_qmm_for(DType::F32, 8);
-        assert_eq!(k.name, "mt_qmm_bm2");
-    }
-
-    #[test]
-    fn selector_picks_v2_at_m_1_through_3() {
-        // M < 4 wastes the BM=2 tile (half the output slots idle).
-        for m in [1u32, 2, 3] {
+    fn selector_picks_bm2_at_even_m_ge_2() {
+        // Median-of-5 head-to-head bench (2026-05-19) on M5 + M2 mini
+        // showed bm2 wins v2 at every even M from 2 to 32 inclusive.
+        // The W-bandwidth halving from BM=2 W-reuse is the dominant
+        // factor across the whole M range we tested.
+        for m in [2u32, 4, 6, 8, 12, 16, 24, 32, 64] {
             let k = mt_qmm_for(DType::F32, m);
-            assert_eq!(k.name, "mt_qmm", "m={m}: should route to v2");
+            assert_eq!(k.name, "mt_qmm_bm2", "m={m}: even ≥ 2 should route to bm2");
         }
     }
 
     #[test]
-    fn selector_picks_v2_at_m_ge_16() {
-        // bm2 collapses to cache-thrash floor at M ≥ 16 — prefer
-        // v2 floor until BM=4 ships.
-        for m in [16u32, 24, 32, 64] {
+    fn selector_picks_v2_at_m_1() {
+        // bm2 requires m % 2 == 0 (BM=2 tile). M=1 falls back to v2.
+        let k = mt_qmm_for(DType::F32, 1);
+        assert_eq!(k.name, "mt_qmm");
+    }
+
+    #[test]
+    fn selector_picks_v2_at_odd_m() {
+        // bm2 requires m % 2 == 0. Odd M dispatches v2 which has
+        // unit BM and handles any M.
+        for m in [3u32, 5, 7, 9, 15, 31] {
             let k = mt_qmm_for(DType::F32, m);
-            assert_eq!(k.name, "mt_qmm", "m={m}: should route to v2 floor");
+            assert_eq!(k.name, "mt_qmm", "m={m}: odd M should route to v2");
         }
     }
 
