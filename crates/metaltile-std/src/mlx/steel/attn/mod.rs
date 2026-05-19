@@ -35,7 +35,7 @@ use metaltile_core::{dtype::DType, ir::Kernel};
 ///
 /// # Untested hardware
 ///
-/// Heuristic was validated on M2 mini (Apple7/gen-8) and M5 Max
+/// Heuristic was validated on M2 mini (Apple8/gen-8) and M5 Max
 /// (Apple10/gen-17+). The other Apple GPU families are inferred:
 ///
 /// - **M1 (Apple7/gen-7)**: same architectural class as M2 (no native bf16
