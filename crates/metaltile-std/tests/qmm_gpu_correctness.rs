@@ -26,7 +26,7 @@ mod common;
 use common::gpu_lock;
 use metaltile_core::dtype::DType;
 use metaltile_runtime::{Context, DispatchSpec, ResidentBuffer};
-use metaltile_std::mlx::quantized::{mt_qmm, mt_qmm_bm2, mt_qmm_bm4};
+use metaltile_std::mlx::quantized::{mt_qmm, mt_qmm_bm2, mt_qmm_bm4, mt_qmm_mma};
 
 #[allow(clippy::too_many_arguments)]
 fn run_qmm(
@@ -1203,6 +1203,304 @@ fn mt_qmm_bm4_runs_on_qwen3_attention_proj_shape() {
     let _g = gpu_lock();
     let ctx = Context::new().expect("Context::new should succeed on macOS");
     let out_bytes = run_qmm_bm4(
+        &ctx,
+        DType::F32,
+        &w,
+        &scales_bytes,
+        &biases_bytes,
+        &x_bytes,
+        m,
+        n,
+        k,
+        gs_per_row,
+        4,
+    );
+    let actual: Vec<f32> =
+        out_bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    for (i, v) in actual.iter().enumerate() {
+        assert!(v.is_finite(), "non-finite output at index {i}: {v}");
+    }
+}
+
+// ── mt_qmm_mma (simdgroup-matrix MMA variant) ─────────────────────────
+//
+// 32×32 output tile, 128 tpg = 4 SG × 32 lanes. Same int4 layout as
+// v2/bm2/bm4 — geometry is BM=BN=BK=32, grid `[n/32, m/32, 1]`.
+
+#[allow(clippy::too_many_arguments)]
+fn run_qmm_mma(
+    ctx: &Context,
+    dtype: DType,
+    w: &[u32],
+    scales_bytes: &[u8],
+    biases_bytes: &[u8],
+    x_bytes: &[u8],
+    m: usize,
+    n: usize,
+    k: usize,
+    gs_per_row: usize,
+    out_bytes_per_elem: usize,
+) -> Vec<u8> {
+    assert!(m.is_multiple_of(32), "mt_qmm_mma requires m %% 32 == 0 (BM=32 tile)");
+    assert!(n.is_multiple_of(32), "mt_qmm_mma requires n %% 32 == 0 (BN=32 tile)");
+    assert!(k.is_multiple_of(32), "mt_qmm_mma requires k %% 32 == 0 (BK=32 step)");
+    let mut buffers: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    buffers.insert("w".into(), w.iter().flat_map(|v| v.to_le_bytes()).collect());
+    buffers.insert("scales".into(), scales_bytes.to_vec());
+    buffers.insert("biases".into(), biases_bytes.to_vec());
+    buffers.insert("x".into(), x_bytes.to_vec());
+    buffers.insert("out".into(), vec![0u8; m * n * out_bytes_per_elem]);
+    buffers.insert("k".into(), (k as u32).to_le_bytes().to_vec());
+    buffers.insert("n".into(), (n as u32).to_le_bytes().to_vec());
+    buffers.insert("gs_per_row".into(), (gs_per_row as u32).to_le_bytes().to_vec());
+
+    let mut kernel = mt_qmm_mma::kernel_ir_for(dtype);
+    kernel.mode = metaltile_core::ir::KernelMode::Reduction;
+    let result = ctx
+        .dispatch_with_grid(&kernel, &buffers, &BTreeMap::new(), [n / 32, m / 32, 1], [128, 1, 1])
+        .expect("dispatch_with_grid should succeed");
+    result.outputs.get("out").expect("`out` buffer in dispatch result").clone()
+}
+
+#[test]
+fn mt_qmm_mma_matches_cpu_reference_f32() {
+    // Smallest valid MMA shape: m=32 (1 TG in M), n=32 (1 TG in N),
+    // k=64 (2 K-blocks). gs_per_row=1 (group_size=64, k=64).
+    let m = 32usize;
+    let n = 32usize;
+    let k = 64usize;
+    let group_size = 64usize;
+    let gs_per_row = k / group_size;
+
+    let w: Vec<u32> = (0..n * k / 8)
+        .map(|i| {
+            let mut v = 0u32;
+            for bit in 0..8u32 {
+                v |= ((i as u32 + bit) & 0xF) << (bit * 4);
+            }
+            v
+        })
+        .collect();
+    let scales: Vec<f32> = (0..n * gs_per_row).map(|i| 0.1 + (i as f32) * 0.001).collect();
+    let biases: Vec<f32> = (0..n * gs_per_row).map(|i| (i as f32) * 0.0001).collect();
+    let x: Vec<f32> = (0..m * k).map(|i| 1.0 + (i as f32) * 0.001).collect();
+    let expected = cpu_qmm_reference(&w, &scales, &biases, &x, m, n, k, gs_per_row, group_size);
+
+    let scales_bytes: Vec<u8> = scales.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let biases_bytes: Vec<u8> = biases.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let x_bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    let _g = gpu_lock();
+    let ctx = Context::new().expect("Context::new should succeed on macOS");
+    let out_bytes = run_qmm_mma(
+        &ctx,
+        DType::F32,
+        &w,
+        &scales_bytes,
+        &biases_bytes,
+        &x_bytes,
+        m,
+        n,
+        k,
+        gs_per_row,
+        4,
+    );
+    let actual: Vec<f32> =
+        out_bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    assert_eq!(actual.len(), expected.len(), "output element count");
+
+    let mut max_diff = 0.0_f32;
+    let mut max_at = 0usize;
+    for (i, (e, a)) in expected.iter().zip(actual.iter()).enumerate() {
+        let diff = (e - a).abs();
+        if diff > max_diff {
+            max_diff = diff;
+            max_at = i;
+        }
+    }
+    assert!(
+        max_diff < 1e-3,
+        "max |diff| = {max_diff:.2e} at index {max_at} (expected {:.6}, got {:.6})",
+        expected[max_at],
+        actual[max_at],
+    );
+}
+
+#[test]
+fn mt_qmm_mma_matches_cpu_reference_f16() {
+    let m = 32usize;
+    let n = 32usize;
+    let k = 64usize;
+    let group_size = 64usize;
+    let gs_per_row = k / group_size;
+
+    let w: Vec<u32> = (0..n * k / 8)
+        .map(|i| {
+            let mut v = 0u32;
+            for bit in 0..8u32 {
+                v |= ((i as u32 + bit) & 0xF) << (bit * 4);
+            }
+            v
+        })
+        .collect();
+    let scales_f32: Vec<f32> = (0..n * gs_per_row).map(|i| 0.1 + (i as f32) * 0.001).collect();
+    let biases_f32: Vec<f32> = (0..n * gs_per_row).map(|i| (i as f32) * 0.0001).collect();
+    let x_f32: Vec<f32> = (0..m * k).map(|i| 1.0 + (i as f32) * 0.001).collect();
+
+    let round_f16 = |v: f32| -> f32 { half::f16::from_f32(v).to_f32() };
+    let scales: Vec<f32> = scales_f32.iter().map(|&v| round_f16(v)).collect();
+    let biases: Vec<f32> = biases_f32.iter().map(|&v| round_f16(v)).collect();
+    let x: Vec<f32> = x_f32.iter().map(|&v| round_f16(v)).collect();
+    let expected = cpu_qmm_reference(&w, &scales, &biases, &x, m, n, k, gs_per_row, group_size);
+
+    let scales_bytes: Vec<u8> =
+        scales.iter().flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes()).collect();
+    let biases_bytes: Vec<u8> =
+        biases.iter().flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes()).collect();
+    let x_bytes: Vec<u8> =
+        x.iter().flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes()).collect();
+
+    let _g = gpu_lock();
+    let ctx = Context::new().expect("Context::new should succeed on macOS");
+    let out_bytes = run_qmm_mma(
+        &ctx,
+        DType::F16,
+        &w,
+        &scales_bytes,
+        &biases_bytes,
+        &x_bytes,
+        m,
+        n,
+        k,
+        gs_per_row,
+        2,
+    );
+    let actual: Vec<f32> = out_bytes
+        .chunks_exact(2)
+        .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+        .collect();
+
+    let mut max_rel = 0.0_f32;
+    let mut max_at = 0usize;
+    for (i, (e, a)) in expected.iter().zip(actual.iter()).enumerate() {
+        let rel = (e - a).abs() / e.abs().max(1.0);
+        if rel > max_rel {
+            max_rel = rel;
+            max_at = i;
+        }
+    }
+    // Looser tolerance than f32: MMA frags + dequant-into-TG-fp16
+    // round to half precision twice (once on Ws load, once on MMA
+    // output cast). 1.5e-2 vs bm4's 5e-3.
+    assert!(
+        max_rel < 1.5e-2,
+        "max relative diff = {max_rel:.2e} at index {max_at} (expected {:.6}, got {:.6})",
+        expected[max_at],
+        actual[max_at],
+    );
+}
+
+#[test]
+fn mt_qmm_mma_matches_mt_qmm_at_same_shape_f32() {
+    // Pinned numeric-agreement check: MMA must match v2 reference within
+    // 1e-3 tolerance. v2 requires k %% 512 == 0; pick k=512 (which is
+    // also a multiple of BK=32). m=32, n=32 = single TG for MMA.
+    let m = 32usize;
+    let n = 32usize;
+    let k = 512usize;
+    let group_size = 64usize;
+    let gs_per_row = k / group_size;
+
+    let w: Vec<u32> = (0..n * k / 8)
+        .map(|i| {
+            let mut v = 0u32;
+            for bit in 0..8u32 {
+                v |= ((i as u32 + bit) & 0xF) << (bit * 4);
+            }
+            v
+        })
+        .collect();
+    let scales: Vec<f32> = (0..n * gs_per_row).map(|i| 0.1 + (i as f32) * 0.001).collect();
+    let biases: Vec<f32> = (0..n * gs_per_row).map(|i| (i as f32) * 0.0001).collect();
+    let x: Vec<f32> = (0..m * k).map(|i| 1.0 + (i as f32) * 0.001).collect();
+    let scales_bytes: Vec<u8> = scales.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let biases_bytes: Vec<u8> = biases.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let x_bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    let _g = gpu_lock();
+    let ctx = Context::new().expect("Context::new should succeed on macOS");
+    let out_v2 = run_qmm(
+        &ctx,
+        DType::F32,
+        &w,
+        &scales_bytes,
+        &biases_bytes,
+        &x_bytes,
+        m,
+        n,
+        k,
+        gs_per_row,
+        4,
+    );
+    let out_mma = run_qmm_mma(
+        &ctx,
+        DType::F32,
+        &w,
+        &scales_bytes,
+        &biases_bytes,
+        &x_bytes,
+        m,
+        n,
+        k,
+        gs_per_row,
+        4,
+    );
+    let a_v2: Vec<f32> =
+        out_v2.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let a_mma: Vec<f32> =
+        out_mma.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+
+    // MMA accumulation order (frag-broadcast) differs from v2's scalar
+    // simd_sum reduce; allow relative diff < 1e-5 — at k=512 with values
+    // ~1e4, absolute diff of ~1e-2 is normal fp32 reorder noise.
+    let mut max_rel = 0.0_f32;
+    let mut max_at = 0usize;
+    for (i, (v2, m_)) in a_v2.iter().zip(a_mma.iter()).enumerate() {
+        let rel = (v2 - m_).abs() / v2.abs().max(1.0);
+        if rel > max_rel {
+            max_rel = rel;
+            max_at = i;
+        }
+    }
+    assert!(
+        max_rel < 1e-4,
+        "v2 vs mma diverge: max rel diff = {max_rel:.2e} at index {max_at} (v2 {:.6}, mma {:.6})",
+        a_v2[max_at],
+        a_mma[max_at],
+    );
+}
+
+#[test]
+fn mt_qmm_mma_runs_on_qwen3_attention_proj_shape() {
+    // M=32 at prod shape — 1 TG in M, n/32 = 160 TGs in N axis. The
+    // headline cell where MMA needs to beat bm4 + match MLX.
+    let m = 32usize;
+    let n = 5120usize;
+    let k = 5120usize;
+    let group_size = 64usize;
+    let gs_per_row = k / group_size;
+
+    let w: Vec<u32> = (0..n * k / 8).map(|i| (i as u32).wrapping_mul(2654435761u32)).collect();
+    let scales: Vec<f32> = (0..n * gs_per_row).map(|i| 0.01 + (i % 13) as f32 * 0.001).collect();
+    let biases: Vec<f32> = (0..n * gs_per_row).map(|i| (i % 7) as f32 * 0.0001).collect();
+    let x: Vec<f32> = (0..m * k).map(|i| 0.1 + ((i % 31) as f32) * 0.01).collect();
+    let scales_bytes: Vec<u8> = scales.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let biases_bytes: Vec<u8> = biases.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let x_bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    let _g = gpu_lock();
+    let ctx = Context::new().expect("Context::new should succeed on macOS");
+    let out_bytes = run_qmm_mma(
         &ctx,
         DType::F32,
         &w,
