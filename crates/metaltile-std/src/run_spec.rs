@@ -1115,10 +1115,14 @@ fn run_quantized_mat_mul(
 
         // mt_qmm grid: [n/8, m, 1] with tpg=64 (2 SG × 32 lanes).
         // Same row-tile geometry as mt_qmv lifted into M via tgid_y.
-        // mt_qmm_bm2 packs BM=2 M-rows per TG → grid Y halves
-        // (16 outputs per TG vs 8). v2 keeps unit BM.
+        // mt_qmm_bm2 packs BM=2 M-rows per TG → 16 outputs (grid Y / 2).
+        // mt_qmm_bm4 packs BM=4 → 32 outputs (grid Y / 4). v2 keeps unit BM.
         const N_PER_TG: usize = 8;
-        let bm: usize = if spec.kernel_name == "mt_qmm_bm2" { 2 } else { 1 };
+        let bm: usize = match spec.kernel_name {
+            "mt_qmm_bm4" => 4,
+            "mt_qmm_bm2" => 2,
+            _ => 1,
+        };
         let mt_perf = {
             let out_buf = runner.buffer_zeros(m * n_dim * dtype_bytes);
             bench_gbps_only(
