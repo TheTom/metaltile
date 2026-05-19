@@ -607,6 +607,11 @@ pub enum Op {
     /// Maps to `simd_sum(v)`, `simd_max(v)`, `simd_min(v)` (Metal 2.1+).
     SimdReduce { value: ValueId, op: ReduceKind },
 
+    /// SIMD-group butterfly shuffle: `simd_shuffle_xor(value, mask)`.
+    /// Used by Steel attention row reductions, where lanes sharing the same
+    /// MMA row exchange values through fixed xor masks (for example 1 and 8).
+    SimdShuffleXor { value: ValueId, mask: u32 },
+
     /// Allocate a simdgroup matrix of shape M×N with given element type.
     /// Emits `simdgroup_matrix<T, M, N> name;` in MSL.
     SimdgroupAlloc { dtype: DType, m: u32, n: u32 },
@@ -1126,6 +1131,9 @@ impl Op {
                 write!(f, "Dequantize({weights}, gs={group_size}, bits={bits})")
             },
             Op::SimdReduce { value, op } => write!(f, "SimdReduce(v{}, {op:?})", value.as_u32()),
+            Op::SimdShuffleXor { value, mask } => {
+                write!(f, "SimdShuffleXor(v{}, mask={mask})", value.as_u32())
+            },
             Op::ThreadgroupAlloc { dtype, size, name } => {
                 write!(f, "ThreadgroupAlloc({dtype:?}, {size}, {name})")
             },

@@ -269,7 +269,7 @@ impl DslBodyParser {
         // Save outer scope; add loop variable with the +1000 legacy key that
         // the msl.rs emitter also registers.
         let prev_bindings = self.bindings.clone();
-        self.bindings.insert(loop_var_name.clone(), var_id + 1000);
+        self.bindings.insert(loop_var_name.clone(), var_id + 0x4000_0000);
 
         // Redirect IR emission to the loop body block.
         let prev_target =
@@ -517,6 +517,7 @@ impl DslBodyParser {
             "simd_sum" => self.parse_simd_reduce(call, "Sum"),
             "simd_max" => self.parse_simd_reduce(call, "Max"),
             "simd_min" => self.parse_simd_reduce(call, "Min"),
+            "simd_shuffle_xor" => self.parse_simd_shuffle_xor(call),
             "threadgroup_barrier" => self.parse_barrier(call),
             "threadgroup_alloc" => self.parse_threadgroup_alloc(call),
             "threadgroup_load" => self.parse_threadgroup_load(call),
@@ -1125,10 +1126,10 @@ impl DslBodyParser {
 
         // GPU built-in scalars available in every kernel preamble.
         // Emitted as Op::Load { src: "<name>", indices: [] } so the MSL emitter
-        // outputs `auto vN = tid;` (or lsize, tgid_x, tgid_y, simd_lane, simd_id, n_simd).
+        // outputs `auto vN = tid;` (or lsize, tgid_x/y/z, simd_lane, simd_id, n_simd).
         if matches!(
             name.as_str(),
-            "tid" | "lsize" | "tgid_x" | "tgid_y" | "simd_lane" | "simd_id" | "n_simd"
+            "tid" | "lsize" | "tgid_x" | "tgid_y" | "tgid_z" | "simd_lane" | "simd_id" | "n_simd"
         ) {
             let result = self.alloc_vid();
             let n = name.clone();
@@ -1237,6 +1238,24 @@ impl DslBodyParser {
         self.push_op(
             quote! {
                 Op::SimdReduce { value: ValueId::new(#val), op: #op_tokens }
+            },
+            result,
+        );
+        result
+    }
+
+    /// `simd_shuffle_xor(val, mask)` → Op::SimdShuffleXor
+    fn parse_simd_shuffle_xor(&mut self, call: &ExprCall) -> u32 {
+        let args: Vec<_> = call.args.iter().collect();
+        let val = args.first().map(|a| self.parse_expr(a)).unwrap_or_else(|| self.alloc_vid());
+        let mask = args.get(1).map(|a| literal_u32(a)).unwrap_or(0);
+        let result = self.alloc_vid();
+        self.push_op(
+            quote! {
+                Op::SimdShuffleXor {
+                    value: ValueId::new(#val),
+                    mask: #mask,
+                }
             },
             result,
         );

@@ -294,7 +294,7 @@ fn replace_value_in_op(op: &mut Op, old: ValueId, new: ValueId) {
             s(scalar);
         },
         Op::Dequantize { .. } => {},
-        Op::SimdReduce { value, .. } => s(value),
+        Op::SimdReduce { value, .. } | Op::SimdShuffleXor { value, .. } => s(value),
         Op::ThreadgroupLoad { index, .. } => s(index),
         Op::ThreadgroupStore { index, value, .. } => {
             s(index);
@@ -465,7 +465,7 @@ fn collect_uses(op: &Op, used: &mut BTreeSet<ValueId>) {
             add(*scalar);
         },
         Op::Dequantize { .. } => {},
-        Op::SimdReduce { value, .. } => add(*value),
+        Op::SimdReduce { value, .. } | Op::SimdShuffleXor { value, .. } => add(*value),
         Op::ThreadgroupLoad { index, .. } => add(*index),
         Op::ThreadgroupStore { index, value, .. } => {
             add(*index);

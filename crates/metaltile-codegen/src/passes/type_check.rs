@@ -296,6 +296,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::StrideStore { .. } => "StrideStore",
         Op::Dequantize { .. } => "Dequantize",
         Op::SimdReduce { .. } => "SimdReduce",
+        Op::SimdShuffleXor { .. } => "SimdShuffleXor",
         Op::ThreadgroupAlloc { .. } => "ThreadgroupAlloc",
         Op::ThreadgroupLoad { .. } => "ThreadgroupLoad",
         Op::ThreadgroupStore { .. } => "ThreadgroupStore",
@@ -442,6 +443,28 @@ fn infer_block(
                 } else if kernel.constexprs.iter().any(|ce| ce.name.name() == src.as_str()) {
                     // Constexpr parameters are `constant uint` scalars.
                     env.insert(vid, TypedValue { dtype: DType::U32, shape: Shape::scalar() });
+                } else {
+                    // Builtin uint scalars (Apple Metal thread/group position attrs).
+                    let is_uint_builtin = matches!(
+                        src.as_str(),
+                        "simd_lane"
+                            | "simd_id"
+                            | "n_simd"
+                            | "lsize"
+                            | "tgid_x"
+                            | "tgid_y"
+                            | "tgid_z"
+                            | "tid"
+                            | "tid_x"
+                            | "tid_y"
+                            | "tid_z"
+                            | "gid_x"
+                            | "gid_y"
+                            | "gid_z"
+                    );
+                    if is_uint_builtin {
+                        env.insert(vid, TypedValue { dtype: DType::U32, shape: Shape::scalar() });
+                    }
                 }
             },
 
@@ -541,7 +564,7 @@ fn infer_block(
                 // Register the loop variable as uint before processing the loop body
                 // so that index arithmetic like `_r * lsize + lid` infers as uint.
                 // The body_parser encodes the loop variable as VarId(N)+1000.
-                let loop_var_vid = ValueId::new(var.as_u32() + 1000);
+                let loop_var_vid = ValueId::new(var.as_u32() + 0x4000_0000);
                 env.insert(loop_var_vid, TypedValue { dtype: DType::U32, shape: Shape::scalar() });
                 // Recurse into the loop body.
                 if let Some(loop_block) = all_blocks.get(bid) {
@@ -561,7 +584,7 @@ fn infer_block(
                 env.insert(vid, TypedValue { dtype: DType::F16, shape: Shape::scalar() });
             },
 
-            Op::SimdReduce { value, .. } => {
+            Op::SimdReduce { value, .. } | Op::SimdShuffleXor { value, .. } => {
                 // Same type as input
                 if let Some(tv) = env.get(value).cloned() {
                     env.insert(vid, tv);
@@ -603,8 +626,6 @@ fn infer_block(
             | Op::VectorStore { .. }
             | Op::VectorExtract { .. }
             | Op::If { .. }
-            | Op::ExpandDims { .. }
-            | Op::Reshape { .. }
             | Op::Cat { .. }
             | Op::Scatter { .. }
             | Op::Atomic { .. }
@@ -620,6 +641,14 @@ fn infer_block(
             },
             Op::SimdgroupAlloc { .. } | Op::SimdgroupElemLoad { .. } | Op::SimdScan { .. } => {
                 env.insert(vid, TypedValue { dtype: DType::F32, shape: Shape::scalar() });
+            },
+            // ExpandDims/Reshape emit `auto v = rv;` (emit_block.rs aliases the input
+            // value), so downstream BinOps must see the input dtype — without this,
+            // any chain off a reshape inherits no dtype and trips the fma-int guard.
+            Op::ExpandDims { value, .. } | Op::Reshape { value, .. } => {
+                if let Some(tv) = env.get(value).cloned() {
+                    env.insert(vid, tv);
+                }
             },
             Op::SimdLaneId | Op::SimdGroupId => {
                 env.insert(vid, TypedValue { dtype: DType::U32, shape: Shape::scalar() });
