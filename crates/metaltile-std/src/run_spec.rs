@@ -1117,11 +1117,13 @@ fn run_quantized_mat_mul(
         // Same row-tile geometry as mt_qmv lifted into M via tgid_y.
         // mt_qmm_bm2 packs BM=2 M-rows per TG → 16 outputs (grid Y / 2).
         // mt_qmm_bm4 packs BM=4 → 32 outputs (grid Y / 4). v2 keeps unit BM.
-        const N_PER_TG: usize = 8;
-        let bm: usize = match spec.kernel_name {
-            "mt_qmm_bm4" => 4,
-            "mt_qmm_bm2" => 2,
-            _ => 1,
+        // mt_qmm_mma packs BM=BN=32 → 1024 outputs (grid Y / 32, grid X / 32);
+        // matches MLX's 32×32 tile geometry with 4 SG × 32 lanes = 128 tpg.
+        let (n_per_tg, bm) = match spec.kernel_name {
+            "mt_qmm_mma" => (32usize, 32usize),
+            "mt_qmm_bm4" => (8usize, 4usize),
+            "mt_qmm_bm2" => (8usize, 2usize),
+            _ => (8usize, 1usize),
         };
         let mt_perf = {
             let out_buf = runner.buffer_zeros(m * n_dim * dtype_bytes);
@@ -1129,7 +1131,7 @@ fn run_quantized_mat_mul(
                 runner,
                 &mk,
                 &[&w_buf, &s_buf, &b_buf, &x_buf, &out_buf, &k_buf, &n_buf, &gpr_buf],
-                [n_dim / N_PER_TG, m / bm, 1],
+                [n_dim / n_per_tg, m / bm, 1],
                 [tpg, 1, 1],
                 bytes_mt,
             )
