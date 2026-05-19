@@ -717,13 +717,15 @@ pub fn mt_qmm<T>(
     // also benefit (W reload halved); M=1 should keep dispatching
     // mt_qmm (v2) since the BM=2 tile would burn TG slots on unused
     // outputs.
-    // M=8 is bm2's peak speedup-vs-v2 cell (median-of-5 head-to-head
-    // on M5 + M2 mini, 2026-05-19): bm2/v2 ~1.27× on M5, ~1.39× on
-    // M2. vs MLX `affine_qmm_t` the win is 1.7-2.5× on M5 / 1.4-1.7×
-    // f16 on M2. bm2 beats v2 at EVERY even M from 2 to 32 inclusive;
-    // selector `mt_qmm_for` routes accordingly. Neither kernel beats
-    // MLX at M ≥ 16 (MLX's BM=BN=32 simdgroup-matrix tile dominates
-    // at large M) — closing that gap is the BM=4/BM=8 follow-up.
+    // M=8 is a representative mid-M cell. Clean median-of-5 head-to-head
+    // bm2/v2 (25 cells per M, both rigs): bm2 wins 350/350 across
+    // M ∈ {2,4,6,8,12,16,32}. Speedups grow with M: 1.09× at M=2
+    // → 1.24× M5 / 1.30× M2 at M=32. vs MLX `affine_qmm_t`, the M=8
+    // bench cell measures 1.7-2.5× M5 / 1.4-1.7× f16 M2 (3-run M5
+    // drift ≤3pt). Selector `mt_qmm_for` routes every even M ≥ 2
+    // to bm2. Neither kernel beats MLX at M ≥ 16 (MLX's BM=BN=32
+    // simdgroup-matrix tile dominates large-M); closing that gap is
+    // the BM=4/BM=8 follow-up.
     m=8,
     group_size=64,
     tpg=64,
@@ -1603,18 +1605,25 @@ pub fn mt_affine_dequantize_int6<T>(
 /// Odd M and M=1 fall back to v2 (where bm2 is undefined / wastes
 /// half the output slots).
 ///
-/// Head-to-head bm2/v2 speedup (median of 5 reruns, WARMUP=20 +
-/// ITERS=50 per kernel, resident-buffer harness, both rigs):
+/// Head-to-head bm2/v2 speedup (median of 5 reruns × 5 Qwen3
+/// production shapes = 25 cells per M; WARMUP=20 + ITERS=50 per
+/// kernel per cell; resident-buffer harness; clean shell sessions;
+/// `mt_qmm_v2_vs_bm2_head_to_head_f16_m_sweep`):
 ///
-/// | M  | M5 Max bm2/v2 speedup | M2 mini bm2/v2 speedup |
-/// |---:|----------------------:|-----------------------:|
-/// |  2 | ~1.05×                | ~1.04×                 |
-/// |  4 | ~1.18×                | ~1.20×                 |
-/// |  6 | ~1.18×                | ~1.12×                 |
-/// |  8 | **~1.27×**            | **~1.39×**             |
-/// | 12 | ~1.23×                | ~1.39×                 |
-/// | 16 | ~1.23×                | ~1.30×                 |
-/// | 32 | ~1.23×                | ~1.43×                 |
+/// | M  | M5 Max speedup | M5 wins | M2 mini speedup | M2 wins |
+/// |---:|---------------:|:-------:|----------------:|:-------:|
+/// |  2 | 1.09×          | 25/25   | 1.11×           | 25/25   |
+/// |  4 | 1.21×          | 25/25   | 1.26×           | 25/25   |
+/// |  6 | 1.22×          | 25/25   | 1.27×           | 25/25   |
+/// |  8 | 1.22×          | 25/25   | 1.28×           | 25/25   |
+/// | 12 | 1.23×          | 25/25   | 1.29×           | 25/25   |
+/// | 16 | 1.23×          | 25/25   | 1.29×           | 25/25   |
+/// | 32 | 1.24×          | 25/25   | 1.30×           | 25/25   |
+///
+/// 350/350 cells went to bm2 (175 per rig). No shape or M cell on
+/// either rig has v2 beating bm2. Cell-to-cell variance is tight
+/// (median min/max within ~2% on M ≥ 8; ~10-20% on M ≤ 6 where
+/// individual cells occasionally see lucky outliers).
 ///
 /// Both kernels still trail MLX `affine_qmm_t` at M ≥ 16 (MLX's
 /// BM=BN=32 simdgroup-matrix tile dominates at large M); the bm2
@@ -1635,8 +1644,9 @@ pub fn mt_qmm_for(dtype: metaltile_core::dtype::DType, m: u32) -> metaltile_core
 
 #[cfg(test)]
 mod qmm_selector_tests {
-    use super::*;
     use metaltile_core::dtype::DType;
+
+    use super::*;
 
     #[test]
     fn selector_picks_bm2_at_even_m_ge_2() {

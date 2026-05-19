@@ -1105,13 +1105,13 @@ fn mt_qmm_v2_vs_bm2_head_to_head_f16_m_sweep() {
                     }
                     agg.ratio_sum += ratio;
                     agg.ratio_n += 1;
-                }
+                },
                 None => {
                     println!(
                         "    {m:>5}  {v2_us:>10.2}  {v2_gbps:>10.1}  {:>10}  {:>10}  {:>10}",
                         "n/a", "n/a", "skip"
                     );
-                }
+                },
             }
         }
     }
@@ -1125,23 +1125,22 @@ fn mt_qmm_v2_vs_bm2_head_to_head_f16_m_sweep() {
     );
     for &m in M_SWEEP {
         let agg = per_m[&m];
-        let mean_ratio = if agg.ratio_n > 0 {
-            agg.ratio_sum / agg.ratio_n as f64
-        } else {
-            f64::NAN
-        };
+        let mean_ratio =
+            if agg.ratio_n > 0 { agg.ratio_sum / agg.ratio_n as f64 } else { f64::NAN };
         let selector_route = if (4..=12).contains(&(m as u32)) { "bm2" } else { "v2" };
         // Selector route matches data when:
         //   * route = bm2 AND bm2 wins majority of shapes
         //   * route = v2 AND v2 wins majority of shapes (or bm2 cell skipped at M=1)
-        let data_winner =
-            if agg.ratio_n == 0 { "v2" } else if agg.bm2_wins > agg.v2_wins { "bm2" } else { "v2" };
-        let matches = if selector_route == data_winner { "YES" } else { "NO" };
-        let mean_disp = if mean_ratio.is_nan() {
-            "n/a".to_string()
+        let data_winner = if agg.ratio_n == 0 {
+            "v2"
+        } else if agg.bm2_wins > agg.v2_wins {
+            "bm2"
         } else {
-            format!("{mean_ratio:.3}")
+            "v2"
         };
+        let matches = if selector_route == data_winner { "YES" } else { "NO" };
+        let mean_disp =
+            if mean_ratio.is_nan() { "n/a".to_string() } else { format!("{mean_ratio:.3}") };
         println!(
             "  {m:>5}  {:>10}  {:>10}  {:>14}  {:>14}  {:>10}",
             agg.bm2_wins, agg.v2_wins, mean_disp, selector_route, matches
