@@ -60,8 +60,8 @@ fmt-check: ## check formatting without modifying files
 	cargo fmt --all -- --check
 
 .PHONY: typos
-typos: ## run typos checker
-	typos
+typos: ## run typos checker (same config CI uses)
+	typos --config .github/configs/typos-cli.toml
 
 # ─── Benchmark ────────────────────────────────────────────────────────
 .PHONY: bench

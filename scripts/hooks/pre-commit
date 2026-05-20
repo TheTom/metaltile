@@ -5,7 +5,9 @@
 #
 # Covers:
 #   - fmt-check  (rustfmt --check across the workspace)
-#   - typos      (catches "halfs" / "supress" / etc. — bit 3+ PRs)
+#   - typos      (catches misspellings like `halfs` / `supress` — bit
+#                 3+ PRs; the backticks keep typos from flagging this
+#                 very comment, see .github/configs/typos-cli.toml)
 #
 # Skipped here (live in pre-push or commit-msg instead):
 #   - clippy (slow, runs on push)
