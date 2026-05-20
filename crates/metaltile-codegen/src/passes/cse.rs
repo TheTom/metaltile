@@ -343,6 +343,10 @@ fn replace_values(op: &mut Op, map: &FxHashMap<ValueId, ValueId>) {
             s(value);
             s(data);
         },
+        Op::SimdgroupLoad { dest, offset, .. } => {
+            s(dest);
+            s(offset);
+        },
         Op::SimdScan { value, .. } => s(value),
         Op::DeclareLocal { value, .. } | Op::SetLocal { value, .. } => s(value),
         Op::ArgReduce { value, .. } => s(value),

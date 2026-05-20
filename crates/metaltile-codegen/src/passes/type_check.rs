@@ -305,6 +305,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::SimdgroupAlloc { .. } => "SimdgroupAlloc",
         Op::SimdgroupElemLoad { .. } => "SimdgroupElemLoad",
         Op::SimdgroupElemStore { .. } => "SimdgroupElemStore",
+        Op::SimdgroupLoad { .. } => "SimdgroupLoad",
         Op::SimdgroupMatMul { .. } => "SimdgroupMatMul",
         Op::SimdScan { .. } => "SimdScan",
         Op::SimdLaneId => "SimdLaneId",
@@ -657,7 +658,8 @@ fn infer_block(
             | Op::DeclareLocal { .. }
             | Op::SetLocal { .. }
             | Op::SimdgroupMatMul { .. }
-            | Op::SimdgroupElemStore { .. } => {
+            | Op::SimdgroupElemStore { .. }
+            | Op::SimdgroupLoad { .. } => {
                 // No output value to type (or side-effect-only op).
             },
             Op::SimdgroupAlloc { .. } | Op::SimdgroupElemLoad { .. } | Op::SimdScan { .. } => {

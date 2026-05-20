@@ -624,6 +624,21 @@ pub enum Op {
     /// No result (side-effecting).
     SimdgroupElemStore { value: ValueId, index: u32, data: ValueId },
 
+    /// Hardware-fused simdgroup load: fill all 64 elements of an 8×8
+    /// `simdgroup_matrix<T,M,N>` from a contiguous threadgroup-memory tile
+    /// in one MSL `simdgroup_load(matrix, &tg[offset], stride, origin,
+    /// transpose)` instruction.
+    /// Bypasses the per-lane scatter of repeated `simdgroup_elem_store(
+    /// frag, idx, threadgroup_load(...))`, which suffers TG-bank conflicts
+    /// at f16 stride geometries (see `qmm_mma_ftrans_report.md` §7).
+    /// `offset` is a ValueId computing the starting element offset of the
+    /// fragment's top-left corner inside the named TG array. `stride` is
+    /// the row stride in elements (const). `transpose=true` swaps the row
+    /// and column dimensions of the loaded fragment — used to load a B
+    /// operand stored row-major `[N, K]` as if it were `[K, N]` for the
+    /// standard `C = A * B` MMA layout (MLX `qmm_t` pattern).
+    SimdgroupLoad { dest: ValueId, tg: String, offset: ValueId, stride: u32, transpose: bool },
+
     /// simdgroup multiply-accumulate: `C = A * B + C`.
     /// All three operands must be simdgroup matrices of compatible shapes.
     SimdgroupMatMul { a: ValueId, b: ValueId, c: ValueId },
@@ -1203,6 +1218,14 @@ impl Op {
             },
             Op::SimdgroupElemStore { value, index, data } => {
                 write!(f, "SimdgroupElemStore(v{}, [{index}], v{})", value.as_u32(), data.as_u32())
+            },
+            Op::SimdgroupLoad { dest, tg, offset, stride, transpose } => {
+                write!(
+                    f,
+                    "SimdgroupLoad(v{}, {tg}, off=v{}, stride={stride}, transpose={transpose})",
+                    dest.as_u32(),
+                    offset.as_u32()
+                )
             },
             Op::SimdgroupMatMul { a, b, c } => {
                 write!(f, "SimdgroupMatMul(v{}, v{}, v{})", a.as_u32(), b.as_u32(), c.as_u32())

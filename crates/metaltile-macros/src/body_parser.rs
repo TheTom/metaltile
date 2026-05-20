@@ -566,6 +566,7 @@ impl DslBodyParser {
             "simdgroup_alloc" => self.parse_simdgroup_alloc(call),
             "simdgroup_elem_load" => self.parse_simdgroup_elem_load(call),
             "simdgroup_elem_store" => self.parse_simdgroup_elem_store(call),
+            "simdgroup_load" => self.parse_simdgroup_load(call),
             "simdgroup_matmul" => self.parse_simdgroup_matmul(call),
             "simd_lane_id" => self.parse_simd_lane_id(call),
             "simd_group_id" => self.parse_simd_group_id(call),
@@ -1467,6 +1468,49 @@ impl DslBodyParser {
         0
     }
 
+    /// `simdgroup_load(frag, "tg_name", offset, stride)` /
+    /// `simdgroup_load(frag, "tg_name", offset, stride, transpose)` →
+    /// Op::SimdgroupLoad (no result). HW-fused 8×8 fragment load from
+    /// threadgroup memory — emits a single MSL `simdgroup_load(...)`
+    /// instruction that issues a coalesced 32-lane fetch with HW swizzle.
+    /// Use in place of the per-lane scatter
+    /// `simdgroup_elem_store(frag, idx, threadgroup_load("tg", off))`
+    /// to dodge f16 TG-bank conflicts on 8×8 fragment fills.
+    /// Args: frag value-id (ssa), tg name (str literal), offset (ssa),
+    /// stride (u32 const literal — row stride in elements), optional
+    /// `transpose` (bool literal — default `false`; pass `true` to swap
+    /// the row/col axes of the loaded fragment, e.g. for a row-major
+    /// `[N, K]` B tile read into the MMA's `[K, N]` operand layout).
+    fn parse_simdgroup_load(&mut self, call: &ExprCall) -> u32 {
+        let args: Vec<_> = call.args.iter().collect();
+        let frag_vid = args.first().map(|a| self.parse_expr(a)).unwrap_or(0);
+        let tg_name = string_lit_from_expr(args.get(1).unwrap_or(&&*call.func));
+        let off_vid = args.get(2).map(|a| self.parse_expr(a)).unwrap_or(0);
+        let stride = args.get(3).map(|a| literal_u32(a)).unwrap_or(0);
+        let transpose = args
+            .get(4)
+            .map(|a| {
+                if let Expr::Lit(lit) = *a
+                    && let syn::Lit::Bool(b) = &lit.lit
+                {
+                    b.value
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+        self.push_op_no_result(quote! {
+            Op::SimdgroupLoad {
+                dest: ValueId::new(#frag_vid),
+                tg: #tg_name.to_string(),
+                offset: ValueId::new(#off_vid),
+                stride: #stride,
+                transpose: #transpose,
+            }
+        });
+        0
+    }
+
     /// `simdgroup_matmul(a, b, c)` → Op::SimdgroupMatMul (c = a * b + c, no result)
     fn parse_simdgroup_matmul(&mut self, call: &ExprCall) -> u32 {
         let args: Vec<_> = call.args.iter().collect();
@@ -1738,5 +1782,35 @@ mod tests {
         assert!(tokens.contains("compile_error"), "{tokens}");
         assert!(tokens.contains("unrecognized MetalTile DSL call"), "{tokens}");
         assert!(tokens.contains("sine"), "{tokens}");
+    }
+
+    #[test]
+    fn parses_simdgroup_load_basic() {
+        // `simdgroup_load(frag, "tg", off, stride)` — default transpose=false.
+        let body: Block = parse_quote!({
+            let f = simdgroup_alloc::<f16, 8, 8>();
+            simdgroup_load(f, "ws", off, 36u32);
+        });
+
+        let tokens = DslBodyParser::parse(&body, &[], &[]).to_string();
+
+        assert!(tokens.contains("Op :: SimdgroupLoad"), "{tokens}");
+        assert!(tokens.contains("tg : \"ws\" . to_string ()"), "{tokens}");
+        assert!(tokens.contains("stride : 36u32"), "{tokens}");
+        assert!(tokens.contains("transpose : false"), "{tokens}");
+    }
+
+    #[test]
+    fn parses_simdgroup_load_with_transpose() {
+        // 5-arg form: `simdgroup_load(frag, "tg", off, stride, true)`.
+        let body: Block = parse_quote!({
+            let f = simdgroup_alloc::<f16, 8, 8>();
+            simdgroup_load(f, "ws", off, 36u32, true);
+        });
+
+        let tokens = DslBodyParser::parse(&body, &[], &[]).to_string();
+
+        assert!(tokens.contains("Op :: SimdgroupLoad"), "{tokens}");
+        assert!(tokens.contains("transpose : true"), "{tokens}");
     }
 }
