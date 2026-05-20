@@ -336,6 +336,267 @@ fn gated_delta_step_matches_oracle_f16() {
 }
 
 #[test]
+fn gated_delta_step_qwen36_head_dim_256_f32() {
+    let _g = gpu_lock();
+    // Qwen3.6's actual head_dim = 256. n_per_t = 256/32 = 8 elements
+    // per lane — the tg_state[256] alloc is fully utilized. None of the
+    // smaller-Dk tests exercise this regime; a regression in the
+    // multi-iteration `for i in 0..n_per_t` loop or in the upper half
+    // of the TG memory would slip through them.
+    let b = 1;
+    let hv = 2;
+    let hk = 1;
+    let dv = 2;
+    let dk = 256; // Qwen3.6 head_dim
+    let n_total = b * hv;
+
+    let q: Vec<f32> = (0..b * hk * dk).map(|i| ((i as f32) * 0.0091).sin() * 0.3).collect();
+    let k: Vec<f32> = (0..b * hk * dk).map(|i| ((i as f32) * 0.0103).cos() * 0.3).collect();
+    let v: Vec<f32> = (0..n_total * dv).map(|i| ((i as f32) * 0.029).sin() * 0.3).collect();
+    let g: Vec<f32> = (0..n_total).map(|i| 0.92 + (i as f32) * 0.005).collect();
+    let beta: Vec<f32> = (0..n_total).map(|i| 0.4 + (i as f32) * 0.01).collect();
+    let state_in: Vec<f32> =
+        (0..n_total * dv * dk).map(|i| ((i as f32) * 0.011).sin() * 0.1).collect();
+
+    let (y_expected, state_expected) =
+        naive_gated_delta_step(&q, &k, &v, &g, &beta, &state_in, b, hv, hk, dv, dk);
+    let (y_actual, state_actual) =
+        run_gated_delta_step(&q, &k, &v, &g, &beta, &state_in, Dt::F32, b, hv, hk, dv, dk);
+
+    // Dk=256 means each reduction sums 256 f32 mul-adds — tolerance bumped
+    // vs Dk=64 because the accumulation depth is 4× longer.
+    let mut max_y_diff = 0.0_f32;
+    for (a, e) in y_actual.iter().zip(y_expected.iter()) {
+        max_y_diff = max_y_diff.max((a - e).abs());
+    }
+    assert!(max_y_diff < 2e-4, "Dk=256 y max |diff| = {max_y_diff:.2e}");
+
+    let mut max_state_diff = 0.0_f32;
+    for (a, e) in state_actual.iter().zip(state_expected.iter()) {
+        max_state_diff = max_state_diff.max((a - e).abs());
+    }
+    assert!(max_state_diff < 5e-5, "Dk=256 state max |diff| = {max_state_diff:.2e}");
+}
+
+#[test]
+fn gated_delta_step_no_gqa_hv_equals_hk_f32() {
+    let _g = gpu_lock();
+    // Hv == Hk: every Hv-head has its own (q, k) — no sharing.
+    // Hv/Hk = 1 so hk_idx == hv_idx. The trivial case. Catches a
+    // hypothetical refactor that breaks the no-share branch.
+    let b = 2;
+    let hv = 4;
+    let hk = 4;
+    let dv = 4;
+    let dk = 32;
+    let n_total = b * hv;
+
+    let q: Vec<f32> = (0..b * hk * dk).map(|i| ((i as f32) * 0.019).sin() * 0.4).collect();
+    let k: Vec<f32> = (0..b * hk * dk).map(|i| ((i as f32) * 0.023).cos() * 0.4).collect();
+    let v: Vec<f32> = (0..n_total * dv).map(|i| ((i as f32) * 0.031).sin() * 0.3).collect();
+    let g: Vec<f32> = (0..n_total).map(|i| 0.88 + (i as f32) * 0.005).collect();
+    let beta: Vec<f32> = (0..n_total).map(|i| 0.5 + (i as f32) * 0.01).collect();
+    let state_in: Vec<f32> =
+        (0..n_total * dv * dk).map(|i| ((i as f32) * 0.013).cos() * 0.1).collect();
+
+    let (y_expected, _) =
+        naive_gated_delta_step(&q, &k, &v, &g, &beta, &state_in, b, hv, hk, dv, dk);
+    let (y_actual, _) =
+        run_gated_delta_step(&q, &k, &v, &g, &beta, &state_in, Dt::F32, b, hv, hk, dv, dk);
+
+    let mut max_diff = 0.0_f32;
+    for (a, e) in y_actual.iter().zip(y_expected.iter()) {
+        max_diff = max_diff.max((a - e).abs());
+    }
+    assert!(max_diff < 5e-5, "Hv=Hk y max |diff| = {max_diff:.2e}");
+}
+
+#[test]
+fn gated_delta_step_batch_4_stresses_indexing_f32() {
+    let _g = gpu_lock();
+    // B > 1 stress — distinct per-batch g / beta / state so the b = n/hv
+    // batch index decomposition is exercised. Catches a wrong divisor
+    // that would cross-contaminate batch slots.
+    let b = 4;
+    let hv = 2;
+    let hk = 1;
+    let dv = 4;
+    let dk = 32;
+    let n_total = b * hv;
+
+    let q: Vec<f32> = (0..b * hk * dk).map(|i| ((i as f32) * 0.017).sin() * 0.4).collect();
+    let k: Vec<f32> = (0..b * hk * dk).map(|i| ((i as f32) * 0.021).cos() * 0.4).collect();
+    let v: Vec<f32> = (0..n_total * dv).map(|i| ((i as f32) * 0.027).sin() * 0.3).collect();
+    // Distinct g per batch — first half 0.95, second half 0.75 — so a
+    // mis-routed batch returns visibly wrong recurrence direction.
+    let g: Vec<f32> = (0..n_total).map(|i| if (i / hv) < b / 2 { 0.95 } else { 0.75 }).collect();
+    let beta: Vec<f32> = (0..n_total).map(|i| 0.4 + (i as f32) * 0.01).collect();
+    let state_in: Vec<f32> =
+        (0..n_total * dv * dk).map(|i| ((i as f32) * 0.011).sin() * 0.1).collect();
+
+    let (y_expected, _) =
+        naive_gated_delta_step(&q, &k, &v, &g, &beta, &state_in, b, hv, hk, dv, dk);
+    let (y_actual, _) =
+        run_gated_delta_step(&q, &k, &v, &g, &beta, &state_in, Dt::F32, b, hv, hk, dv, dk);
+
+    let mut max_diff = 0.0_f32;
+    for (a, e) in y_actual.iter().zip(y_expected.iter()) {
+        max_diff = max_diff.max((a - e).abs());
+    }
+    assert!(max_diff < 5e-5, "B=4 y max |diff| = {max_diff:.2e}");
+}
+
+#[test]
+fn gated_delta_step_2049_iterations_stay_stable_f32() {
+    let _g = gpu_lock();
+    // Issue #111: Qwen3.6 crashes at ctx > 2048 in the hybrid scheduler.
+    // The decode-form kernel doesn't carry a T-loop (that's the chunked
+    // kernel — part 1b), but a long autoregressive sequence calls the
+    // decode kernel iteratively. Running 2049 iterations exercises the
+    // exact regime that matters for serving past the 2048 boundary —
+    // state must remain finite, deterministic, and match a CPU oracle.
+    //
+    // 2049 chosen specifically to cross the bug's boundary (the chunked-
+    // prefill kernel breaks at T=2049; the decode kernel should NOT
+    // break here regardless because it's pure single-step).
+    let b = 1;
+    let hv = 2;
+    let hk = 1;
+    let dv = 4;
+    let dk = 32;
+    let n_iters = 2049usize;
+    let n_total = b * hv;
+
+    let q: Vec<f32> = (0..b * hk * dk).map(|i| ((i as f32) * 0.013).sin() * 0.3).collect();
+    let k: Vec<f32> = (0..b * hk * dk).map(|i| ((i as f32) * 0.017).cos() * 0.3).collect();
+    // g < 1 so the state stays bounded across 2049 iterations.
+    let g = vec![0.95_f32; n_total];
+    let beta = vec![0.3_f32; n_total];
+
+    let mut state_gpu = vec![0.0_f32; n_total * dv * dk];
+    let mut state_cpu = state_gpu.clone();
+    let mut last_y_gpu = vec![0.0_f32; n_total * dv];
+    let mut last_y_cpu = vec![0.0_f32; n_total * dv];
+
+    for step in 0..n_iters {
+        // v varies per step so the recurrence has actual input.
+        let v: Vec<f32> =
+            (0..n_total * dv).map(|i| ((i as f32 + step as f32) * 0.029).sin() * 0.3).collect();
+
+        let (y_gpu, state_gpu_new) =
+            run_gated_delta_step(&q, &k, &v, &g, &beta, &state_gpu, Dt::F32, b, hv, hk, dv, dk);
+        let (y_cpu, state_cpu_new) =
+            naive_gated_delta_step(&q, &k, &v, &g, &beta, &state_cpu, b, hv, hk, dv, dk);
+
+        state_gpu = state_gpu_new;
+        state_cpu = state_cpu_new;
+        last_y_gpu = y_gpu;
+        last_y_cpu = y_cpu;
+
+        // Spot-check at a couple of milestones — at 2048 and 2049 (the
+        // exact #111 boundary) the state must remain finite and tracking
+        // the CPU oracle.
+        if step == 2047 || step == 2048 {
+            for &v in state_gpu.iter() {
+                assert!(v.is_finite(), "step {step}: state contains non-finite value {v}");
+            }
+            for &v in last_y_gpu.iter() {
+                assert!(v.is_finite(), "step {step}: y contains non-finite value {v}");
+            }
+        }
+    }
+
+    // After 2049 iterations, GPU and CPU should still agree.
+    // Tolerance accumulates ULPs across iterations — generous 5e-3.
+    let mut max_y_diff = 0.0_f32;
+    for (a, e) in last_y_gpu.iter().zip(last_y_cpu.iter()) {
+        max_y_diff = max_y_diff.max((a - e).abs());
+    }
+    assert!(max_y_diff < 5e-3, "y drift after {n_iters} iterations: max |diff| = {max_y_diff:.2e}",);
+
+    let mut max_state_diff = 0.0_f32;
+    for (a, e) in state_gpu.iter().zip(state_cpu.iter()) {
+        max_state_diff = max_state_diff.max((a - e).abs());
+    }
+    assert!(
+        max_state_diff < 5e-3,
+        "state drift after {n_iters} iterations: max |diff| = {max_state_diff:.2e}",
+    );
+}
+
+#[test]
+fn gated_delta_step_edge_gates_f32() {
+    let _g = gpu_lock();
+    // Edge values for g and beta: g near 1 (slow decay, state nearly
+    // preserved), g near 0 (fast decay, state nearly wiped), beta near
+    // 0 (small update), beta = 1 (full delta-rule update). Each pair
+    // exercises a different numerical regime; a bug in the (1 - β·k·kᵀ)
+    // decomposition would surface in one of these.
+    let b = 1;
+    let hv = 4;
+    let hk = 2;
+    let dv = 4;
+    let dk = 32;
+    let n_total = b * hv;
+
+    let q: Vec<f32> = (0..b * hk * dk).map(|i| ((i as f32) * 0.013).sin() * 0.3).collect();
+    let k: Vec<f32> = (0..b * hk * dk).map(|i| ((i as f32) * 0.017).cos() * 0.3).collect();
+    let v: Vec<f32> = (0..n_total * dv).map(|i| ((i as f32) * 0.029).sin() * 0.3).collect();
+    let state_in: Vec<f32> =
+        (0..n_total * dv * dk).map(|i| ((i as f32) * 0.011).sin() * 0.1).collect();
+
+    let configs: [(f32, f32, &str); 4] = [
+        (0.999, 0.01, "g=0.999 (slow decay), beta=0.01 (tiny update)"),
+        (0.01, 0.5, "g=0.01 (fast decay), beta=0.5"),
+        (0.5, 0.999, "g=0.5, beta=0.999 (near-full delta)"),
+        (1.0, 1.0, "g=1, beta=1 (no decay, full delta)"),
+    ];
+
+    for (g_val, beta_val, label) in configs {
+        let g = vec![g_val; n_total];
+        let beta = vec![beta_val; n_total];
+
+        let (y_expected, _) =
+            naive_gated_delta_step(&q, &k, &v, &g, &beta, &state_in, b, hv, hk, dv, dk);
+        let (y_actual, _) =
+            run_gated_delta_step(&q, &k, &v, &g, &beta, &state_in, Dt::F32, b, hv, hk, dv, dk);
+
+        let mut max_diff = 0.0_f32;
+        for (a, e) in y_actual.iter().zip(y_expected.iter()) {
+            max_diff = max_diff.max((a - e).abs());
+        }
+        assert!(max_diff < 5e-5, "{label}: y max |diff| = {max_diff:.2e}");
+        for &v in y_actual.iter() {
+            assert!(v.is_finite(), "{label}: y contains non-finite {v}");
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "mt_gated_delta_step requires dk % 32 == 0")]
+fn gated_delta_step_panics_on_unaligned_dk() {
+    // Dk = 33 violates the kernel's "Dk must be a multiple of 32"
+    // contract. The dispatch helper asserts the contract before the
+    // kernel runs. If a future refactor drops the assertion (or a new
+    // dispatcher forgets it), this test catches the regression before
+    // the kernel produces silently-wrong output.
+    let _g = gpu_lock();
+    let b = 1;
+    let hv = 1;
+    let hk = 1;
+    let dv = 1;
+    let dk = 33; // not a multiple of 32
+    let n_total = b * hv;
+    let q = vec![0.0_f32; b * hk * dk];
+    let k = vec![0.0_f32; b * hk * dk];
+    let v = vec![0.0_f32; n_total * dv];
+    let g = vec![1.0_f32; n_total];
+    let beta = vec![0.0_f32; n_total];
+    let state_in = vec![0.0_f32; n_total * dv * dk];
+    let _ = run_gated_delta_step(&q, &k, &v, &g, &beta, &state_in, Dt::F32, b, hv, hk, dv, dk);
+}
+
+#[test]
 fn gated_delta_step_matches_oracle_bf16() {
     let _g = gpu_lock();
     let b = 1;
