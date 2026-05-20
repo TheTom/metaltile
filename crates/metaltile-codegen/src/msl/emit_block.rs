@@ -904,6 +904,25 @@ impl MslGenerator {
                     wl!(out, "{pad}{sv}.thread_elements()[{index}] = {dv};");
                 },
 
+                Op::SimdgroupLoad { dest, tg, offset, stride, transpose } => {
+                    // HW-fused fragment load: one MSL `simdgroup_load`
+                    // instruction issues a coalesced fetch across all 32
+                    // lanes of the simdgroup, with HW swizzle, bypassing
+                    // the per-lane bank-conflict scatter of repeated
+                    // `simdgroup_elem_store(frag, idx, threadgroup_load(...))`.
+                    // `ulong2(0,0)` origin mirrors MLX/llama.cpp usage
+                    // (steel_gemm/qmm_t). `transpose=true` reads a row-major
+                    // `[N, K]` tile as `[K, N]` — used for B operand of
+                    // `C = A * B` MMA in the qmm_t pattern.
+                    let dv = self.vname(Some(*dest), block, extra_names);
+                    let off = self.vname(Some(*offset), block, extra_names);
+                    let tflag = if *transpose { "true" } else { "false" };
+                    wl!(
+                        out,
+                        "{pad}simdgroup_load({dv}, &{tg}[{off}], {stride}, ulong2(0, 0), {tflag});"
+                    );
+                },
+
                 Op::SimdgroupMatMul { a, b, c } => {
                     let av = self.vname(Some(*a), block, extra_names);
                     let bv = self.vname(Some(*b), block, extra_names);

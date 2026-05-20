@@ -311,6 +311,10 @@ fn replace_value_in_op(op: &mut Op, old: ValueId, new: ValueId) {
             s(value);
             s(data);
         },
+        Op::SimdgroupLoad { dest, offset, .. } => {
+            s(dest);
+            s(offset);
+        },
         Op::SimdScan { value, .. } => s(value),
         Op::DeclareLocal { value, .. } | Op::SetLocal { value, .. } => s(value),
         Op::ArgReduce { value, .. } => s(value),
@@ -485,6 +489,10 @@ fn collect_uses(op: &Op, used: &mut BTreeSet<ValueId>) {
         Op::SimdgroupElemStore { value, data, .. } => {
             add(*value);
             add(*data);
+        },
+        Op::SimdgroupLoad { dest, offset, .. } => {
+            add(*dest);
+            add(*offset);
         },
         Op::SimdScan { value, .. } => add(*value),
         Op::DeclareLocal { value, .. } | Op::SetLocal { value, .. } => add(*value),

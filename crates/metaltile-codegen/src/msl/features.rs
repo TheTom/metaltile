@@ -108,6 +108,7 @@ impl MslGenerator {
                 Op::SimdgroupAlloc { .. }
                 | Op::SimdgroupElemLoad { .. }
                 | Op::SimdgroupElemStore { .. }
+                | Op::SimdgroupLoad { .. }
                 | Op::SimdgroupMatMul { .. } => {
                     feat.needs_simd_lane = true;
                     feat.needs_simd_group = true;

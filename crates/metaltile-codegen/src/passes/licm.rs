@@ -344,7 +344,8 @@ fn is_pure_op(op: &Op, read_only: &BTreeSet<String>) -> bool {
         | Op::GatedMlp { .. }
         | Op::SimdgroupMatMul { .. }
         | Op::SimdgroupElemLoad { .. }
-        | Op::SimdgroupElemStore { .. } => false,
+        | Op::SimdgroupElemStore { .. }
+        | Op::SimdgroupLoad { .. } => false,
     }
 }
 
