@@ -257,8 +257,7 @@ fn process_chunk_one_head(
     for t in 0..c {
         let t_abs = chunk.start + t;
         for d in 0..dv {
-            let val = big_g[t] * (s0_q[t * dv + d] - correction[t * dv + d])
-                + y_local[t * dv + d];
+            let val = big_g[t] * (s0_q[t * dv + d] - correction[t * dv + d]) + y_local[t * dv + d];
             y_out[(t_abs * hv + h_v) * dv + d] = val as f32;
         }
     }
@@ -361,34 +360,22 @@ fn synthetic_inputs(
     // noise relative to f64. With sin² mean ≈ 0.5, k_scale = 1/√(Dk/2)
     // gives ‖k‖² ≈ 1.
     let kscale = (2.0 / dk as f32).sqrt();
-    let q: Vec<f32> = (0..t_total * hk * dk)
-        .map(|i| ((i as f32) * 0.0173).sin() * kscale)
-        .collect();
-    let k: Vec<f32> = (0..t_total * hk * dk)
-        .map(|i| ((i as f32) * 0.0211).cos() * kscale)
-        .collect();
-    let v: Vec<f32> = (0..t_total * hv * dv)
-        .map(|i| ((i as f32) * 0.029).sin() * 0.3)
-        .collect();
+    let q: Vec<f32> =
+        (0..t_total * hk * dk).map(|i| ((i as f32) * 0.0173).sin() * kscale).collect();
+    let k: Vec<f32> =
+        (0..t_total * hk * dk).map(|i| ((i as f32) * 0.0211).cos() * kscale).collect();
+    let v: Vec<f32> = (0..t_total * hv * dv).map(|i| ((i as f32) * 0.029).sin() * 0.3).collect();
     // g ∈ (0, 1) — realistic gating distribution.
-    let g: Vec<f32> = (0..t_total * hv)
-        .map(|i| 0.8 + 0.15 * ((i as f32) * 0.013).sin())
-        .collect();
+    let g: Vec<f32> = (0..t_total * hv).map(|i| 0.8 + 0.15 * ((i as f32) * 0.013).sin()).collect();
     // β ∈ (0, 1) — realistic learning rate (sigmoid output).
-    let beta: Vec<f32> = (0..t_total * hv)
-        .map(|i| 0.4 + 0.3 * ((i as f32) * 0.017).cos())
-        .collect();
-    let state: Vec<f32> = (0..hv * dv * dk)
-        .map(|i| ((i as f32) * 0.011).sin() * 0.1)
-        .collect();
+    let beta: Vec<f32> =
+        (0..t_total * hv).map(|i| 0.4 + 0.3 * ((i as f32) * 0.017).cos()).collect();
+    let state: Vec<f32> = (0..hv * dv * dk).map(|i| ((i as f32) * 0.011).sin() * 0.1).collect();
     (q, k, v, g, beta, state)
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0_f32, f32::max)
+    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0_f32, f32::max)
 }
 
 #[test]
@@ -411,7 +398,7 @@ fn wy_debug_t2_minimal() {
 
     eprintln!("y_seq = {:?}", y_seq);
     eprintln!("y_wy  = {:?}", y_wy);
-    eprintln!("y_diff = {:?}", y_seq.iter().zip(&y_wy).map(|(a,b)| a-b).collect::<Vec<_>>());
+    eprintln!("y_diff = {:?}", y_seq.iter().zip(&y_wy).map(|(a, b)| a - b).collect::<Vec<_>>());
     eprintln!("s_seq = {:?}", s1);
     eprintln!("s_wy  = {:?}", s2);
 
@@ -426,8 +413,17 @@ fn wy_debug_t2_minimal() {
 /// noise when validating the chunked-WY algorithm port.
 #[allow(clippy::too_many_arguments)]
 fn sequential_gdn_f64(
-    q: &[f64], k: &[f64], v: &[f64], g: &[f64], beta: &[f64],
-    state: &mut [f64], t_total: usize, hk: usize, hv: usize, dk: usize, dv: usize,
+    q: &[f64],
+    k: &[f64],
+    v: &[f64],
+    g: &[f64],
+    beta: &[f64],
+    state: &mut [f64],
+    t_total: usize,
+    hk: usize,
+    hv: usize,
+    dk: usize,
+    dv: usize,
 ) -> Vec<f64> {
     let hv_per_hk = hv / hk;
     let mut y = vec![0.0_f64; t_total * hv * dv];
