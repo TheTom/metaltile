@@ -86,36 +86,34 @@ pub fn mt_gated_delta_step<T>(
 
     // ─── Phase 1: decay + kv_mem reduction ─────────────────────────────
     //
-    // Stash the decayed state into TG memory so phase 2 can read it back
-    // for the rank-1 update without recomputing. tg_state is sized at
-    // the maximum supported Dk (256 — Qwen3.6's `head_dim`); kernels with
-    // smaller Dk under-utilise the TG alloc but stay correct because
-    // every read uses `s_idx < dk`. The DSL doesn't yet accept constexpr
-    // sizes for `threadgroup_alloc` (PR #88's `stack_alloc` is the
-    // future-clean way; until then this is the canonical pattern).
-    threadgroup_alloc("tg_state", 256u32);
-
+    // Compute decayed state locally per element + contribute to kv_mem,
+    // then DISCARD. Phase 2 re-reads `state_in` and re-applies `g_val` to
+    // reconstruct the decayed state — one extra global load per element
+    // in exchange for zero TG-memory traffic and zero TG allocation.
+    //
+    // The second read hits Apple GPU's L1 / global cache (same address
+    // accessed ~50 cycles earlier in phase 1), so the perf cost is
+    // negligible compared to the saved TG store + load + barrier.
     let mut kv_mem = 0.0f32;
     for i in range(0u32, n_per_t, 1u32) {
         let s_idx = n_per_t * dk_idx + i;
         let s_decayed = load(state_in[state_base + s_idx]).cast::<f32>() * g_val;
-        threadgroup_store("tg_state", s_idx, s_decayed);
         let k_val = load(k[qk_base + s_idx]).cast::<f32>();
         kv_mem = kv_mem + s_decayed * k_val;
     }
     let kv_mem_sum = simd_sum(kv_mem);
 
     let delta = (v_val - kv_mem_sum) * beta_val;
-    threadgroup_barrier();
 
     // ─── Phase 2: rank-1 update + output projection ────────────────────
     //
-    // For each (dv_idx, dk_idx, i): state_new = state_decayed + k * delta
-    // Then accumulate state_new * q into `out` via simd_sum.
+    // Re-read state_in (cache hit), re-apply g_val to reconstruct the
+    // decayed state, then state_new = decayed + k*delta. Both k and q
+    // are loaded once per phase — same pattern MLX-LM's reference uses.
     let mut out = 0.0f32;
     for i in range(0u32, n_per_t, 1u32) {
         let s_idx = n_per_t * dk_idx + i;
-        let s_decayed = threadgroup_load("tg_state", s_idx);
+        let s_decayed = load(state_in[state_base + s_idx]).cast::<f32>() * g_val;
         let k_val = load(k[qk_base + s_idx]).cast::<f32>();
         let s_new = s_decayed + k_val * delta;
         store(state_out[state_base + s_idx], s_new.cast::<T>());
