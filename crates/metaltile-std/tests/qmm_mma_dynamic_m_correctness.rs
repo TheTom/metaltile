@@ -124,9 +124,7 @@ fn run_dynamic_m(
 
 // ── Dtype byte helpers. ─────────────────────────────────────────────────
 
-fn f32_to_f32_bytes(vals: &[f32]) -> Vec<u8> {
-    vals.iter().flat_map(|v| v.to_le_bytes()).collect()
-}
+fn f32_to_f32_bytes(vals: &[f32]) -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() }
 fn f32_to_f16_bytes(vals: &[f32]) -> Vec<u8> {
     vals.iter().flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes()).collect()
 }
@@ -456,10 +454,8 @@ fn dynamic_m_f32_t32_reference() {
         gs_per_row,
         4,
     );
-    let actual: Vec<f32> = out_bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
+    let actual: Vec<f32> =
+        out_bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
     assert_eq!(actual.len(), expected.len(), "T=32 element count");
     let cos = cosine(&expected, &actual);
     let mut max_diff = 0.0f32;

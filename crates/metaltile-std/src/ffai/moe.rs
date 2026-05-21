@@ -1392,14 +1392,30 @@ pub fn mt_moe_gather_qmm_mma_int4_bm16<T>(
                 let g5r = m_tile_base + mr5;
                 let g6r = m_tile_base + mr6;
                 let g7r = m_tile_base + mr7;
-                let m0 = select((mr0 >= sub_offset) & (mr0 < sub_end) & (g0r < m_total), 1.0f32, 0.0f32).cast::<T>();
-                let m1 = select((mr1 >= sub_offset) & (mr1 < sub_end) & (g1r < m_total), 1.0f32, 0.0f32).cast::<T>();
-                let m2 = select((mr2 >= sub_offset) & (mr2 < sub_end) & (g2r < m_total), 1.0f32, 0.0f32).cast::<T>();
-                let m3 = select((mr3 >= sub_offset) & (mr3 < sub_end) & (g3r < m_total), 1.0f32, 0.0f32).cast::<T>();
-                let m4 = select((mr4 >= sub_offset) & (mr4 < sub_end) & (g4r < m_total), 1.0f32, 0.0f32).cast::<T>();
-                let m5 = select((mr5 >= sub_offset) & (mr5 < sub_end) & (g5r < m_total), 1.0f32, 0.0f32).cast::<T>();
-                let m6 = select((mr6 >= sub_offset) & (mr6 < sub_end) & (g6r < m_total), 1.0f32, 0.0f32).cast::<T>();
-                let m7 = select((mr7 >= sub_offset) & (mr7 < sub_end) & (g7r < m_total), 1.0f32, 0.0f32).cast::<T>();
+                let m0 =
+                    select((mr0 >= sub_offset) & (mr0 < sub_end) & (g0r < m_total), 1.0f32, 0.0f32)
+                        .cast::<T>();
+                let m1 =
+                    select((mr1 >= sub_offset) & (mr1 < sub_end) & (g1r < m_total), 1.0f32, 0.0f32)
+                        .cast::<T>();
+                let m2 =
+                    select((mr2 >= sub_offset) & (mr2 < sub_end) & (g2r < m_total), 1.0f32, 0.0f32)
+                        .cast::<T>();
+                let m3 =
+                    select((mr3 >= sub_offset) & (mr3 < sub_end) & (g3r < m_total), 1.0f32, 0.0f32)
+                        .cast::<T>();
+                let m4 =
+                    select((mr4 >= sub_offset) & (mr4 < sub_end) & (g4r < m_total), 1.0f32, 0.0f32)
+                        .cast::<T>();
+                let m5 =
+                    select((mr5 >= sub_offset) & (mr5 < sub_end) & (g5r < m_total), 1.0f32, 0.0f32)
+                        .cast::<T>();
+                let m6 =
+                    select((mr6 >= sub_offset) & (mr6 < sub_end) & (g6r < m_total), 1.0f32, 0.0f32)
+                        .cast::<T>();
+                let m7 =
+                    select((mr7 >= sub_offset) & (mr7 < sub_end) & (g7r < m_total), 1.0f32, 0.0f32)
+                        .cast::<T>();
                 threadgroup_store("xs", mr0 * xs_ld + kc0, xv0 * m0);
                 threadgroup_store("xs", mr1 * xs_ld + kc1, xv1 * m1);
                 threadgroup_store("xs", mr2 * xs_ld + kc2, xv2 * m2);
@@ -1483,15 +1499,47 @@ pub fn mt_moe_gather_qmm_mma_int4_bm16<T>(
 
                 for k_inner in range(0u32, 4u32, 1u32) {
                     let ki_off = k_inner * 8u32;
-                    simdgroup_elem_store(a_f0, 0, threadgroup_load("xs", row_a0 * xs_ld + ki_off + fn0));
-                    simdgroup_elem_store(a_f0, 1, threadgroup_load("xs", row_a0 * xs_ld + ki_off + fn1));
-                    simdgroup_elem_store(a_f1, 0, threadgroup_load("xs", row_a1 * xs_ld + ki_off + fn0));
-                    simdgroup_elem_store(a_f1, 1, threadgroup_load("xs", row_a1 * xs_ld + ki_off + fn1));
+                    simdgroup_elem_store(
+                        a_f0,
+                        0,
+                        threadgroup_load("xs", row_a0 * xs_ld + ki_off + fn0),
+                    );
+                    simdgroup_elem_store(
+                        a_f0,
+                        1,
+                        threadgroup_load("xs", row_a0 * xs_ld + ki_off + fn1),
+                    );
+                    simdgroup_elem_store(
+                        a_f1,
+                        0,
+                        threadgroup_load("xs", row_a1 * xs_ld + ki_off + fn0),
+                    );
+                    simdgroup_elem_store(
+                        a_f1,
+                        1,
+                        threadgroup_load("xs", row_a1 * xs_ld + ki_off + fn1),
+                    );
                     simdgroup_barrier_mem_none();
-                    simdgroup_elem_store(b_f0, 0, threadgroup_load("ws", (col_b0 + fn0) * ws_ld + ki_off + fm));
-                    simdgroup_elem_store(b_f0, 1, threadgroup_load("ws", (col_b0 + fn1) * ws_ld + ki_off + fm));
-                    simdgroup_elem_store(b_f1, 0, threadgroup_load("ws", (col_b1 + fn0) * ws_ld + ki_off + fm));
-                    simdgroup_elem_store(b_f1, 1, threadgroup_load("ws", (col_b1 + fn1) * ws_ld + ki_off + fm));
+                    simdgroup_elem_store(
+                        b_f0,
+                        0,
+                        threadgroup_load("ws", (col_b0 + fn0) * ws_ld + ki_off + fm),
+                    );
+                    simdgroup_elem_store(
+                        b_f0,
+                        1,
+                        threadgroup_load("ws", (col_b0 + fn1) * ws_ld + ki_off + fm),
+                    );
+                    simdgroup_elem_store(
+                        b_f1,
+                        0,
+                        threadgroup_load("ws", (col_b1 + fn0) * ws_ld + ki_off + fm),
+                    );
+                    simdgroup_elem_store(
+                        b_f1,
+                        1,
+                        threadgroup_load("ws", (col_b1 + fn1) * ws_ld + ki_off + fm),
+                    );
                     simdgroup_barrier_mem_none();
                     simdgroup_matmul(a_f0, b_f0, c_f00);
                     simdgroup_matmul(a_f0, b_f1, c_f01);

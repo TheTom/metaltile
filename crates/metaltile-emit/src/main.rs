@@ -27,16 +27,22 @@ use metaltile_core::{
 };
 // Bring high-perf kernels from metaltile-std into the emit registry.
 use metaltile_std::ffai::gated_delta::{mt_gated_delta_chunk, mt_gated_delta_step};
-use metaltile_std::ffai::gated_delta_prep::mt_gated_delta_prep_step;
-use metaltile_std::ffai::moe::mt_moe_gather_qmm_mma_int4_bm16;
-use metaltile_std::ffai::moe_mpp;
-use metaltile_std::ffai::moe_mpp_bm64;
-use metaltile_std::ffai::moe_mpp_bm8;
-use metaltile_std::mlx::steel::attn::steel_attention_mma::mt_sdpa_prefill_mma;
-use metaltile_std::mlx::quantized::mt_qmm_mma;
-use metaltile_std::mlx::quantized_mpp;
-use metaltile_std::mlx::unary::{mt_gelu, mt_relu, mt_sigmoid};
-use metaltile_std::probe::mpp_matmul_smoke;
+use metaltile_std::{
+    ffai::{
+        gated_delta_prep::mt_gated_delta_prep_step,
+        moe::mt_moe_gather_qmm_mma_int4_bm16,
+        moe_mpp,
+        moe_mpp_bm8,
+        moe_mpp_bm64,
+    },
+    mlx::{
+        quantized::mt_qmm_mma,
+        quantized_mpp,
+        steel::attn::steel_attention_mma::mt_sdpa_prefill_mma,
+        unary::{mt_gelu, mt_relu, mt_sigmoid},
+    },
+    probe::mpp_matmul_smoke,
+};
 use serde::Serialize;
 
 // ─── CLI ──────────────────────────────────────────────────────────────────
@@ -108,12 +114,7 @@ fn softplus_elem<T>(a: Tensor<T>, out: Tensor<T>) {
 // Embedding lookup. For each output element (token, d), copy
 // table[indices[token], d]. One thread per output element.
 #[kernel]
-fn gather_row<T>(
-    table: Tensor<T>,
-    indices: Tensor<u32>,
-    out: Tensor<T>,
-    #[constexpr] dim: u32,
-) {
+fn gather_row<T>(table: Tensor<T>, indices: Tensor<u32>, out: Tensor<T>, #[constexpr] dim: u32) {
     let idx = program_id::<0>();
     let token = idx / dim;
     let d = idx - token * dim;
@@ -128,12 +129,7 @@ fn gather_row<T>(
 // metaltile-bench/src/ops/gemv.rs (which gets ~100% of MLX throughput
 // on M-series). weight is [out_dim, in_dim] row-major; input is [in_dim].
 #[kernel]
-fn gemv_naive<T>(
-    mat: Tensor<T>,
-    vec: Tensor<T>,
-    out: Tensor<T>,
-    #[constexpr] k: u32,
-) {
+fn gemv_naive<T>(mat: Tensor<T>, vec: Tensor<T>, out: Tensor<T>, #[constexpr] k: u32) {
     let row = program_id::<0>();
     let rs = row * k;
     let re = rs + k;
@@ -194,11 +190,7 @@ fn rope_llama<T>(
 
     let is_low_freq = wavelen > low_freq_wavelen;
     let is_high_freq = wavelen < high_freq_wavelen;
-    let inv_freq = select(
-        is_low_freq,
-        scaled,
-        select(is_high_freq, inv_freq_base, smoothed),
-    );
+    let inv_freq = select(is_low_freq, scaled, select(is_high_freq, inv_freq_base, smoothed));
 
     let pos_f = position.cast::<f32>();
     let theta = pos_f * inv_freq;
@@ -494,7 +486,7 @@ fn softmax_categorical_sample<T>(
     if lid == 0u32 {
         let target = load(uniform_in[0]) * total;
         let mut cum = 0.0f32;
-        let mut found_idx = n - 1u32;   // fallback to last index
+        let mut found_idx = n - 1u32; // fallback to last index
         let mut done = 0u32;
         for i in range(0u32, n, 1u32) {
             let v = load(inp[i]).cast::<f32>() * inv_t;
@@ -566,8 +558,7 @@ fn quantize_kv_int8<T>(
             let v = load(src[src_base + d_start + p * 4u32 + i]).cast::<f32>();
             // Round half-up via +0.5 + truncating cast.
             let q_f = (v - mn) * inv_scale + 0.5f32;
-            let q_clamped_f = select(q_f > 255.0f32, 255.0f32,
-                                     select(q_f < 0.0f32, 0.0f32, q_f));
+            let q_clamped_f = select(q_f > 255.0f32, 255.0f32, select(q_f < 0.0f32, 0.0f32, q_f));
             let q = q_clamped_f.cast::<u32>();
             packed = packed | (q << (i * 8u32));
         }
@@ -796,8 +787,7 @@ fn quantize_kv_int4<T>(
         for i in range(0u32, 8u32, 1u32) {
             let v = load(src[src_base + d_start + p * 8u32 + i]).cast::<f32>();
             let q_f = (v - mn) * inv_scale + 0.5f32;
-            let q_clamped_f = select(q_f > 15.0f32, 15.0f32,
-                                     select(q_f < 0.0f32, 0.0f32, q_f));
+            let q_clamped_f = select(q_f > 15.0f32, 15.0f32, select(q_f < 0.0f32, 0.0f32, q_f));
             let q = q_clamped_f.cast::<u32>();
             packed = packed | (q << (i * 4u32));
         }
@@ -908,9 +898,7 @@ fn sdpa_decode_naive<T>(
         let k_base = head_slab + _t * head_dim;
         let mut score = 0.0f32;
         for j in range(0u32, head_dim, 1u32) {
-            score = score
-                + load(q[q_off + j]).cast::<f32>()
-                * load(k[k_base + j]).cast::<f32>();
+            score = score + load(q[q_off + j]).cast::<f32>() * load(k[k_base + j]).cast::<f32>();
         }
         score = score * scale;
 
@@ -1087,94 +1075,126 @@ fn dequant_gemv_int3<T>(
 
     let g_iters = (n_groups + lsize - 1u32) / lsize;
     for g_iter in range(0u32, g_iters, 1u32) {
-      let g = g_iter * lsize + tid;
-      if g < n_groups {
-        let scale = load(scales[row_group_off + g]).cast::<f32>();
-        let bias = load(biases[row_group_off + g]).cast::<f32>();
-        let g_start = g * group_size;
-        let g_u32_off = row_u32_off + g * u32_per_group;
-        let cycles = group_size / 32u32;
+        let g = g_iter * lsize + tid;
+        if g < n_groups {
+            let scale = load(scales[row_group_off + g]).cast::<f32>();
+            let bias = load(biases[row_group_off + g]).cast::<f32>();
+            let g_start = g * group_size;
+            let g_u32_off = row_u32_off + g * u32_per_group;
+            let cycles = group_size / 32u32;
 
-        for c in range(0u32, cycles, 1u32) {
-            let cy = g_u32_off + c * 3u32;
-            let u0 = load(weight[cy]);
-            let u1 = load(weight[cy + 1u32]);
-            let u2 = load(weight[cy + 2u32]);
-            let xo = g_start + c * 32u32;
+            for c in range(0u32, cycles, 1u32) {
+                let cy = g_u32_off + c * 3u32;
+                let u0 = load(weight[cy]);
+                let u1 = load(weight[cy + 1u32]);
+                let u2 = load(weight[cy + 2u32]);
+                let xo = g_start + c * 32u32;
 
-            // Chunk 0 — bytes 0,1,2 of u0
-            let v0 = u0 & 7u32;
-            let v1 = (u0 >> 3u32) & 7u32;
-            let v2 = ((u0 >> 6u32) & 3u32) | (((u0 >> 8u32) & 1u32) << 2u32);
-            let v3 = (u0 >> 9u32) & 7u32;
-            let v4 = (u0 >> 12u32) & 7u32;
-            let v5 = ((u0 >> 15u32) & 1u32) | (((u0 >> 16u32) & 3u32) << 1u32);
-            let v6 = (u0 >> 18u32) & 7u32;
-            let v7 = (u0 >> 21u32) & 7u32;
-            acc = acc + (v0.cast::<f32>() * scale + bias) * load(input[xo + 0u32]).cast::<f32>();
-            acc = acc + (v1.cast::<f32>() * scale + bias) * load(input[xo + 1u32]).cast::<f32>();
-            acc = acc + (v2.cast::<f32>() * scale + bias) * load(input[xo + 2u32]).cast::<f32>();
-            acc = acc + (v3.cast::<f32>() * scale + bias) * load(input[xo + 3u32]).cast::<f32>();
-            acc = acc + (v4.cast::<f32>() * scale + bias) * load(input[xo + 4u32]).cast::<f32>();
-            acc = acc + (v5.cast::<f32>() * scale + bias) * load(input[xo + 5u32]).cast::<f32>();
-            acc = acc + (v6.cast::<f32>() * scale + bias) * load(input[xo + 6u32]).cast::<f32>();
-            acc = acc + (v7.cast::<f32>() * scale + bias) * load(input[xo + 7u32]).cast::<f32>();
+                // Chunk 0 — bytes 0,1,2 of u0
+                let v0 = u0 & 7u32;
+                let v1 = (u0 >> 3u32) & 7u32;
+                let v2 = ((u0 >> 6u32) & 3u32) | (((u0 >> 8u32) & 1u32) << 2u32);
+                let v3 = (u0 >> 9u32) & 7u32;
+                let v4 = (u0 >> 12u32) & 7u32;
+                let v5 = ((u0 >> 15u32) & 1u32) | (((u0 >> 16u32) & 3u32) << 1u32);
+                let v6 = (u0 >> 18u32) & 7u32;
+                let v7 = (u0 >> 21u32) & 7u32;
+                acc =
+                    acc + (v0.cast::<f32>() * scale + bias) * load(input[xo + 0u32]).cast::<f32>();
+                acc =
+                    acc + (v1.cast::<f32>() * scale + bias) * load(input[xo + 1u32]).cast::<f32>();
+                acc =
+                    acc + (v2.cast::<f32>() * scale + bias) * load(input[xo + 2u32]).cast::<f32>();
+                acc =
+                    acc + (v3.cast::<f32>() * scale + bias) * load(input[xo + 3u32]).cast::<f32>();
+                acc =
+                    acc + (v4.cast::<f32>() * scale + bias) * load(input[xo + 4u32]).cast::<f32>();
+                acc =
+                    acc + (v5.cast::<f32>() * scale + bias) * load(input[xo + 5u32]).cast::<f32>();
+                acc =
+                    acc + (v6.cast::<f32>() * scale + bias) * load(input[xo + 6u32]).cast::<f32>();
+                acc =
+                    acc + (v7.cast::<f32>() * scale + bias) * load(input[xo + 7u32]).cast::<f32>();
 
-            // Chunk 1 — byte 3 of u0, bytes 0,1 of u1
-            let v8 = (u0 >> 24u32) & 7u32;
-            let v9 = (u0 >> 27u32) & 7u32;
-            let v10 = ((u0 >> 30u32) & 3u32) | ((u1 & 1u32) << 2u32);
-            let v11 = (u1 >> 1u32) & 7u32;
-            let v12 = (u1 >> 4u32) & 7u32;
-            let v13 = ((u1 >> 7u32) & 1u32) | (((u1 >> 8u32) & 3u32) << 1u32);
-            let v14 = (u1 >> 10u32) & 7u32;
-            let v15 = (u1 >> 13u32) & 7u32;
-            acc = acc + (v8.cast::<f32>() * scale + bias) * load(input[xo + 8u32]).cast::<f32>();
-            acc = acc + (v9.cast::<f32>() * scale + bias) * load(input[xo + 9u32]).cast::<f32>();
-            acc = acc + (v10.cast::<f32>() * scale + bias) * load(input[xo + 10u32]).cast::<f32>();
-            acc = acc + (v11.cast::<f32>() * scale + bias) * load(input[xo + 11u32]).cast::<f32>();
-            acc = acc + (v12.cast::<f32>() * scale + bias) * load(input[xo + 12u32]).cast::<f32>();
-            acc = acc + (v13.cast::<f32>() * scale + bias) * load(input[xo + 13u32]).cast::<f32>();
-            acc = acc + (v14.cast::<f32>() * scale + bias) * load(input[xo + 14u32]).cast::<f32>();
-            acc = acc + (v15.cast::<f32>() * scale + bias) * load(input[xo + 15u32]).cast::<f32>();
+                // Chunk 1 — byte 3 of u0, bytes 0,1 of u1
+                let v8 = (u0 >> 24u32) & 7u32;
+                let v9 = (u0 >> 27u32) & 7u32;
+                let v10 = ((u0 >> 30u32) & 3u32) | ((u1 & 1u32) << 2u32);
+                let v11 = (u1 >> 1u32) & 7u32;
+                let v12 = (u1 >> 4u32) & 7u32;
+                let v13 = ((u1 >> 7u32) & 1u32) | (((u1 >> 8u32) & 3u32) << 1u32);
+                let v14 = (u1 >> 10u32) & 7u32;
+                let v15 = (u1 >> 13u32) & 7u32;
+                acc =
+                    acc + (v8.cast::<f32>() * scale + bias) * load(input[xo + 8u32]).cast::<f32>();
+                acc =
+                    acc + (v9.cast::<f32>() * scale + bias) * load(input[xo + 9u32]).cast::<f32>();
+                acc = acc
+                    + (v10.cast::<f32>() * scale + bias) * load(input[xo + 10u32]).cast::<f32>();
+                acc = acc
+                    + (v11.cast::<f32>() * scale + bias) * load(input[xo + 11u32]).cast::<f32>();
+                acc = acc
+                    + (v12.cast::<f32>() * scale + bias) * load(input[xo + 12u32]).cast::<f32>();
+                acc = acc
+                    + (v13.cast::<f32>() * scale + bias) * load(input[xo + 13u32]).cast::<f32>();
+                acc = acc
+                    + (v14.cast::<f32>() * scale + bias) * load(input[xo + 14u32]).cast::<f32>();
+                acc = acc
+                    + (v15.cast::<f32>() * scale + bias) * load(input[xo + 15u32]).cast::<f32>();
 
-            // Chunk 2 — bytes 2,3 of u1, byte 0 of u2
-            let v16 = (u1 >> 16u32) & 7u32;
-            let v17 = (u1 >> 19u32) & 7u32;
-            let v18 = ((u1 >> 22u32) & 3u32) | (((u1 >> 24u32) & 1u32) << 2u32);
-            let v19 = (u1 >> 25u32) & 7u32;
-            let v20 = (u1 >> 28u32) & 7u32;
-            let v21 = ((u1 >> 31u32) & 1u32) | ((u2 & 3u32) << 1u32);
-            let v22 = (u2 >> 2u32) & 7u32;
-            let v23 = (u2 >> 5u32) & 7u32;
-            acc = acc + (v16.cast::<f32>() * scale + bias) * load(input[xo + 16u32]).cast::<f32>();
-            acc = acc + (v17.cast::<f32>() * scale + bias) * load(input[xo + 17u32]).cast::<f32>();
-            acc = acc + (v18.cast::<f32>() * scale + bias) * load(input[xo + 18u32]).cast::<f32>();
-            acc = acc + (v19.cast::<f32>() * scale + bias) * load(input[xo + 19u32]).cast::<f32>();
-            acc = acc + (v20.cast::<f32>() * scale + bias) * load(input[xo + 20u32]).cast::<f32>();
-            acc = acc + (v21.cast::<f32>() * scale + bias) * load(input[xo + 21u32]).cast::<f32>();
-            acc = acc + (v22.cast::<f32>() * scale + bias) * load(input[xo + 22u32]).cast::<f32>();
-            acc = acc + (v23.cast::<f32>() * scale + bias) * load(input[xo + 23u32]).cast::<f32>();
+                // Chunk 2 — bytes 2,3 of u1, byte 0 of u2
+                let v16 = (u1 >> 16u32) & 7u32;
+                let v17 = (u1 >> 19u32) & 7u32;
+                let v18 = ((u1 >> 22u32) & 3u32) | (((u1 >> 24u32) & 1u32) << 2u32);
+                let v19 = (u1 >> 25u32) & 7u32;
+                let v20 = (u1 >> 28u32) & 7u32;
+                let v21 = ((u1 >> 31u32) & 1u32) | ((u2 & 3u32) << 1u32);
+                let v22 = (u2 >> 2u32) & 7u32;
+                let v23 = (u2 >> 5u32) & 7u32;
+                acc = acc
+                    + (v16.cast::<f32>() * scale + bias) * load(input[xo + 16u32]).cast::<f32>();
+                acc = acc
+                    + (v17.cast::<f32>() * scale + bias) * load(input[xo + 17u32]).cast::<f32>();
+                acc = acc
+                    + (v18.cast::<f32>() * scale + bias) * load(input[xo + 18u32]).cast::<f32>();
+                acc = acc
+                    + (v19.cast::<f32>() * scale + bias) * load(input[xo + 19u32]).cast::<f32>();
+                acc = acc
+                    + (v20.cast::<f32>() * scale + bias) * load(input[xo + 20u32]).cast::<f32>();
+                acc = acc
+                    + (v21.cast::<f32>() * scale + bias) * load(input[xo + 21u32]).cast::<f32>();
+                acc = acc
+                    + (v22.cast::<f32>() * scale + bias) * load(input[xo + 22u32]).cast::<f32>();
+                acc = acc
+                    + (v23.cast::<f32>() * scale + bias) * load(input[xo + 23u32]).cast::<f32>();
 
-            // Chunk 3 — bytes 1,2,3 of u2
-            let v24 = (u2 >> 8u32) & 7u32;
-            let v25 = (u2 >> 11u32) & 7u32;
-            let v26 = ((u2 >> 14u32) & 3u32) | (((u2 >> 16u32) & 1u32) << 2u32);
-            let v27 = (u2 >> 17u32) & 7u32;
-            let v28 = (u2 >> 20u32) & 7u32;
-            let v29 = ((u2 >> 23u32) & 1u32) | (((u2 >> 24u32) & 3u32) << 1u32);
-            let v30 = (u2 >> 26u32) & 7u32;
-            let v31 = (u2 >> 29u32) & 7u32;
-            acc = acc + (v24.cast::<f32>() * scale + bias) * load(input[xo + 24u32]).cast::<f32>();
-            acc = acc + (v25.cast::<f32>() * scale + bias) * load(input[xo + 25u32]).cast::<f32>();
-            acc = acc + (v26.cast::<f32>() * scale + bias) * load(input[xo + 26u32]).cast::<f32>();
-            acc = acc + (v27.cast::<f32>() * scale + bias) * load(input[xo + 27u32]).cast::<f32>();
-            acc = acc + (v28.cast::<f32>() * scale + bias) * load(input[xo + 28u32]).cast::<f32>();
-            acc = acc + (v29.cast::<f32>() * scale + bias) * load(input[xo + 29u32]).cast::<f32>();
-            acc = acc + (v30.cast::<f32>() * scale + bias) * load(input[xo + 30u32]).cast::<f32>();
-            acc = acc + (v31.cast::<f32>() * scale + bias) * load(input[xo + 31u32]).cast::<f32>();
+                // Chunk 3 — bytes 1,2,3 of u2
+                let v24 = (u2 >> 8u32) & 7u32;
+                let v25 = (u2 >> 11u32) & 7u32;
+                let v26 = ((u2 >> 14u32) & 3u32) | (((u2 >> 16u32) & 1u32) << 2u32);
+                let v27 = (u2 >> 17u32) & 7u32;
+                let v28 = (u2 >> 20u32) & 7u32;
+                let v29 = ((u2 >> 23u32) & 1u32) | (((u2 >> 24u32) & 3u32) << 1u32);
+                let v30 = (u2 >> 26u32) & 7u32;
+                let v31 = (u2 >> 29u32) & 7u32;
+                acc = acc
+                    + (v24.cast::<f32>() * scale + bias) * load(input[xo + 24u32]).cast::<f32>();
+                acc = acc
+                    + (v25.cast::<f32>() * scale + bias) * load(input[xo + 25u32]).cast::<f32>();
+                acc = acc
+                    + (v26.cast::<f32>() * scale + bias) * load(input[xo + 26u32]).cast::<f32>();
+                acc = acc
+                    + (v27.cast::<f32>() * scale + bias) * load(input[xo + 27u32]).cast::<f32>();
+                acc = acc
+                    + (v28.cast::<f32>() * scale + bias) * load(input[xo + 28u32]).cast::<f32>();
+                acc = acc
+                    + (v29.cast::<f32>() * scale + bias) * load(input[xo + 29u32]).cast::<f32>();
+                acc = acc
+                    + (v30.cast::<f32>() * scale + bias) * load(input[xo + 30u32]).cast::<f32>();
+                acc = acc
+                    + (v31.cast::<f32>() * scale + bias) * load(input[xo + 31u32]).cast::<f32>();
+            }
         }
-      }
     }
 
     let total = reduce_sum(acc);
@@ -1204,9 +1224,9 @@ fn dequant_gather_int3<T>(
     let g = d / group_size;
     let row_u32_off = token_id * u32_per_row;
 
-    let chunk_idx = d / 8u32;            // which 8-value chunk
-    let intra = d & 7u32;                // which value within the chunk
-    let byte_off = chunk_idx * 3u32;     // 3 bytes per chunk
+    let chunk_idx = d / 8u32; // which 8-value chunk
+    let intra = d & 7u32; // which value within the chunk
+    let byte_off = chunk_idx * 3u32; // 3 bytes per chunk
 
     let u_idx0 = byte_off / 4u32;
     let u0 = load(weight[row_u32_off + u_idx0]);
@@ -1275,96 +1295,128 @@ fn dequant_gemv_int5<T>(
 
     let g_iters = (n_groups + lsize - 1u32) / lsize;
     for g_iter in range(0u32, g_iters, 1u32) {
-      let g = g_iter * lsize + tid;
-      if g < n_groups {
-        let scale = load(scales[row_group_off + g]).cast::<f32>();
-        let bias = load(biases[row_group_off + g]).cast::<f32>();
-        let g_start = g * group_size;
-        let g_u32_off = row_u32_off + g * u32_per_group;
-        let cycles = group_size / 32u32;
+        let g = g_iter * lsize + tid;
+        if g < n_groups {
+            let scale = load(scales[row_group_off + g]).cast::<f32>();
+            let bias = load(biases[row_group_off + g]).cast::<f32>();
+            let g_start = g * group_size;
+            let g_u32_off = row_u32_off + g * u32_per_group;
+            let cycles = group_size / 32u32;
 
-        for c in range(0u32, cycles, 1u32) {
-            let cy = g_u32_off + c * 5u32;
-            let u0 = load(weight[cy]);
-            let u1 = load(weight[cy + 1u32]);
-            let u2 = load(weight[cy + 2u32]);
-            let u3 = load(weight[cy + 3u32]);
-            let u4 = load(weight[cy + 4u32]);
-            let xo = g_start + c * 32u32;
+            for c in range(0u32, cycles, 1u32) {
+                let cy = g_u32_off + c * 5u32;
+                let u0 = load(weight[cy]);
+                let u1 = load(weight[cy + 1u32]);
+                let u2 = load(weight[cy + 2u32]);
+                let u3 = load(weight[cy + 3u32]);
+                let u4 = load(weight[cy + 4u32]);
+                let xo = g_start + c * 32u32;
 
-            // Chunk 0 — u0 bytes 0-3 + u1 byte 0
-            let v0 = u0 & 31u32;
-            let v1 = ((u0 >> 5u32) & 7u32) | (((u0 >> 8u32) & 3u32) << 3u32);
-            let v2 = (u0 >> 10u32) & 31u32;
-            let v3 = ((u0 >> 15u32) & 1u32) | (((u0 >> 16u32) & 15u32) << 1u32);
-            let v4 = ((u0 >> 20u32) & 15u32) | (((u0 >> 24u32) & 1u32) << 4u32);
-            let v5 = (u0 >> 25u32) & 31u32;
-            let v6 = ((u0 >> 30u32) & 3u32) | ((u1 & 7u32) << 2u32);
-            let v7 = (u1 >> 3u32) & 31u32;
-            acc = acc + (v0.cast::<f32>() * scale + bias) * load(input[xo + 0u32]).cast::<f32>();
-            acc = acc + (v1.cast::<f32>() * scale + bias) * load(input[xo + 1u32]).cast::<f32>();
-            acc = acc + (v2.cast::<f32>() * scale + bias) * load(input[xo + 2u32]).cast::<f32>();
-            acc = acc + (v3.cast::<f32>() * scale + bias) * load(input[xo + 3u32]).cast::<f32>();
-            acc = acc + (v4.cast::<f32>() * scale + bias) * load(input[xo + 4u32]).cast::<f32>();
-            acc = acc + (v5.cast::<f32>() * scale + bias) * load(input[xo + 5u32]).cast::<f32>();
-            acc = acc + (v6.cast::<f32>() * scale + bias) * load(input[xo + 6u32]).cast::<f32>();
-            acc = acc + (v7.cast::<f32>() * scale + bias) * load(input[xo + 7u32]).cast::<f32>();
+                // Chunk 0 — u0 bytes 0-3 + u1 byte 0
+                let v0 = u0 & 31u32;
+                let v1 = ((u0 >> 5u32) & 7u32) | (((u0 >> 8u32) & 3u32) << 3u32);
+                let v2 = (u0 >> 10u32) & 31u32;
+                let v3 = ((u0 >> 15u32) & 1u32) | (((u0 >> 16u32) & 15u32) << 1u32);
+                let v4 = ((u0 >> 20u32) & 15u32) | (((u0 >> 24u32) & 1u32) << 4u32);
+                let v5 = (u0 >> 25u32) & 31u32;
+                let v6 = ((u0 >> 30u32) & 3u32) | ((u1 & 7u32) << 2u32);
+                let v7 = (u1 >> 3u32) & 31u32;
+                acc =
+                    acc + (v0.cast::<f32>() * scale + bias) * load(input[xo + 0u32]).cast::<f32>();
+                acc =
+                    acc + (v1.cast::<f32>() * scale + bias) * load(input[xo + 1u32]).cast::<f32>();
+                acc =
+                    acc + (v2.cast::<f32>() * scale + bias) * load(input[xo + 2u32]).cast::<f32>();
+                acc =
+                    acc + (v3.cast::<f32>() * scale + bias) * load(input[xo + 3u32]).cast::<f32>();
+                acc =
+                    acc + (v4.cast::<f32>() * scale + bias) * load(input[xo + 4u32]).cast::<f32>();
+                acc =
+                    acc + (v5.cast::<f32>() * scale + bias) * load(input[xo + 5u32]).cast::<f32>();
+                acc =
+                    acc + (v6.cast::<f32>() * scale + bias) * load(input[xo + 6u32]).cast::<f32>();
+                acc =
+                    acc + (v7.cast::<f32>() * scale + bias) * load(input[xo + 7u32]).cast::<f32>();
 
-            // Chunk 1 — u1 bytes 1-3 + u2 bytes 0-1
-            let w0 = (u1 >> 8u32) & 31u32;
-            let w1 = ((u1 >> 13u32) & 7u32) | (((u1 >> 16u32) & 3u32) << 3u32);
-            let w2 = (u1 >> 18u32) & 31u32;
-            let w3 = ((u1 >> 23u32) & 1u32) | (((u1 >> 24u32) & 15u32) << 1u32);
-            let w4 = ((u1 >> 28u32) & 15u32) | ((u2 & 1u32) << 4u32);
-            let w5 = (u2 >> 1u32) & 31u32;
-            let w6 = ((u2 >> 6u32) & 3u32) | (((u2 >> 8u32) & 7u32) << 2u32);
-            let w7 = (u2 >> 11u32) & 31u32;
-            acc = acc + (w0.cast::<f32>() * scale + bias) * load(input[xo + 8u32]).cast::<f32>();
-            acc = acc + (w1.cast::<f32>() * scale + bias) * load(input[xo + 9u32]).cast::<f32>();
-            acc = acc + (w2.cast::<f32>() * scale + bias) * load(input[xo + 10u32]).cast::<f32>();
-            acc = acc + (w3.cast::<f32>() * scale + bias) * load(input[xo + 11u32]).cast::<f32>();
-            acc = acc + (w4.cast::<f32>() * scale + bias) * load(input[xo + 12u32]).cast::<f32>();
-            acc = acc + (w5.cast::<f32>() * scale + bias) * load(input[xo + 13u32]).cast::<f32>();
-            acc = acc + (w6.cast::<f32>() * scale + bias) * load(input[xo + 14u32]).cast::<f32>();
-            acc = acc + (w7.cast::<f32>() * scale + bias) * load(input[xo + 15u32]).cast::<f32>();
+                // Chunk 1 — u1 bytes 1-3 + u2 bytes 0-1
+                let w0 = (u1 >> 8u32) & 31u32;
+                let w1 = ((u1 >> 13u32) & 7u32) | (((u1 >> 16u32) & 3u32) << 3u32);
+                let w2 = (u1 >> 18u32) & 31u32;
+                let w3 = ((u1 >> 23u32) & 1u32) | (((u1 >> 24u32) & 15u32) << 1u32);
+                let w4 = ((u1 >> 28u32) & 15u32) | ((u2 & 1u32) << 4u32);
+                let w5 = (u2 >> 1u32) & 31u32;
+                let w6 = ((u2 >> 6u32) & 3u32) | (((u2 >> 8u32) & 7u32) << 2u32);
+                let w7 = (u2 >> 11u32) & 31u32;
+                acc =
+                    acc + (w0.cast::<f32>() * scale + bias) * load(input[xo + 8u32]).cast::<f32>();
+                acc =
+                    acc + (w1.cast::<f32>() * scale + bias) * load(input[xo + 9u32]).cast::<f32>();
+                acc =
+                    acc + (w2.cast::<f32>() * scale + bias) * load(input[xo + 10u32]).cast::<f32>();
+                acc =
+                    acc + (w3.cast::<f32>() * scale + bias) * load(input[xo + 11u32]).cast::<f32>();
+                acc =
+                    acc + (w4.cast::<f32>() * scale + bias) * load(input[xo + 12u32]).cast::<f32>();
+                acc =
+                    acc + (w5.cast::<f32>() * scale + bias) * load(input[xo + 13u32]).cast::<f32>();
+                acc =
+                    acc + (w6.cast::<f32>() * scale + bias) * load(input[xo + 14u32]).cast::<f32>();
+                acc =
+                    acc + (w7.cast::<f32>() * scale + bias) * load(input[xo + 15u32]).cast::<f32>();
 
-            // Chunk 2 — u2 bytes 2-3 + u3 bytes 0-2
-            let x0 = (u2 >> 16u32) & 31u32;
-            let x1 = ((u2 >> 21u32) & 7u32) | (((u2 >> 24u32) & 3u32) << 3u32);
-            let x2 = (u2 >> 26u32) & 31u32;
-            let x3 = ((u2 >> 31u32) & 1u32) | ((u3 & 15u32) << 1u32);
-            let x4 = ((u3 >> 4u32) & 15u32) | (((u3 >> 8u32) & 1u32) << 4u32);
-            let x5 = (u3 >> 9u32) & 31u32;
-            let x6 = ((u3 >> 14u32) & 3u32) | (((u3 >> 16u32) & 7u32) << 2u32);
-            let x7 = (u3 >> 19u32) & 31u32;
-            acc = acc + (x0.cast::<f32>() * scale + bias) * load(input[xo + 16u32]).cast::<f32>();
-            acc = acc + (x1.cast::<f32>() * scale + bias) * load(input[xo + 17u32]).cast::<f32>();
-            acc = acc + (x2.cast::<f32>() * scale + bias) * load(input[xo + 18u32]).cast::<f32>();
-            acc = acc + (x3.cast::<f32>() * scale + bias) * load(input[xo + 19u32]).cast::<f32>();
-            acc = acc + (x4.cast::<f32>() * scale + bias) * load(input[xo + 20u32]).cast::<f32>();
-            acc = acc + (x5.cast::<f32>() * scale + bias) * load(input[xo + 21u32]).cast::<f32>();
-            acc = acc + (x6.cast::<f32>() * scale + bias) * load(input[xo + 22u32]).cast::<f32>();
-            acc = acc + (x7.cast::<f32>() * scale + bias) * load(input[xo + 23u32]).cast::<f32>();
+                // Chunk 2 — u2 bytes 2-3 + u3 bytes 0-2
+                let x0 = (u2 >> 16u32) & 31u32;
+                let x1 = ((u2 >> 21u32) & 7u32) | (((u2 >> 24u32) & 3u32) << 3u32);
+                let x2 = (u2 >> 26u32) & 31u32;
+                let x3 = ((u2 >> 31u32) & 1u32) | ((u3 & 15u32) << 1u32);
+                let x4 = ((u3 >> 4u32) & 15u32) | (((u3 >> 8u32) & 1u32) << 4u32);
+                let x5 = (u3 >> 9u32) & 31u32;
+                let x6 = ((u3 >> 14u32) & 3u32) | (((u3 >> 16u32) & 7u32) << 2u32);
+                let x7 = (u3 >> 19u32) & 31u32;
+                acc =
+                    acc + (x0.cast::<f32>() * scale + bias) * load(input[xo + 16u32]).cast::<f32>();
+                acc =
+                    acc + (x1.cast::<f32>() * scale + bias) * load(input[xo + 17u32]).cast::<f32>();
+                acc =
+                    acc + (x2.cast::<f32>() * scale + bias) * load(input[xo + 18u32]).cast::<f32>();
+                acc =
+                    acc + (x3.cast::<f32>() * scale + bias) * load(input[xo + 19u32]).cast::<f32>();
+                acc =
+                    acc + (x4.cast::<f32>() * scale + bias) * load(input[xo + 20u32]).cast::<f32>();
+                acc =
+                    acc + (x5.cast::<f32>() * scale + bias) * load(input[xo + 21u32]).cast::<f32>();
+                acc =
+                    acc + (x6.cast::<f32>() * scale + bias) * load(input[xo + 22u32]).cast::<f32>();
+                acc =
+                    acc + (x7.cast::<f32>() * scale + bias) * load(input[xo + 23u32]).cast::<f32>();
 
-            // Chunk 3 — u3 byte 3 + u4 bytes 0-3
-            let y0 = (u3 >> 24u32) & 31u32;
-            let y1 = ((u3 >> 29u32) & 7u32) | ((u4 & 3u32) << 3u32);
-            let y2 = (u4 >> 2u32) & 31u32;
-            let y3 = ((u4 >> 7u32) & 1u32) | (((u4 >> 8u32) & 15u32) << 1u32);
-            let y4 = ((u4 >> 12u32) & 15u32) | (((u4 >> 16u32) & 1u32) << 4u32);
-            let y5 = (u4 >> 17u32) & 31u32;
-            let y6 = ((u4 >> 22u32) & 3u32) | (((u4 >> 24u32) & 7u32) << 2u32);
-            let y7 = (u4 >> 27u32) & 31u32;
-            acc = acc + (y0.cast::<f32>() * scale + bias) * load(input[xo + 24u32]).cast::<f32>();
-            acc = acc + (y1.cast::<f32>() * scale + bias) * load(input[xo + 25u32]).cast::<f32>();
-            acc = acc + (y2.cast::<f32>() * scale + bias) * load(input[xo + 26u32]).cast::<f32>();
-            acc = acc + (y3.cast::<f32>() * scale + bias) * load(input[xo + 27u32]).cast::<f32>();
-            acc = acc + (y4.cast::<f32>() * scale + bias) * load(input[xo + 28u32]).cast::<f32>();
-            acc = acc + (y5.cast::<f32>() * scale + bias) * load(input[xo + 29u32]).cast::<f32>();
-            acc = acc + (y6.cast::<f32>() * scale + bias) * load(input[xo + 30u32]).cast::<f32>();
-            acc = acc + (y7.cast::<f32>() * scale + bias) * load(input[xo + 31u32]).cast::<f32>();
+                // Chunk 3 — u3 byte 3 + u4 bytes 0-3
+                let y0 = (u3 >> 24u32) & 31u32;
+                let y1 = ((u3 >> 29u32) & 7u32) | ((u4 & 3u32) << 3u32);
+                let y2 = (u4 >> 2u32) & 31u32;
+                let y3 = ((u4 >> 7u32) & 1u32) | (((u4 >> 8u32) & 15u32) << 1u32);
+                let y4 = ((u4 >> 12u32) & 15u32) | (((u4 >> 16u32) & 1u32) << 4u32);
+                let y5 = (u4 >> 17u32) & 31u32;
+                let y6 = ((u4 >> 22u32) & 3u32) | (((u4 >> 24u32) & 7u32) << 2u32);
+                let y7 = (u4 >> 27u32) & 31u32;
+                acc =
+                    acc + (y0.cast::<f32>() * scale + bias) * load(input[xo + 24u32]).cast::<f32>();
+                acc =
+                    acc + (y1.cast::<f32>() * scale + bias) * load(input[xo + 25u32]).cast::<f32>();
+                acc =
+                    acc + (y2.cast::<f32>() * scale + bias) * load(input[xo + 26u32]).cast::<f32>();
+                acc =
+                    acc + (y3.cast::<f32>() * scale + bias) * load(input[xo + 27u32]).cast::<f32>();
+                acc =
+                    acc + (y4.cast::<f32>() * scale + bias) * load(input[xo + 28u32]).cast::<f32>();
+                acc =
+                    acc + (y5.cast::<f32>() * scale + bias) * load(input[xo + 29u32]).cast::<f32>();
+                acc =
+                    acc + (y6.cast::<f32>() * scale + bias) * load(input[xo + 30u32]).cast::<f32>();
+                acc =
+                    acc + (y7.cast::<f32>() * scale + bias) * load(input[xo + 31u32]).cast::<f32>();
+            }
         }
-      }
     }
 
     let total = reduce_sum(acc);
@@ -1396,7 +1448,7 @@ fn dequant_gather_int5<T>(
 
     let chunk_idx = d / 8u32;
     let intra = d & 7u32;
-    let byte_off = chunk_idx * 5u32;     // 5 bytes per chunk
+    let byte_off = chunk_idx * 5u32; // 5 bytes per chunk
 
     // 5 consecutive bytes can span at most 2 uint32. Read both.
     let u_idx0 = byte_off / 4u32;
@@ -1566,40 +1618,56 @@ fn dequant_gemv_int6<T>(
                 let p0v1 = ((u0 >> 6u32) & 3u32) | (((u0 >> 8u32) & 15u32) << 2u32);
                 let p0v2 = ((u0 >> 12u32) & 15u32) | (((u0 >> 16u32) & 3u32) << 4u32);
                 let p0v3 = (u0 >> 18u32) & 63u32;
-                acc = acc + (p0v0.cast::<f32>() * scale + bias) * load(input[xo + 0u32]).cast::<f32>();
-                acc = acc + (p0v1.cast::<f32>() * scale + bias) * load(input[xo + 1u32]).cast::<f32>();
-                acc = acc + (p0v2.cast::<f32>() * scale + bias) * load(input[xo + 2u32]).cast::<f32>();
-                acc = acc + (p0v3.cast::<f32>() * scale + bias) * load(input[xo + 3u32]).cast::<f32>();
+                acc = acc
+                    + (p0v0.cast::<f32>() * scale + bias) * load(input[xo + 0u32]).cast::<f32>();
+                acc = acc
+                    + (p0v1.cast::<f32>() * scale + bias) * load(input[xo + 1u32]).cast::<f32>();
+                acc = acc
+                    + (p0v2.cast::<f32>() * scale + bias) * load(input[xo + 2u32]).cast::<f32>();
+                acc = acc
+                    + (p0v3.cast::<f32>() * scale + bias) * load(input[xo + 3u32]).cast::<f32>();
 
                 // Pack 1 — byte 3 of u0, bytes 0,1 of u1
                 let p1v0 = (u0 >> 24u32) & 63u32;
                 let p1v1 = ((u0 >> 30u32) & 3u32) | ((u1 & 15u32) << 2u32);
                 let p1v2 = ((u1 >> 4u32) & 15u32) | (((u1 >> 8u32) & 3u32) << 4u32);
                 let p1v3 = (u1 >> 10u32) & 63u32;
-                acc = acc + (p1v0.cast::<f32>() * scale + bias) * load(input[xo + 4u32]).cast::<f32>();
-                acc = acc + (p1v1.cast::<f32>() * scale + bias) * load(input[xo + 5u32]).cast::<f32>();
-                acc = acc + (p1v2.cast::<f32>() * scale + bias) * load(input[xo + 6u32]).cast::<f32>();
-                acc = acc + (p1v3.cast::<f32>() * scale + bias) * load(input[xo + 7u32]).cast::<f32>();
+                acc = acc
+                    + (p1v0.cast::<f32>() * scale + bias) * load(input[xo + 4u32]).cast::<f32>();
+                acc = acc
+                    + (p1v1.cast::<f32>() * scale + bias) * load(input[xo + 5u32]).cast::<f32>();
+                acc = acc
+                    + (p1v2.cast::<f32>() * scale + bias) * load(input[xo + 6u32]).cast::<f32>();
+                acc = acc
+                    + (p1v3.cast::<f32>() * scale + bias) * load(input[xo + 7u32]).cast::<f32>();
 
                 // Pack 2 — bytes 2,3 of u1, byte 0 of u2
                 let p2v0 = (u1 >> 16u32) & 63u32;
                 let p2v1 = ((u1 >> 22u32) & 3u32) | (((u1 >> 24u32) & 15u32) << 2u32);
                 let p2v2 = ((u1 >> 28u32) & 15u32) | ((u2 & 3u32) << 4u32);
                 let p2v3 = (u2 >> 2u32) & 63u32;
-                acc = acc + (p2v0.cast::<f32>() * scale + bias) * load(input[xo + 8u32]).cast::<f32>();
-                acc = acc + (p2v1.cast::<f32>() * scale + bias) * load(input[xo + 9u32]).cast::<f32>();
-                acc = acc + (p2v2.cast::<f32>() * scale + bias) * load(input[xo + 10u32]).cast::<f32>();
-                acc = acc + (p2v3.cast::<f32>() * scale + bias) * load(input[xo + 11u32]).cast::<f32>();
+                acc = acc
+                    + (p2v0.cast::<f32>() * scale + bias) * load(input[xo + 8u32]).cast::<f32>();
+                acc = acc
+                    + (p2v1.cast::<f32>() * scale + bias) * load(input[xo + 9u32]).cast::<f32>();
+                acc = acc
+                    + (p2v2.cast::<f32>() * scale + bias) * load(input[xo + 10u32]).cast::<f32>();
+                acc = acc
+                    + (p2v3.cast::<f32>() * scale + bias) * load(input[xo + 11u32]).cast::<f32>();
 
                 // Pack 3 — bytes 1,2,3 of u2
                 let p3v0 = (u2 >> 8u32) & 63u32;
                 let p3v1 = ((u2 >> 14u32) & 3u32) | (((u2 >> 16u32) & 15u32) << 2u32);
                 let p3v2 = ((u2 >> 20u32) & 15u32) | (((u2 >> 24u32) & 3u32) << 4u32);
                 let p3v3 = (u2 >> 26u32) & 63u32;
-                acc = acc + (p3v0.cast::<f32>() * scale + bias) * load(input[xo + 12u32]).cast::<f32>();
-                acc = acc + (p3v1.cast::<f32>() * scale + bias) * load(input[xo + 13u32]).cast::<f32>();
-                acc = acc + (p3v2.cast::<f32>() * scale + bias) * load(input[xo + 14u32]).cast::<f32>();
-                acc = acc + (p3v3.cast::<f32>() * scale + bias) * load(input[xo + 15u32]).cast::<f32>();
+                acc = acc
+                    + (p3v0.cast::<f32>() * scale + bias) * load(input[xo + 12u32]).cast::<f32>();
+                acc = acc
+                    + (p3v1.cast::<f32>() * scale + bias) * load(input[xo + 13u32]).cast::<f32>();
+                acc = acc
+                    + (p3v2.cast::<f32>() * scale + bias) * load(input[xo + 14u32]).cast::<f32>();
+                acc = acc
+                    + (p3v3.cast::<f32>() * scale + bias) * load(input[xo + 15u32]).cast::<f32>();
             }
         }
     }
@@ -2105,8 +2173,7 @@ fn main() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("generate MSL for {}: {:?}", kernel.name, e))?;
 
         let metal_path = kernels_dir.join(format!("{}.metal", kernel.name));
-        fs::write(&metal_path, &msl)
-            .with_context(|| format!("write {}", metal_path.display()))?;
+        fs::write(&metal_path, &msl).with_context(|| format!("write {}", metal_path.display()))?;
         println!("  wrote {}", metal_path.display());
 
         manifest_entries.push(kernel_to_manifest(kernel));
@@ -2255,12 +2322,7 @@ fn emit_swift_wrapper(out: &mut String, k: &KernelManifest) {
     writeln!(out, "        threadgroupSize: MTLSize,").ok();
     writeln!(out, "        on commandBuffer: MTLCommandBuffer").ok();
     writeln!(out, "    ) {{").ok();
-    writeln!(
-        out,
-        "        let pso = PSOCache.shared.pipelineState(for: \"{}\")",
-        k.name
-    )
-    .ok();
+    writeln!(out, "        let pso = PSOCache.shared.pipelineState(for: \"{}\")", k.name).ok();
     writeln!(
         out,
         "        guard let enc = commandBuffer.makeComputeCommandEncoder() else {{ return }}"
@@ -2271,32 +2333,21 @@ fn emit_swift_wrapper(out: &mut String, k: &KernelManifest) {
     let mut slot = 0usize;
     for p in &k.params {
         let label = swift_safe_name(&p.name);
-        writeln!(
-            out,
-            "        enc.setBuffer({label}, offset: {label}Offset, index: {slot})"
-        )
-        .ok();
+        writeln!(out, "        enc.setBuffer({label}, offset: {label}Offset, index: {slot})").ok();
         slot += 1;
     }
     for c in &k.constexprs {
         let label = swift_safe_name(&c.name);
         let len = swift_scalar_size(&c.dtype);
         writeln!(out, "        var {label}_v = {label}").ok();
-        writeln!(
-            out,
-            "        enc.setBytes(&{label}_v, length: {len}, index: {slot})"
-        )
-        .ok();
+        writeln!(out, "        enc.setBytes(&{label}_v, length: {len}, index: {slot})").ok();
         slot += 1;
     }
-        // dispatchThreads (in threads, not threadgroups) so out-of-bound
-        // threads aren't created and the kernel doesn't need bounds checks.
-        // Requires Metal 2.0 non-uniform threadgroup support (M-series ✓).
-    writeln!(
-        out,
-        "        enc.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)"
-    )
-    .ok();
+    // dispatchThreads (in threads, not threadgroups) so out-of-bound
+    // threads aren't created and the kernel doesn't need bounds checks.
+    // Requires Metal 2.0 non-uniform threadgroup support (M-series ✓).
+    writeln!(out, "        enc.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)")
+        .ok();
     writeln!(out, "        enc.endEncoding()").ok();
     writeln!(out, "    }}\n").ok();
 }

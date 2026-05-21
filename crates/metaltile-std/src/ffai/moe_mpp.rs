@@ -83,8 +83,8 @@
 use std::collections::BTreeMap;
 
 use metaltile_core::{
-    dtype::DType,
     constexpr::ConstExpr,
+    dtype::DType,
     ir::{Block, BlockId, ConstExprDecl, Kernel, KernelMode, Op, Param, ParamKind, ValueId},
     shape::{Dim, Shape},
 };
@@ -410,16 +410,8 @@ pub fn kernel_ir_for(dt: DType) -> Kernel {
     // Threadgroup allocations. `xs` and `ws` are sized for ONE BK=16
     // K-chunk; `ys` is sized for the BM=16 × BN=32 output stage. Sizes
     // are in elements (not bytes).
-    body.push_op_no_result(Op::ThreadgroupAlloc {
-        dtype: dt,
-        size: 16 * 16,
-        name: "xs".into(),
-    });
-    body.push_op_no_result(Op::ThreadgroupAlloc {
-        dtype: dt,
-        size: 32 * 16,
-        name: "ws".into(),
-    });
+    body.push_op_no_result(Op::ThreadgroupAlloc { dtype: dt, size: 16 * 16, name: "xs".into() });
+    body.push_op_no_result(Op::ThreadgroupAlloc { dtype: dt, size: 32 * 16, name: "ws".into() });
     // fp32 staging for the cooperative_tensor `ct_c.store(...)`. The
     // store overload requires destination elem-type == accumulator type
     // (float here). We narrow to `{t}` during the coop-write to global.

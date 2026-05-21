@@ -1,3 +1,5 @@
+#![allow(clippy::manual_is_multiple_of)]
+
 //! GPU correctness for `ffai::moe_mpp_bm8::mt_moe_gather_qmm_mma_int4_bm8_mpp`.
 //!
 //! BM=8 MPP MoE kernel — same output semantics as the BM=16 / BM=64 siblings
@@ -20,8 +22,7 @@ use std::collections::BTreeMap;
 use common::{Dt, gpu_lock, pack_bytes, unpack_bytes};
 use metaltile_core::ir::KernelMode;
 use metaltile_runtime::Context;
-use metaltile_std::ffai::moe::mt_moe_gather_qmm_int4;
-use metaltile_std::ffai::moe_mpp_bm8;
+use metaltile_std::ffai::{moe::mt_moe_gather_qmm_int4, moe_mpp_bm8};
 
 /// Pack a row of int4 weights into uint32s (8 per uint, LSB-first per
 /// nibble). Same helper used by the bm16_mpp / bm64_mpp test files —
@@ -105,9 +106,8 @@ fn run_case(case: &Case) {
     // different coefficients so each case hits a different mix of
     // dequant bits.
     let total_weights = n_experts * n_out * k_in;
-    let weight_unpacked: Vec<u32> = (0..total_weights)
-        .map(|i| ((i as u32).wrapping_mul(13).wrapping_add(7)) & 0xf)
-        .collect();
+    let weight_unpacked: Vec<u32> =
+        (0..total_weights).map(|i| ((i as u32).wrapping_mul(13).wrapping_add(7)) & 0xf).collect();
     let weight_packed: Vec<u32> =
         weight_unpacked.chunks_exact(k_in).flat_map(pack_int4_row).collect();
     let groups_total = n_experts * n_out * (k_in / group_size);
@@ -225,18 +225,14 @@ fn run_case(case: &Case) {
 // 4 experts at 2 rows/expert).
 // ─────────────────────────────────────────────────────────────────────────
 #[test]
-fn bm8_f32_small_t8() {
-    run_case(&Case::new("f32_small_t8", 4, 8, 64, 64, 32, Dt::F32));
-}
+fn bm8_f32_small_t8() { run_case(&Case::new("f32_small_t8", 4, 8, 64, 64, 32, Dt::F32)); }
 
 // ─────────────────────────────────────────────────────────────────────────
 // Case 2: f16 small — same shape as case 1, f16 dtype. f16 quant
 // accumulation lands within the cosine envelope easily.
 // ─────────────────────────────────────────────────────────────────────────
 #[test]
-fn bm8_f16_small_t8() {
-    run_case(&Case::new("f16_small_t8", 4, 8, 64, 64, 32, Dt::F16));
-}
+fn bm8_f16_small_t8() { run_case(&Case::new("f16_small_t8", 4, 8, 64, 64, 32, Dt::F16)); }
 
 // ─────────────────────────────────────────────────────────────────────────
 // Case 3: bf16 small — same shape, bf16 dtype. bf16 has a 7-bit mantissa
@@ -257,9 +253,7 @@ fn bm8_bf16_small_t8() {
 // tgid_y) → different output regions, all must match m1).
 // ─────────────────────────────────────────────────────────────────────────
 #[test]
-fn bm8_f16_multi_tile() {
-    run_case(&Case::new("f16_multi_tile", 8, 16, 128, 128, 64, Dt::F16));
-}
+fn bm8_f16_multi_tile() { run_case(&Case::new("f16_multi_tile", 8, 16, 128, 128, 64, Dt::F16)); }
 
 // ─────────────────────────────────────────────────────────────────────────
 // Case 5: f16 ragged T (T=5) — not a multiple of BM=8. The last TG covers

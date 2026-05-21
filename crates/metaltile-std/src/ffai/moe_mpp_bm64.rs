@@ -154,7 +154,7 @@ const uint x_k_base = x_k_quad * 16u;
 //   pack_id     = lane_in_tg * 2 + pi   for pi in 0..2  (256 packs total)
 //   w_row       = pack_id / 4 ∈ 0..64   (BK=32 → 4 packs per N-row)
 //   pack_in_row = pack_id & 3 ∈ 0..4
-// Mask-without-shift dequant constants (matches mt_qmm_mma_mpp).
+// Mask-without-shift dequant constants (same pattern as the MPP qmm path).
 constexpr float s_16   = 0.0625f;
 constexpr float s_256  = 0.00390625f;
 constexpr float s_4096 = 0.000244140625f;

@@ -1,3 +1,5 @@
+#![allow(clippy::manual_is_multiple_of)]
+
 //! GPU correctness for `ffai::moe_mpp::mt_moe_gather_qmm_mma_int4_bm16_mpp`.
 //!
 //! This is the MPP (MetalPerformancePrimitives) MoE BGEMM — same algorithm
@@ -20,8 +22,7 @@ use std::collections::BTreeMap;
 use common::{Dt, gpu_lock, pack_bytes, unpack_bytes};
 use metaltile_core::ir::KernelMode;
 use metaltile_runtime::Context;
-use metaltile_std::ffai::moe::mt_moe_gather_qmm_int4;
-use metaltile_std::ffai::moe_mpp;
+use metaltile_std::ffai::{moe::mt_moe_gather_qmm_int4, moe_mpp};
 
 /// Pack a row of int4 weights into uint32s (8 per uint, LSB-first per nibble).
 /// Identical to the helper used by `moe_gather_qmm_gpu_correctness.rs` —

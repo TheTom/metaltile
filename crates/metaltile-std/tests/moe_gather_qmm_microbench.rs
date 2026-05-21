@@ -219,13 +219,37 @@ fn bench_qwen36_a3b_moe_layer_shape_f16() {
 
     for (k_in, m_out, label) in [(2048, 256, "gate/up"), (256, 2048, "down")] {
         let us_m8 = time_gather_qmm_vd(
-            &ctx, t_rows, k_in, m_out, n_experts, group_size, iters, Variant::M8, Dt::F16,
+            &ctx,
+            t_rows,
+            k_in,
+            m_out,
+            n_experts,
+            group_size,
+            iters,
+            Variant::M8,
+            Dt::F16,
         );
         let us_mma = time_gather_qmm_vd(
-            &ctx, t_rows, k_in, m_out, n_experts, group_size, iters, Variant::Mma, Dt::F16,
+            &ctx,
+            t_rows,
+            k_in,
+            m_out,
+            n_experts,
+            group_size,
+            iters,
+            Variant::Mma,
+            Dt::F16,
         );
         let us_bm16 = time_gather_qmm_vd(
-            &ctx, t_rows, k_in, m_out, n_experts, group_size, iters, Variant::MmaBm16, Dt::F16,
+            &ctx,
+            t_rows,
+            k_in,
+            m_out,
+            n_experts,
+            group_size,
+            iters,
+            Variant::MmaBm16,
+            Dt::F16,
         );
         let flops = (t_rows * m_out * k_in * 2) as f64;
         let gf_m8 = flops / us_m8 / 1e3;

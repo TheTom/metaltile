@@ -27,9 +27,8 @@
 //!   - `dt_bias`      : Tensor<T> [Hv]
 //!   - `a_raw`        : Tensor<T> [B, Hv]
 //!   - `b_raw`        : Tensor<T> [B, Hv]
-//!   - `q_norm_weight`: Tensor<T> [Hk·Dk]  — pass an all-1×scale vector
-//!                                            to recover the unweighted
-//!                                            `perHeadRMSNormScale35` path.
+//!   - `q_norm_weight`: Tensor<T> [Hk·Dk]  — pass an all-1×scale vector to
+//!     recover the unweighted `perHeadRMSNormScale35` path.
 //!   - `k_norm_weight`: Tensor<T> [Hk·Dk]
 //!   - `state_in`     : Tensor<T> [B, Hv, Dv, Dk]   (recurrence state)
 //!

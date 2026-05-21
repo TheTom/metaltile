@@ -1,3 +1,11 @@
+#![allow(
+    clippy::manual_is_multiple_of,
+    clippy::unnecessary_cast,
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    clippy::doc_lazy_continuation
+)]
+
 //! GPU correctness for `ffai::moe::mt_moe_gather_qmm_int4`.
 //!
 //! Matches MLX's `gatherQuantizedMM` (called by `SwitchLinear` →

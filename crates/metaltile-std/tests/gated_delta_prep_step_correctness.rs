@@ -1,3 +1,5 @@
+#![allow(clippy::type_complexity)]
+
 //! GPU correctness for `ffai::gated_delta_prep::mt_gated_delta_prep_step`.
 //!
 //! The fused kernel absorbs the host-side prep that
@@ -30,7 +32,6 @@
 //! macOS-gated, shared `gpu_lock` via `tests/common/`.
 
 #![cfg(target_os = "macos")]
-
 #![allow(clippy::too_many_arguments)]
 
 mod common;
@@ -62,11 +63,11 @@ fn sigmoid(x: f32) -> f32 { 1.0 / (1.0 + (-x).exp()) }
 /// in arithmetic. `q_norm_weight` / `k_norm_weight` are `[Hk·Dk]` —
 /// pass all-ones × scale to recover the unweighted path.
 fn cpu_prep(
-    conv_out: &[f32], // [B, 2·Hk·Dk + Hv·Dv]
-    a_log: &[f32],    // [Hv]
-    dt_bias: &[f32],  // [Hv]
-    a_raw: &[f32],    // [B, Hv]
-    b_raw: &[f32],    // [B, Hv]
+    conv_out: &[f32],      // [B, 2·Hk·Dk + Hv·Dv]
+    a_log: &[f32],         // [Hv]
+    dt_bias: &[f32],       // [Hv]
+    a_raw: &[f32],         // [B, Hv]
+    b_raw: &[f32],         // [B, Hv]
     q_norm_weight: &[f32], // [Hk·Dk]
     k_norm_weight: &[f32], // [Hk·Dk]
     b: usize,
@@ -200,7 +201,18 @@ fn cpu_fused_oracle(
     dk: usize,
 ) -> (Vec<f32>, Vec<f32>) {
     let (q, k, v, g, beta) = cpu_prep(
-        conv_out, a_log, dt_bias, a_raw, b_raw, q_norm_weight, k_norm_weight, b, hv, hk, dv, dk,
+        conv_out,
+        a_log,
+        dt_bias,
+        a_raw,
+        b_raw,
+        q_norm_weight,
+        k_norm_weight,
+        b,
+        hv,
+        hk,
+        dv,
+        dk,
     );
     cpu_step(&q, &k, &v, &g, &beta, state_in, b, hv, hk, dv, dk)
 }
@@ -310,9 +322,8 @@ fn make_fixture(
     seed_offset: usize,
 ) -> Fixture {
     let stride_b = 2 * hk * dk + hv * dv;
-    let conv_out: Vec<f32> = (0..b * stride_b)
-        .map(|i| (((i + seed_offset) as f32) * 0.0131).sin() * 0.4)
-        .collect();
+    let conv_out: Vec<f32> =
+        (0..b * stride_b).map(|i| (((i + seed_offset) as f32) * 0.0131).sin() * 0.4).collect();
     // a_log < 0 → exp(a_log) ∈ (0, 1) → g ∈ (0, 1). Production-realistic.
     let a_log: Vec<f32> = (0..hv).map(|i| -1.5 - (i as f32) * 0.1).collect();
     let dt_bias: Vec<f32> = (0..hv).map(|i| -0.5 + (i as f32) * 0.05).collect();
@@ -332,10 +343,7 @@ fn make_fixture(
     let state_in: Vec<f32> =
         (0..b * hv * dv * dk).map(|i| (((i + seed_offset) as f32) * 0.0073).cos() * 0.1).collect();
 
-    Fixture {
-        conv_out, a_log, dt_bias, a_raw, b_raw,
-        q_norm_weight, k_norm_weight, state_in,
-    }
+    Fixture { conv_out, a_log, dt_bias, a_raw, b_raw, q_norm_weight, k_norm_weight, state_in }
 }
 
 /// Quantise every input through the kernel's load-time dtype so the CPU
@@ -371,14 +379,35 @@ fn run_cell(
     let f = round_fixture(&raw, dt);
 
     let (y_cpu, state_cpu) = cpu_fused_oracle(
-        &f.conv_out, &f.a_log, &f.dt_bias, &f.a_raw, &f.b_raw,
-        &f.q_norm_weight, &f.k_norm_weight, &f.state_in,
-        b, hv, hk, dv, dk,
+        &f.conv_out,
+        &f.a_log,
+        &f.dt_bias,
+        &f.a_raw,
+        &f.b_raw,
+        &f.q_norm_weight,
+        &f.k_norm_weight,
+        &f.state_in,
+        b,
+        hv,
+        hk,
+        dv,
+        dk,
     );
     let (y_gpu, state_gpu) = run_gpu(
-        &f.conv_out, &f.a_log, &f.dt_bias, &f.a_raw, &f.b_raw,
-        &f.q_norm_weight, &f.k_norm_weight, &f.state_in,
-        dt, b, hv, hk, dv, dk,
+        &f.conv_out,
+        &f.a_log,
+        &f.dt_bias,
+        &f.a_raw,
+        &f.b_raw,
+        &f.q_norm_weight,
+        &f.k_norm_weight,
+        &f.state_in,
+        dt,
+        b,
+        hv,
+        hk,
+        dv,
+        dk,
     );
 
     (cosine(&y_gpu, &y_cpu), cosine(&state_gpu, &state_cpu))
@@ -516,23 +545,30 @@ fn prep_step_f32_multi_step_8_consecutive() {
         let stride_b = 2 * hk * dk + hv * dv;
         // Vary conv_out / a_raw / b_raw per step so the recurrence has
         // real input. Quantising through f32 is a no-op.
-        let conv_out: Vec<f32> = (0..b * stride_b)
-            .map(|i| (((i + step * 17) as f32) * 0.0131).sin() * 0.4)
-            .collect();
-        let a_raw: Vec<f32> =
-            (0..b * hv).map(|i| -0.3 + ((i + step) as f32) * 0.04).collect();
-        let b_raw: Vec<f32> =
-            (0..b * hv).map(|i| -0.2 + ((i + step) as f32) * 0.03).collect();
+        let conv_out: Vec<f32> =
+            (0..b * stride_b).map(|i| (((i + step * 17) as f32) * 0.0131).sin() * 0.4).collect();
+        let a_raw: Vec<f32> = (0..b * hv).map(|i| -0.3 + ((i + step) as f32) * 0.04).collect();
+        let b_raw: Vec<f32> = (0..b * hv).map(|i| -0.2 + ((i + step) as f32) * 0.03).collect();
 
         let (y_cpu, state_cpu_new) = cpu_fused_oracle(
-            &conv_out, &a_log, &dt_bias, &a_raw, &b_raw,
-            &weights_q, &weights_k, &state_cpu,
-            b, hv, hk, dv, dk,
+            &conv_out, &a_log, &dt_bias, &a_raw, &b_raw, &weights_q, &weights_k, &state_cpu, b, hv,
+            hk, dv, dk,
         );
         let (y_gpu, state_gpu_new) = run_gpu(
-            &conv_out, &a_log, &dt_bias, &a_raw, &b_raw,
-            &weights_q, &weights_k, &state_gpu,
-            Dt::F32, b, hv, hk, dv, dk,
+            &conv_out,
+            &a_log,
+            &dt_bias,
+            &a_raw,
+            &b_raw,
+            &weights_q,
+            &weights_k,
+            &state_gpu,
+            Dt::F32,
+            b,
+            hv,
+            hk,
+            dv,
+            dk,
         );
 
         let cy = cosine(&y_gpu, &y_cpu);
@@ -579,22 +615,30 @@ fn prep_step_bf16_multi_step_8_consecutive() {
                 .map(|i| (((i + step * 17) as f32) * 0.0131).sin() * 0.4)
                 .collect::<Vec<_>>(),
         );
-        let a_raw = round_bf(
-            &(0..b * hv).map(|i| -0.3 + ((i + step) as f32) * 0.04).collect::<Vec<_>>(),
-        );
-        let b_raw = round_bf(
-            &(0..b * hv).map(|i| -0.2 + ((i + step) as f32) * 0.03).collect::<Vec<_>>(),
-        );
+        let a_raw =
+            round_bf(&(0..b * hv).map(|i| -0.3 + ((i + step) as f32) * 0.04).collect::<Vec<_>>());
+        let b_raw =
+            round_bf(&(0..b * hv).map(|i| -0.2 + ((i + step) as f32) * 0.03).collect::<Vec<_>>());
 
         let (_y_cpu, state_cpu_new) = cpu_fused_oracle(
-            &conv_out, &a_log, &dt_bias, &a_raw, &b_raw,
-            &weights_q, &weights_k, &state_cpu,
-            b, hv, hk, dv, dk,
+            &conv_out, &a_log, &dt_bias, &a_raw, &b_raw, &weights_q, &weights_k, &state_cpu, b, hv,
+            hk, dv, dk,
         );
         let (y_gpu, state_gpu_new) = run_gpu(
-            &conv_out, &a_log, &dt_bias, &a_raw, &b_raw,
-            &weights_q, &weights_k, &state_gpu,
-            Dt::Bf16, b, hv, hk, dv, dk,
+            &conv_out,
+            &a_log,
+            &dt_bias,
+            &a_raw,
+            &b_raw,
+            &weights_q,
+            &weights_k,
+            &state_gpu,
+            Dt::Bf16,
+            b,
+            hv,
+            hk,
+            dv,
+            dk,
         );
 
         // bf16 drift across 8 steps — only check cosine on state +
