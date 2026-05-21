@@ -25,6 +25,7 @@ pub mod gemv_masked;
 pub mod layer_norm;
 pub mod logsumexp;
 pub mod quantized;
+pub mod quantized_mpp;
 #[cfg(feature = "nax")]
 pub mod quantized_nax;
 pub mod random;

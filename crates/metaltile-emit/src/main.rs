@@ -28,6 +28,7 @@ use metaltile_core::{
 // Bring high-perf kernels from metaltile-std into the emit registry.
 use metaltile_std::ffai::moe::mt_moe_gather_qmm_mma_int4_bm16;
 use metaltile_std::mlx::quantized::mt_qmm_mma;
+use metaltile_std::mlx::quantized_mpp;
 use metaltile_std::probe::mpp_matmul_smoke;
 use serde::Serialize;
 
@@ -1861,6 +1862,21 @@ fn register_kernels() -> Vec<Kernel> {
     for &dt in &[DType::F32, DType::F16] {
         let mut k = mt_moe_gather_qmm_mma_int4_bm16::kernel_ir_for(dt);
         k.name = format!("mt_moe_gather_qmm_mma_int4_bm16_{}", dtype_suffix(dt));
+        k.mode = KernelMode::Reduction;
+        kernels.push(k);
+    }
+
+    // ─── mt_qmm_mma_mpp (Reduction) — MPP `matmul2d` production int4 qmm ──
+    // BM=BN=BK=32, TG=128 (4 SG × 32 lanes WM=WN=2), per-SG 16×16 MMA via
+    // `mpp::tensor_ops::matmul2d<desc, execution_simdgroup>`. Same int4
+    // dequant-into-TG-mem pattern as mt_qmm_mma; the matmul step swaps the
+    // manual 8×8 `simdgroup_matmul` ladder for one cooperative `matmul2d`
+    // per SG per K-block. This is the MPP/NAX path MLX uses for
+    // `affine_qmm_t_nax` / `gather_qmm_rhs_nax`. Requires macOS 26+ /
+    // Metal 4. See `crates/metaltile-std/src/mlx/quantized_mpp.rs`.
+    for &dt in &[DType::F32, DType::F16] {
+        let mut k = quantized_mpp::kernel_ir_for(dt);
+        k.name = format!("mt_qmm_mma_mpp_{}", dtype_suffix(dt));
         k.mode = KernelMode::Reduction;
         kernels.push(k);
     }
