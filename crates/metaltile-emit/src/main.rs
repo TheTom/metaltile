@@ -1984,10 +1984,32 @@ fn generate_swift_wrappers(manifest: &Manifest) -> String {
 
     for k in &manifest.kernels {
         emit_swift_wrapper(&mut out, k);
+        if needs_indirect_variant(&k.name) {
+            emit_swift_wrapper_indirect(&mut out, k);
+        }
     }
 
     out.push_str("}\n");
     out
+}
+
+/// Kernels that get a `_indirect` Swift wrapper alongside the regular one.
+///
+/// The indirect variant takes an `MTLBuffer` carrying
+/// `MTLDispatchThreadgroupsIndirectArguments` instead of a `MTLSize` grid,
+/// so the GPU can pick the dispatch shape from a buffer rather than the
+/// host having to compute it. Used by FFAI's Day-1 GPU-router work to
+/// chain successive MoE-layer expert dispatches onto one command buffer
+/// without per-layer host stalls.
+///
+/// Allowlist (not opt-in via the kernel DSL) so we don't pay the codegen
+/// cost on kernels that have no consumer for the indirect form.
+fn needs_indirect_variant(name: &str) -> bool {
+    // Match the canonical Swift-side wrapper names (no `mt_` prefix; the
+    // FFAI kernels live in the `ffai::` module of metaltile-std and emit
+    // bare names). Restrict to the f16 + bf16 variants — Qwen3.6-A3B is
+    // bf16 + int4. f32 is not used by any MoE checkpoint in this stack.
+    name == "dequant_gemv_int4_f16" || name == "dequant_gemv_int4_bf16"
 }
 
 fn emit_swift_wrapper(out: &mut String, k: &KernelManifest) {
@@ -2039,6 +2061,68 @@ fn emit_swift_wrapper(out: &mut String, k: &KernelManifest) {
     // Requires Metal 2.0 non-uniform threadgroup support (M-series ✓).
     writeln!(out, "        enc.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)")
         .ok();
+    writeln!(out, "        enc.endEncoding()").ok();
+    writeln!(out, "    }}\n").ok();
+}
+
+/// Indirect-dispatch variant of `emit_swift_wrapper`. Same buffer + constexpr
+/// bindings, same PSO (the underlying kernel is unchanged), but the dispatch
+/// shape comes from an `MTLBuffer` carrying
+/// `MTLDispatchThreadgroupsIndirectArguments` (3 × u32 = threadgroup counts
+/// for x/y/z). The `threadgroupSize` is still passed direct — it's a
+/// compile-time-known shape, only the grid is data-dependent.
+fn emit_swift_wrapper_indirect(out: &mut String, k: &KernelManifest) {
+    use std::fmt::Write as _;
+    let fn_name = format!("{}_indirect", swift_safe_name(&k.name));
+
+    writeln!(out, "    /// Indirect-dispatch variant of `{}` — grid shape from a GPU buffer.", k.name).ok();
+    writeln!(out, "    public static func {fn_name}(").ok();
+
+    for p in &k.params {
+        let label = swift_safe_name(&p.name);
+        writeln!(out, "        {label}: MTLBuffer, {label}Offset: Int = 0,").ok();
+    }
+    for c in &k.constexprs {
+        let label = swift_safe_name(&c.name);
+        let swift_ty = swift_scalar_type(&c.dtype);
+        writeln!(out, "        {label}: {swift_ty},").ok();
+    }
+    writeln!(out, "        indirectBuffer: MTLBuffer,").ok();
+    writeln!(out, "        indirectBufferOffset: Int = 0,").ok();
+    writeln!(out, "        threadgroupSize: MTLSize,").ok();
+    writeln!(out, "        on commandBuffer: MTLCommandBuffer").ok();
+    writeln!(out, "    ) {{").ok();
+    // PSO lookup uses the underlying kernel name — there is no separate
+    // `_indirect` PSO; the dispatch path is what differs, not the kernel.
+    writeln!(out, "        let pso = PSOCache.shared.pipelineState(for: \"{}\")", k.name).ok();
+    writeln!(
+        out,
+        "        guard let enc = commandBuffer.makeComputeCommandEncoder() else {{ return }}"
+    )
+    .ok();
+    writeln!(out, "        enc.setComputePipelineState(pso)").ok();
+
+    let mut slot = 0usize;
+    for p in &k.params {
+        let label = swift_safe_name(&p.name);
+        writeln!(out, "        enc.setBuffer({label}, offset: {label}Offset, index: {slot})").ok();
+        slot += 1;
+    }
+    for c in &k.constexprs {
+        let label = swift_safe_name(&c.name);
+        let len = swift_scalar_size(&c.dtype);
+        writeln!(out, "        var {label}_v = {label}").ok();
+        writeln!(out, "        enc.setBytes(&{label}_v, length: {len}, index: {slot})").ok();
+        slot += 1;
+    }
+    // Indirect threadgroup-count dispatch. The buffer holds 3 × u32 =
+    // threadgroup counts (NOT thread counts) for x/y/z; the kernel still
+    // gets the same per-threadgroup shape via `threadgroupSize`.
+    writeln!(
+        out,
+        "        enc.dispatchThreadgroups(indirectBuffer: indirectBuffer, indirectBufferOffset: indirectBufferOffset, threadsPerThreadgroup: threadgroupSize)"
+    )
+    .ok();
     writeln!(out, "        enc.endEncoding()").ok();
     writeln!(out, "    }}\n").ok();
 }
