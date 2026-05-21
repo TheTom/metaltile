@@ -253,7 +253,7 @@ fn wy_chunk_matches_oracle_multi_chunk_f32() {
 
 /// Build a synthetic GDN input with normalized k (‖k‖² ≈ 1 regardless of Dk)
 /// so the recurrence is well-conditioned. Matches the CPU-oracle pattern.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn make_inputs(
     seed_phase: f32,
     t: usize,
