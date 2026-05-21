@@ -110,6 +110,17 @@ impl MslGenerator {
             wl!(out);
             wl!(out, "#include <metal_simdgroup_matrix>");
         }
+        // MetalPerformancePrimitives (NAX / `mpp::tensor_ops::matmul2d`) — only
+        // available on macOS 26+ / Metal 4. Gated on a kernel-level feature flag
+        // detected from `Op::InlineMsl` sources that mention `mpp::`. Emits a
+        // version guard so older targets fall through cleanly at compile time.
+        if feat.needs_mpp {
+            wl!(out);
+            wl!(out, "#if defined(__METAL_VERSION__) && __METAL_VERSION__ >= 400");
+            wl!(out, "#include <metal_simdgroup>");
+            wl!(out, "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>");
+            wl!(out, "#endif");
+        }
         self.emit_activation_helpers(&feat, &mut out);
         wl!(out);
         self.emit_kernel(k, &feat, &type_env, &mut out)?;
