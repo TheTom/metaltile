@@ -26,13 +26,16 @@ use metaltile_core::{
     ir::{Kernel, KernelMode, Param, ParamKind},
 };
 // Bring high-perf kernels from metaltile-std into the emit registry.
+use metaltile_std::ffai::gated_delta::{mt_gated_delta_chunk, mt_gated_delta_step};
 use metaltile_std::ffai::gated_delta_prep::mt_gated_delta_prep_step;
 use metaltile_std::ffai::moe::mt_moe_gather_qmm_mma_int4_bm16;
 use metaltile_std::ffai::moe_mpp;
 use metaltile_std::ffai::moe_mpp_bm64;
 use metaltile_std::ffai::moe_mpp_bm8;
+use metaltile_std::mlx::steel::attn::steel_attention_mma::mt_sdpa_prefill_mma;
 use metaltile_std::mlx::quantized::mt_qmm_mma;
 use metaltile_std::mlx::quantized_mpp;
+use metaltile_std::mlx::unary::{mt_gelu, mt_relu, mt_sigmoid};
 use metaltile_std::probe::mpp_matmul_smoke;
 use serde::Serialize;
 
@@ -63,17 +66,19 @@ struct Cli {
 //   3. Re-run `cargo run -p metaltile-emit -- --out <dir>`
 
 // Generic elementwise add. c[i] = a[i] + b[i]. Works for f32 / f16 / bf16.
+// Mirrors metaltile_std::mlx::binary::vector_add (output param named `c`).
 #[kernel]
 fn add_elem<T>(a: Tensor<T>, b: Tensor<T>, c: Tensor<T>) {
     let idx = program_id::<0>();
     store(c[idx], load(a[idx]) + load(b[idx]));
 }
 
-// Generic elementwise multiply. c[i] = a[i] * b[i]. Used for SwiGLU's gate*up.
+// Generic elementwise multiply. out[i] = a[i] * b[i]. Used for SwiGLU's gate*up.
+// Mirrors metaltile_std::mlx::binary::mt_mul (output param named `out`).
 #[kernel]
-fn mul_elem<T>(a: Tensor<T>, b: Tensor<T>, c: Tensor<T>) {
+fn mul_elem<T>(a: Tensor<T>, b: Tensor<T>, out: Tensor<T>) {
     let idx = program_id::<0>();
-    store(c[idx], load(a[idx]) * load(b[idx]));
+    store(out[idx], load(a[idx]) * load(b[idx]));
 }
 
 // SiLU activation: out[i] = x[i] / (1 + exp(-x[i])). Elementwise.
@@ -124,17 +129,17 @@ fn gather_row<T>(
 // on M-series). weight is [out_dim, in_dim] row-major; input is [in_dim].
 #[kernel]
 fn gemv_naive<T>(
-    weight: Tensor<T>,
-    input: Tensor<T>,
-    output: Tensor<T>,
-    #[constexpr] in_dim: u32,
+    mat: Tensor<T>,
+    vec: Tensor<T>,
+    out: Tensor<T>,
+    #[constexpr] k: u32,
 ) {
     let row = program_id::<0>();
-    let rs = row * in_dim;
-    let re = rs + in_dim;
-    let acc = strided_reduce_dot(weight, input, rs, rs, re);
+    let rs = row * k;
+    let re = rs + k;
+    let acc = strided_reduce_dot(mat, vec, rs, rs, re);
     let result = reduce_sum(acc);
-    store(output[row], result);
+    store(out[row], result);
 }
 
 // Llama-style RoPE (HuggingFace half-rotated convention) with optional
@@ -868,6 +873,12 @@ fn kv_cache_update<T>(
 // GQA: kv_head = q_head / heads_per_group.
 //
 // Dispatch: one thread per (q_head, d). Total threads = n_q_heads * head_dim.
+// `sink_end` / `window_start` carve out an optional skip-range
+// `[sink_end, window_start)` for sliding-window-with-sink attention.
+// Both zero ⇒ dense attention over `[0, n_kv)`. Otherwise the kernel
+// attends to `[0, sink_end) ∪ [window_start, n_kv)` — the loop only
+// pays for the kept range so the bound check is at the K-iteration
+// granularity, not per-element masking.
 #[kernel]
 fn sdpa_decode_naive<T>(
     q: Tensor<T>,
@@ -878,6 +889,8 @@ fn sdpa_decode_naive<T>(
     #[constexpr] n_kv: u32,
     #[constexpr] kv_stride: u32,
     #[constexpr] heads_per_group: u32,
+    #[constexpr] sink_end: u32,
+    #[constexpr] window_start: u32,
     #[constexpr] scale: f32,
 ) {
     let idx = program_id::<0>();
@@ -1685,29 +1698,31 @@ fn register_kernels() -> Vec<Kernel> {
     let dtypes = [DType::F32, DType::F16, DType::BF16];
 
     // ─── elementwise (Elementwise mode = default) ────────────────────
+    // Naming convention: `vector_add` (legacy MLX name), `mt_*` for
+    // metaltile-canonical ops, `ffai_*` for FFAI-specific row ops.
     for &dt in &dtypes {
         let mut k = add_elem::kernel_ir_for(dt);
-        k.name = format!("add_{}", dtype_suffix(dt));
+        k.name = format!("vector_add_{}", dtype_suffix(dt));
         kernels.push(k);
 
         let mut k = mul_elem::kernel_ir_for(dt);
-        k.name = format!("mul_{}", dtype_suffix(dt));
+        k.name = format!("mt_mul_{}", dtype_suffix(dt));
         kernels.push(k);
 
         let mut k = silu_elem::kernel_ir_for(dt);
-        k.name = format!("silu_{}", dtype_suffix(dt));
+        k.name = format!("mt_silu_{}", dtype_suffix(dt));
         kernels.push(k);
 
         let mut k = softplus_elem::kernel_ir_for(dt);
-        k.name = format!("softplus_{}", dtype_suffix(dt));
+        k.name = format!("mt_softplus_{}", dtype_suffix(dt));
         kernels.push(k);
 
         let mut k = gather_row::kernel_ir_for(dt);
-        k.name = format!("gather_{}", dtype_suffix(dt));
+        k.name = format!("ffai_gather_{}", dtype_suffix(dt));
         kernels.push(k);
 
         let mut k = gemv_naive::kernel_ir_for(dt);
-        k.name = format!("gemv_{}", dtype_suffix(dt));
+        k.name = format!("mt_gemv_{}", dtype_suffix(dt));
         k.mode = KernelMode::Reduction;
         kernels.push(k);
     }
@@ -1717,24 +1732,24 @@ fn register_kernels() -> Vec<Kernel> {
     // aliases used inside the kernel body.
     for &dt in &dtypes {
         let mut k = mt_rms_norm::kernel_ir_for(dt);
-        k.name = format!("rms_norm_{}", dtype_suffix(dt));
+        k.name = format!("mt_rms_norm_{}", dtype_suffix(dt));
         k.mode = KernelMode::Reduction;
         kernels.push(k);
     }
 
-    // ─── rope (Grid3D — uses program_id<0> for head and program_id<1>
-    //     for half-pair index)
+    // ─── rope_llama (Grid3D — uses program_id<0> for head and
+    //     program_id<1> for half-pair index)
     for &dt in &dtypes {
         let mut k = rope_llama::kernel_ir_for(dt);
-        k.name = format!("rope_{}", dtype_suffix(dt));
+        k.name = format!("ffai_rope_llama_{}", dtype_suffix(dt));
         k.mode = KernelMode::Grid3D;
         kernels.push(k);
     }
 
-    // ─── sdpa decode (Elementwise) ───────────────────────────────────
+    // ─── ffai_sdpa_decode (Elementwise, head_dim=128 default) ────────
     for &dt in &dtypes {
         let mut k = sdpa_decode_naive::kernel_ir_for(dt);
-        k.name = format!("sdpa_decode_{}", dtype_suffix(dt));
+        k.name = format!("ffai_sdpa_decode_{}", dtype_suffix(dt));
         kernels.push(k);
     }
 
@@ -1784,11 +1799,78 @@ fn register_kernels() -> Vec<Kernel> {
         kernels.push(k);
     }
 
-    // ─── argmax (Reduction) ──────────────────────────────────────────
+    // ─── ffai_argmax (Reduction) ─────────────────────────────────────
     for &dt in &dtypes {
         let mut k = argmax::kernel_ir_for(dt);
-        k.name = format!("argmax_{}", dtype_suffix(dt));
+        k.name = format!("ffai_argmax_{}", dtype_suffix(dt));
         k.mode = KernelMode::Reduction;
+        kernels.push(k);
+    }
+
+    // ─── mt_gelu / mt_relu / mt_sigmoid (Elementwise) ────────────────
+    // Sourced from metaltile-std/mlx/unary.rs — canonical activations
+    // FFAI consumers expect alongside silu / softplus.
+    for &dt in &dtypes {
+        let mut k = mt_gelu::kernel_ir_for(dt);
+        k.name = format!("mt_gelu_{}", dtype_suffix(dt));
+        kernels.push(k);
+
+        let mut k = mt_relu::kernel_ir_for(dt);
+        k.name = format!("mt_relu_{}", dtype_suffix(dt));
+        kernels.push(k);
+
+        let mut k = mt_sigmoid::kernel_ir_for(dt);
+        k.name = format!("mt_sigmoid_{}", dtype_suffix(dt));
+        kernels.push(k);
+    }
+
+    // ─── mt_gated_delta_step (Reduction) — Mamba-style GDN decode step ─
+    // Used by Qwen3.5 / Qwen3.6 hybrid GDN layers, one dispatch per token.
+    for &dt in &dtypes {
+        let mut k = mt_gated_delta_step::kernel_ir_for(dt);
+        k.name = format!("mt_gated_delta_step_{}", dtype_suffix(dt));
+        k.mode = KernelMode::Reduction;
+        kernels.push(k);
+    }
+
+    // ─── mt_gated_delta_chunk (Reduction) — chunked-T GDN prefill step ─
+    // Batched-T counterpart of mt_gated_delta_step. Used in
+    // forwardMany / batched prefill paths.
+    for &dt in &dtypes {
+        let mut k = mt_gated_delta_chunk::kernel_ir_for(dt);
+        k.name = format!("mt_gated_delta_chunk_{}", dtype_suffix(dt));
+        k.mode = KernelMode::Reduction;
+        kernels.push(k);
+    }
+
+    // ─── mt_sdpa_prefill_mma (SimdGroup2D) — batched-T causal SDPA ────
+    // MMA-tiled prefill kernel used by FFAI's batched prefill across
+    // Qwen / Mistral / Phi / Gemma. KernelMode::SimdGroup2D matches the
+    // BenchSpec dispatch geometry (per crates/metaltile-std/src/ffai/
+    // sdpa_decode_batched_prefill.rs).
+    for &dt in &dtypes {
+        let mut k = mt_sdpa_prefill_mma::kernel_ir_for(dt);
+        k.name = format!("mt_sdpa_prefill_mma_{}", dtype_suffix(dt));
+        k.mode = KernelMode::SimdGroup2D;
+        kernels.push(k);
+    }
+
+    // ─── ffai_sdpa_decode_d{64,256,512} — head_dim variants ──────────
+    // The kernel's head_dim is a runtime constexpr (setBytes at encode),
+    // so all three variants share the same MSL source as the d=128
+    // baseline above. The distinct Swift wrapper names let callers
+    // self-document the head-dim shape they're dispatching against.
+    for &dt in &dtypes {
+        let mut k = sdpa_decode_naive::kernel_ir_for(dt);
+        k.name = format!("ffai_sdpa_decode_d64_{}", dtype_suffix(dt));
+        kernels.push(k);
+
+        let mut k = sdpa_decode_naive::kernel_ir_for(dt);
+        k.name = format!("ffai_sdpa_decode_d256_{}", dtype_suffix(dt));
+        kernels.push(k);
+
+        let mut k = sdpa_decode_naive::kernel_ir_for(dt);
+        k.name = format!("ffai_sdpa_decode_d512_{}", dtype_suffix(dt));
         kernels.push(k);
     }
 
@@ -1863,7 +1945,7 @@ fn register_kernels() -> Vec<Kernel> {
     // ─── mt_moe_gather_qmm_mma_int4_bm16 (Reduction) — MoE grouped int4 qmm
     // BM=16 variant matches MLX's affine_gather_qmm_rhs_nt geometry. Used by
     // SwitchGLU / MoE FFN at prefill.
-    for &dt in &[DType::F32, DType::F16] {
+    for &dt in &[DType::F32, DType::F16, DType::BF16] {
         let mut k = mt_moe_gather_qmm_mma_int4_bm16::kernel_ir_for(dt);
         k.name = format!("mt_moe_gather_qmm_mma_int4_bm16_{}", dtype_suffix(dt));
         k.mode = KernelMode::Reduction;
