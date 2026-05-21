@@ -27,6 +27,7 @@ use metaltile_core::{
 };
 // Bring high-perf kernels from metaltile-std into the emit registry.
 use metaltile_std::ffai::moe::mt_moe_gather_qmm_mma_int4_bm16;
+use metaltile_std::ffai::moe_mpp;
 use metaltile_std::mlx::quantized::mt_qmm_mma;
 use metaltile_std::mlx::quantized_mpp;
 use metaltile_std::probe::mpp_matmul_smoke;
@@ -1862,6 +1863,21 @@ fn register_kernels() -> Vec<Kernel> {
     for &dt in &[DType::F32, DType::F16] {
         let mut k = mt_moe_gather_qmm_mma_int4_bm16::kernel_ir_for(dt);
         k.name = format!("mt_moe_gather_qmm_mma_int4_bm16_{}", dtype_suffix(dt));
+        k.mode = KernelMode::Reduction;
+        kernels.push(k);
+    }
+
+    // ─── mt_moe_gather_qmm_mma_int4_bm16_mpp (Reduction) — MPP MoE BGEMM ───
+    // MPP-backed counterpart of mt_moe_gather_qmm_mma_int4_bm16. Mirrors the
+    // BM=16 row-partitioning + int4 dequant pipeline but routes the inner
+    // 16×32×16 tile matmul through `mpp::tensor_ops::matmul2d` — the same
+    // Apple-private API MLX uses to hit ~3000 GF on Qwen3.6-A3B `down_proj`.
+    // TG = 32 lanes = 1 SG (matmul2d is `execution_simdgroup`).
+    // Requires macOS 26+ / Metal 4. See
+    // `crates/metaltile-std/src/ffai/moe_mpp.rs`.
+    for &dt in &[DType::F32, DType::F16, DType::BF16] {
+        let mut k = moe_mpp::kernel_ir_for(dt);
+        k.name = format!("mt_moe_gather_qmm_mma_int4_bm16_mpp_{}", dtype_suffix(dt));
         k.mode = KernelMode::Reduction;
         kernels.push(k);
     }
