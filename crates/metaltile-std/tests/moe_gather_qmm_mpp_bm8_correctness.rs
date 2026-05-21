@@ -91,6 +91,20 @@ impl Case {
 fn run_case(case: &Case) {
     let _g = gpu_lock();
 
+    // MPP `tensor_ops::matmul2d` needs Apple10 (gen-17) + macOS 26.2+. On
+    // older silicon or virtualised CI runners (chip_family = None or < 10)
+    // the kernel hits its pre-Metal-4 stub branch and writes zeros — the
+    // cosine assertion would then fail. Skip rather than fail so CI's
+    // hosted Mac runner stays green. Same gate pattern used on the bm64
+    // / qmm / smoke tests.
+    let ctx_probe = Context::new().expect("Context::new");
+    let family = ctx_probe.chip_family();
+    if family.is_none_or(|lvl| lvl < 10) {
+        eprintln!("skip {}: needs Apple10+ GPU (chip_family={family:?})", case.label);
+        return;
+    }
+    drop(ctx_probe);
+
     let Case { n_experts, t_rows, n_out, k_in, group_size, dt, .. } = *case;
 
     // Default index layout: rows split as evenly as possible across

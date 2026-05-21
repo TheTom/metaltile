@@ -51,6 +51,18 @@ fn pack_int4_row(weights: &[u32]) -> Vec<u32> {
 #[test]
 fn moe_gather_qmm_mma_int4_bm16_mpp_matches_m1_clean_tile() {
     let _g = gpu_lock();
+
+    // MPP `tensor_ops::matmul2d` needs Apple10 (gen-17) + macOS 26.2+.
+    // On older silicon or virtualised CI runners the kernel hits its
+    // pre-Metal-4 stub branch and writes zeros — skip rather than fail.
+    let probe = Context::new().expect("Context::new");
+    let family = probe.chip_family();
+    if family.is_none_or(|lvl| lvl < 10) {
+        eprintln!("skip bm16_mpp_clean_tile: needs Apple10+ GPU (chip_family={family:?})");
+        return;
+    }
+    drop(probe);
+
     let n_experts = 4usize;
     let k_in = 64usize; // multiple of 32 (and 16 = BK)
     let n_out = 64usize; // BN=32 → 2 n-tiles
