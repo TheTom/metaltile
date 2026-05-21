@@ -36,6 +36,7 @@ use metaltile_std::{
 
 use crate::{
     BuildArgs,
+    CliError,
     matches_filter,
     term::{Color, Style, paint_stderr, paint_stdout},
 };
@@ -48,7 +49,7 @@ fn pad_left(text: &str, width: usize) -> String { format!("{text:<width$}") }
 
 fn pad_right(text: &str, width: usize) -> String { format!("{text:>width$}") }
 
-pub fn run(args: &BuildArgs) {
+pub fn run(args: &BuildArgs) -> Result<(), CliError> {
     let filter = &args.filter;
     let dtypes_arg = &args.dtypes;
     let verbose = args.verbose > 0;
@@ -57,8 +58,8 @@ pub fn run(args: &BuildArgs) {
     let sdk = &args.sdk;
 
     if args.time_passes {
-        run_time_passes(filter.as_deref(), dtypes_arg.as_deref());
-        return;
+        run_time_passes(filter.as_deref(), dtypes_arg.as_deref())?;
+        return Ok(());
     }
 
     let emit_kinds: BTreeSet<EmitKind> = match emit_arg.as_deref() {
@@ -69,10 +70,10 @@ pub fn run(args: &BuildArgs) {
                 eprintln!(
                     "  {} {}",
                     paint_stderr("error:", Style::new().fg(Color::Red).bold()),
-                    paint_stderr(e, Style::new().fg(Color::BrightWhite)),
+                    paint_stderr(e.to_string(), Style::new().fg(Color::BrightWhite)),
                 );
                 eprintln!("  valid kinds: msl, metallib, swift, ir, all");
-                std::process::exit(1);
+                return Err(e);
             },
         },
     };
@@ -86,7 +87,7 @@ pub fn run(args: &BuildArgs) {
                 paint_stderr("error:", Style::new().fg(Color::Red).bold()),
                 paint_stderr("--emit requires --out <dir>", Style::new().fg(Color::BrightWhite)),
             );
-            std::process::exit(1);
+            return Err(CliError::Other("--emit requires --out <dir>".into()));
         },
     };
 
@@ -155,7 +156,7 @@ pub fn run(args: &BuildArgs) {
             dir.display(),
             e
         );
-        std::process::exit(1);
+        return Err(CliError::Io(e));
     }
     let mut emitted_kernels: Vec<Kernel> = Vec::new();
     let mut emitted_paths: Vec<PathBuf> = Vec::new();
@@ -235,7 +236,7 @@ pub fn run(args: &BuildArgs) {
                             k.name,
                             e
                         );
-                        std::process::exit(1);
+                        return Err(CliError::Other(e.to_string()));
                     },
                 }
             }
@@ -282,7 +283,7 @@ pub fn run(args: &BuildArgs) {
 
     // ─── Emit pass (manifest, Swift wrappers, metallib) ─────────────────
     if let Some(out) = &out_root {
-        emit_artifacts(out, &emit_kinds, &emitted_kernels, &emitted_paths, sdk);
+        emit_artifacts(out, &emit_kinds, &emitted_kernels, &emitted_paths, sdk)?;
     }
 
     // Summary
@@ -296,9 +297,10 @@ pub fn run(args: &BuildArgs) {
                 Style::new().fg(Color::Red).bold()
             ),
         );
-        std::process::exit(1);
+        Err(CliError::Other(format!("{errors} kernel(s) failed to compile")))
     } else {
         println!("  {}", paint_stdout(format!("{ok} ok"), Style::new().fg(Color::Green).bold()));
+        Ok(())
     }
 }
 
@@ -312,7 +314,7 @@ enum EmitKind {
     Ir,
 }
 
-fn parse_emit_list(raw: &str) -> Result<BTreeSet<EmitKind>, String> {
+fn parse_emit_list(raw: &str) -> Result<BTreeSet<EmitKind>, CliError> {
     let mut kinds = BTreeSet::new();
     for tok in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
         match tok {
@@ -335,7 +337,7 @@ fn parse_emit_list(raw: &str) -> Result<BTreeSet<EmitKind>, String> {
                 kinds.insert(EmitKind::Swift);
                 kinds.insert(EmitKind::Ir);
             },
-            other => return Err(format!("unknown --emit kind '{other}'")),
+            other => return Err(CliError::Other(format!("unknown --emit kind '{other}'"))),
         }
     }
     Ok(kinds)
@@ -360,7 +362,7 @@ fn emit_artifacts(
     kernels: &[Kernel],
     metal_files: &[PathBuf],
     sdk: &str,
-) {
+) -> Result<(), CliError> {
     let resources_dir = out_root.join("Resources");
     let generated_dir = out_root.join("Generated");
 
@@ -375,7 +377,7 @@ fn emit_artifacts(
             paint_stderr("error:", Style::new().fg(Color::Red).bold()),
             e
         );
-        std::process::exit(1);
+        return Err(CliError::Io(e));
     }
 
     if kinds.contains(&EmitKind::Swift) {
@@ -386,7 +388,7 @@ fn emit_artifacts(
                 generated_dir.display(),
                 e
             );
-            std::process::exit(1);
+            return Err(CliError::Io(e));
         }
         let path = generated_dir.join("MetalTileKernels.swift");
         if let Err(e) = write_swift_wrappers(kernels, &path) {
@@ -396,7 +398,7 @@ fn emit_artifacts(
                 path.display(),
                 e
             );
-            std::process::exit(1);
+            return Err(CliError::Other(e.to_string()));
         }
     }
 
@@ -412,10 +414,11 @@ fn emit_artifacts(
                 paint_stderr("error:", Style::new().fg(Color::Red).bold()),
                 e
             );
-            std::process::exit(1);
+            return Err(CliError::MetalCompile(e.to_string()));
         }
     }
     let _ = emit::dtype_suffix; // anchor public API surface for re-export checks
+    Ok(())
 }
 
 /// Quickly compile a Metal shader with xcrun to catch type errors.
@@ -472,7 +475,7 @@ const TIME_PASSES_ITERS: usize = 25;
 ///
 /// Output schema matches `rustc -Z time-passes`-style tables:
 /// `pass_name  median_total_us  median_per_kernel_us`.
-fn run_time_passes(filter: Option<&str>, dtypes_arg: Option<&str>) {
+fn run_time_passes(filter: Option<&str>, dtypes_arg: Option<&str>) -> Result<(), CliError> {
     let dtypes_filter: Option<Vec<DType>> =
         dtypes_arg.map(|s| s.split(',').filter_map(|t| t.trim().parse::<DType>().ok()).collect());
 
@@ -491,7 +494,7 @@ fn run_time_passes(filter: Option<&str>, dtypes_arg: Option<&str>) {
             "  {} no kernels matched filter",
             paint_stderr("error:", Style::new().fg(Color::Red).bold()),
         );
-        std::process::exit(1);
+        return Err(CliError::Other("no kernels matched filter".into()));
     }
 
     let pipeline = PipelineBuilder::standard().build();
@@ -546,4 +549,5 @@ fn run_time_passes(filter: Option<&str>, dtypes_arg: Option<&str>) {
         let per_kernel = median as f64 / n_kernels;
         println!("  {name:<24}  {median:>14}  {per_kernel:>18.1}");
     }
+    Ok(())
 }
