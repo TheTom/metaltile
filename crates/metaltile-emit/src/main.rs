@@ -46,7 +46,7 @@ use metaltile_std::{
         gemv::mt_gemv,
         quantized::mt_qmm_mma,
         quantized_mpp,
-        rms_norm::mt_rms_norm,
+        rms_norm::{mt_gated_mixer_norm, mt_rms_norm},
         steel::attn::steel_attention_mma::mt_sdpa_prefill_mma,
         unary::{mt_cast_to_f32, mt_gelu, mt_relu, mt_sigmoid, mt_silu, mt_softplus},
     },
@@ -1444,6 +1444,19 @@ fn register_kernels() -> Vec<Kernel> {
     for &dt in &dtypes {
         let mut k = mt_rms_norm::kernel_ir_for(dt);
         k.name = format!("mt_rms_norm_{}", dtype_suffix(dt));
+        k.mode = KernelMode::Reduction;
+        kernels.push(k);
+    }
+
+    // ─── mt_gated_mixer_norm (Reduction) ─────────────────────────────
+    // Fused `out = rms_norm(y, w) · silu(z)` per row. One TG per `Hv`
+    // value-head. Used by Qwen3.5 / Qwen3.6 GDN mixer's phase 2 to
+    // eliminate the host round-trip the legacy path needs to compute
+    // norm(y)·silu(z) between the recurrence and `out_proj` —
+    // 30 host commit+waits per Qwen3.6-A3B decode token recovered.
+    for &dt in &dtypes {
+        let mut k = mt_gated_mixer_norm::kernel_ir_for(dt);
+        k.name = format!("mt_gated_mixer_norm_{}", dtype_suffix(dt));
         k.mode = KernelMode::Reduction;
         kernels.push(k);
     }
