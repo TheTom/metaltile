@@ -986,7 +986,7 @@ mod tests {
 
     /// `needs_mpp` triggers the MetalPerformancePrimitives include when an
     /// `Op::InlineMsl` body references `mpp::`. Detection lives in
-    /// `KernelFeatures` (see `msl/features.rs:33`); the preamble emits the
+    /// `KernelFeatures` (see `msl/features.rs`); the preamble emits the
     /// header gated on Metal 4 so older toolchains still link.
     #[test]
     fn mpp_preamble_emits_when_inline_msl_contains_mpp() {
