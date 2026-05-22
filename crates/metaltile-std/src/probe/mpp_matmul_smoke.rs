@@ -34,13 +34,12 @@
 //! `metaltile-runtime` already routes via `KernelFeatures::needs_mpp`, so
 //! downstream callers don't need to gate explicitly.
 
-use rustc_hash::FxHashMap;
-
 use metaltile_core::{
     dtype::DType,
     ir::{Block, BlockId, Kernel, KernelMode, Op, Param, ParamKind},
     shape::{Dim, Shape},
 };
+use rustc_hash::FxHashMap;
 
 // Inline MSL body. References the kernel parameter names (`A`, `B`, `C`)
 // directly — the codegen emits them as `const device half*` / `device float*`

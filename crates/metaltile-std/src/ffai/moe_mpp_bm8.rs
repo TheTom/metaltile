@@ -69,14 +69,13 @@
 //! - `tensor_inline` requires packed/contiguous strides — we stage
 //!   into TG memory rather than passing arbitrary-stride device views.
 
-use rustc_hash::FxHashMap;
-
 use metaltile_core::{
     constexpr::ConstExpr,
     dtype::DType,
     ir::{Block, BlockId, ConstExprDecl, Kernel, KernelMode, Op, Param, ParamKind, ValueId},
     shape::{Dim, Shape},
 };
+use rustc_hash::FxHashMap;
 
 use crate::spec::{BenchDispatch, BenchSpec};
 

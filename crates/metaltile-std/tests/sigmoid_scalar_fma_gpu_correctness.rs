@@ -14,9 +14,10 @@
 //!   - f16:  max |Δ| < 5e-4
 //!   - bf16: max |Δ| < 5e-3
 //!
-//! Plus a saturating-gate cell (large |gate| where sigmoid is near 0 or
-//! 1) to make sure the fp32-internal accumulation path stays correct
-//! when the model dtype would round the sigmoid scalar to 0 or 1.
+//! Plus a saturating-gate cell (large |gate| where sigmoid is near
+//! 0 or 1) to make sure the fp32-internal accumulation path stays
+//! correct when the model dtype would round the sigmoid scalar to
+//! 0 or 1.
 //!
 //! macOS-gated: needs an actual Metal device.
 
@@ -89,7 +90,12 @@ fn run_cell(dt: Dt, gate: f32, n: usize, tol: f32, label: &str) {
     assert!(
         diff < tol,
         "[{}] dt={:?} n={} gate={}: max |Δ| = {:.2e} (expected < {:.0e})",
-        label, dt.to_dtype(), n, gate, diff, tol
+        label,
+        dt.to_dtype(),
+        n,
+        gate,
+        diff,
+        tol
     );
 }
 
@@ -111,11 +117,7 @@ fn sigmoid_scalar_fma_bf16_qwen36() { run_cell(Dt::Bf16, 0.5, 2048, 5e-3, "qwen3
 // way the kernel's load-side `.cast` does, so the diff stays zero).
 
 #[test]
-fn sigmoid_scalar_fma_bf16_saturating_high() {
-    run_cell(Dt::Bf16, 8.0, 2048, 5e-3, "sat_high");
-}
+fn sigmoid_scalar_fma_bf16_saturating_high() { run_cell(Dt::Bf16, 8.0, 2048, 5e-3, "sat_high"); }
 
 #[test]
-fn sigmoid_scalar_fma_bf16_saturating_low() {
-    run_cell(Dt::Bf16, -8.0, 2048, 5e-3, "sat_low");
-}
+fn sigmoid_scalar_fma_bf16_saturating_low() { run_cell(Dt::Bf16, -8.0, 2048, 5e-3, "sat_low"); }

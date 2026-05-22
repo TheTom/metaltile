@@ -80,14 +80,13 @@
 //! pending bench harness on M2 mini (see
 //! `feedback_metaltile_bench_on_m2_mini.md` — never bench on M5 Max).
 
-use rustc_hash::FxHashMap;
-
 use metaltile_core::{
     constexpr::ConstExpr,
     dtype::DType,
     ir::{Block, BlockId, ConstExprDecl, Kernel, KernelMode, Op, Param, ParamKind, ValueId},
     shape::{Dim, Shape},
 };
+use rustc_hash::FxHashMap;
 
 use crate::spec::{BenchDispatch, BenchSpec};
 

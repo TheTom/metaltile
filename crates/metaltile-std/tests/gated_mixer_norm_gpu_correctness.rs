@@ -31,9 +31,7 @@ use metaltile_std::mlx::rms_norm::mt_gated_mixer_norm;
 /// CPU oracle. Mirrors the GPU pipeline: load y as fp32, load z/w
 /// quantised through dt (`Dt::round`), compute rms over Dv lane, fuse
 /// silu(z) · norm(y, w), round result back through dt for the store.
-fn oracle(
-    y: &[f32], z: &[f32], w: &[f32], hv: usize, dv: usize, eps: f32, dt: Dt,
-) -> Vec<f32> {
+fn oracle(y: &[f32], z: &[f32], w: &[f32], hv: usize, dv: usize, eps: f32, dt: Dt) -> Vec<f32> {
     let mut out = vec![0.0f32; hv * dv];
     for h in 0..hv {
         let base = h * dv;
@@ -54,7 +52,13 @@ fn oracle(
 }
 
 fn run_gated_mixer_norm(
-    y: &[f32], z: &[f32], w: &[f32], hv: usize, dv: usize, eps: f32, dt: Dt,
+    y: &[f32],
+    z: &[f32],
+    w: &[f32],
+    hv: usize,
+    dv: usize,
+    eps: f32,
+    dt: Dt,
 ) -> Vec<f32> {
     let tpg = dv / 4; // N = TPG * 4 invariant (same as mt_rms_norm).
     assert!(dv.is_multiple_of(128), "dv must be multiple of 128");
@@ -95,7 +99,11 @@ fn run_cell(dt: Dt, hv: usize, dv: usize, tol: f32) {
     assert!(
         diff < tol,
         "gated_mixer_norm dt={:?} Hv={} Dv={}: max |Δ| = {:.2e} (expected < {:.0e})",
-        dt.to_dtype(), hv, dv, diff, tol
+        dt.to_dtype(),
+        hv,
+        dv,
+        diff,
+        tol
     );
 }
 

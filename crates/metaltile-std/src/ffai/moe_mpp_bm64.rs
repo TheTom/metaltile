@@ -73,14 +73,13 @@
 //! per K-block, no inner SK sub-loop) which costs ~2× K-loop overhead but
 //! keeps the inline MSL tractable.
 
-use rustc_hash::FxHashMap;
-
 use metaltile_core::{
     constexpr::ConstExpr,
     dtype::DType,
     ir::{Block, BlockId, ConstExprDecl, Kernel, KernelMode, Op, Param, ParamKind, ValueId},
     shape::{Dim, Shape},
 };
+use rustc_hash::FxHashMap;
 
 use crate::spec::{BenchDispatch, BenchSpec};
 

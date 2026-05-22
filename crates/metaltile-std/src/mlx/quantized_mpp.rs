@@ -46,14 +46,13 @@
 //! is the runtime gate; downstream callers route to `mt_qmm_mma` (the
 //! non-MPP `simdgroup_matmul` variant) when `needs_mpp` is unsupported.
 
-use rustc_hash::FxHashMap;
-
 use metaltile_core::{
     constexpr::ConstExpr,
     dtype::DType,
     ir::{Block, BlockId, ConstExprDecl, Kernel, KernelMode, Op, Param, ParamKind},
     shape::{Dim, Shape},
 };
+use rustc_hash::FxHashMap;
 
 /// Tile geometry — keep in lock-step with the inline MSL below.
 pub const BM: u32 = 32;
