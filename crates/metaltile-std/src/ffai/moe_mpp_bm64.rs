@@ -188,9 +188,21 @@ auto ct_b = gemm_op.template get_right_input_cooperative_tensor<{ts}, {ts}, floa
 auto ct_c = gemm_op.template get_destination_cooperative_tensor<
     decltype(ct_a), decltype(ct_b), float>();
 
-// Walk row sub-runs — same logic as the BM=16 sibling, just over 64 rows.
-// Worst case 64 sub-runs (1 row each); production Qwen3.6-A3B
-// T=1024 × 128 experts ≈ 8 rows/expert → ~8 sub-runs per TG.
+// ── Sub-run accumulation trick (MLX `gather_qmm_rhs_nax` pattern) ─────
+//
+// `mode::multiply_accumulate` makes every matmul `ct_c += ct_a · ct_b`.
+// For rows OUTSIDE the current sub-run, we mask Xs to zero (see the
+// K-loop below), so that row's matmul contribution is zero. This lets
+// us zero ct_c ONCE at TG start, accumulate across all sub-runs, and
+// store ct_c ONCE at TG end — no per-sub-run OutScratch round-trip and
+// no cross-SG coop-write phase. Saves N · 2 barriers per TG (where N =
+// number of sub-runs, ~8 at Qwen3.6-A3B prefill T=512) and ~16 KB of
+// TG bandwidth from the eliminated coop-write reads. Each SG ends up
+// owning its 32×32 fp32 sub-tile in registers; per-SG independent
+// device store completes the kernel.
+for (uint16_t i = 0; i < ct_c.get_capacity(); ++i) ct_c[i] = 0.0f;
+
+// Walk row sub-runs.
 uint sub_offset = 0u;
 for (uint _sub_iter = 0u; _sub_iter < BM; _sub_iter++) {{
     uint sub_end = sub_offset;
@@ -219,14 +231,13 @@ for (uint _sub_iter = 0u; _sub_iter < BM; _sub_iter++) {{
         const uint w_expert_base  = cur_expert * n_out * packs_per_row;
         const uint sb_expert_base = cur_expert * n_out * groups_per_row;
 
-        // Zero the accumulator before this sub-run.
-        for (uint16_t i = 0; i < ct_c.get_capacity(); ++i) ct_c[i] = 0.0f;
-
         for (uint kb = 0u; kb < k_in; kb += BK) {{
             // ── 1. Stage X[m_tile_base..+BM, kb..kb+BK] -> Xs[BM*TG_LD]
             //    128 lanes × 16 contiguous K elems each fills the 64×32 tile.
+            //    Rows OUTSIDE the current sub-run get zeroed so the
+            //    matmul accumulates zero into ct_c for them — see the
+            //    multiply-accumulate note above the sub-run loop.
             uint gr_x = m_tile_base + x_m_row;
-            // Per-row mask: in [sub_offset, sub_end) AND global row valid.
             bool in_run_x =
                 (x_m_row >= sub_offset) && (x_m_row < sub_end) && (gr_x < m_total);
             uint safe_gr_x = in_run_x ? gr_x : 0u;
@@ -283,12 +294,6 @@ for (uint _sub_iter = 0u; _sub_iter < BM; _sub_iter++) {{
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             // ── 3. Per-SG tensor views over the TG tiles ─────────────────
-            // ct_a reads A [32, 32] = Xs[sg_m_base..+32, 0..32] (row-major,
-            // ld=TG_LD). ct_b reads B [32, 32] = Ws[sg_n_base..+32, 0..32]
-            // (row-major, ld=TG_LD) — tb=true treats this as K×N column-major
-            // = the qmm_t weight tile. `tensor_inline` packed-stride ctor:
-            // extents{{TG_LD, 32}} → stride[0]=1 along TG_LD (k-inner),
-            // stride[1]=TG_LD along 32 (m or n outer).
             threadgroup {ts}* xs_sg = Xs + sg_m_base * TG_LD;
             threadgroup {ts}* ws_sg = Ws + sg_n_base * TG_LD;
             metal::tensor<threadgroup {ts}, metal::extents<int, TG_LD, 32>, metal::tensor_inline>
@@ -303,49 +308,43 @@ for (uint _sub_iter = 0u; _sub_iter < BM; _sub_iter++) {{
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }}
-
-        // ── 4. Store per-SG 32×32 fp32 ct_c into a per-SG scratch slot,
-        //    barrier, then coop-write the 64×64 staged tile to global out
-        //    with fp32 → {t} narrow + per-row expert mask.
-        threadgroup float* sg_scratch = OutScratch + simd_group * (32u * 32u);
-        metal::tensor<threadgroup float, metal::extents<int, 32, 32>, metal::tensor_inline>
-            tC(sg_scratch, metal::extents<int, 32, 32>{{}});
-        ct_c.store(tC);
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Coop-write OutScratch -> out[m_tile_base..+BM, n_tile_base..+BN].
-        // 128 lanes × 32 elems = 4096 = BM*BN. Mapping:
-        //   flat = lane_in_tg * 32 + e
-        //   mr   = flat / BN ∈ 0..64
-        //   nc   = flat % BN ∈ 0..64
-        // Find which SG's scratch holds (mr, nc):
-        //   ssm = mr / 32 ∈ {{0, 1}}, ssn = nc / 32 ∈ {{0, 1}}
-        //   src_sg = ssm * 2 + ssn
-        //   sub_mr = mr & 31, sub_nc = nc & 31
-        #pragma clang loop unroll(full)
-        for (uint e = 0u; e < 32u; e++) {{
-            uint flat   = lane_in_tg * 32u + e;
-            uint mr     = flat / BN;
-            uint nc     = flat & 63u;          // BN=64 → mod via mask
-            uint gr     = m_tile_base + mr;
-            uint gc     = n_tile_base + nc;
-            bool in_run = (mr >= sub_offset) && (mr < sub_end)
-                        && (gr < m_total) && (gc < n_out);
-            if (in_run) {{
-                uint ssm     = mr >> 5u;       // mr / 32
-                uint ssn     = nc >> 5u;       // nc / 32
-                uint src_sg  = ssm * 2u + ssn;
-                uint sub_mr  = mr & 31u;
-                uint sub_nc  = nc & 31u;
-                float v      = OutScratch[src_sg * (32u * 32u) + sub_mr * 32u + sub_nc];
-                out[gr * n_out + gc] = ({t})v;
-            }}
-        }}
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }}
     sub_offset = sub_end;
+}}
+
+// ── Single end-of-TG store: ct_c → OutScratch → device `out` ──────────
+//
+// All sub-runs done. Each SG holds its full 32×32 fp32 sub-tile in
+// ct_c registers. Store cooperatively to the SG's slot of OutScratch
+// (still need TG memory because MPP `cooperative_tensor::store` writes
+// to a `metal::tensor` view, not directly to device with fp32→T cast),
+// then each SG's 32 lanes independently narrow + write the slot to its
+// 32×32 sub-region of `out`. No cross-SG TG reads — each lane only
+// reads its own SG's slot.
+threadgroup float* sg_scratch = OutScratch + simd_group * (32u * 32u);
+metal::tensor<threadgroup float, metal::extents<int, 32, 32>, metal::tensor_inline>
+    tC(sg_scratch, metal::extents<int, 32, 32>{{}});
+ct_c.store(tC);
+
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+// Per-SG independent write-out. 32 lanes × 32 elems/lane = 1024 cells
+// = exactly one SG's 32×32 sub-tile. Lane L of SG g writes row L of
+// the slot (cols 0..31) to device row m_tile_base + sg_m_base + L,
+// device cols n_tile_base + sg_n_base + (0..31).
+const uint sg_gr_base = m_tile_base + sg_m_base;
+const uint sg_gc_base = n_tile_base + sg_n_base;
+const uint device_row = sg_gr_base + simd_lane;
+if (device_row < m_total) {{
+    const uint device_row_off = device_row * n_out + sg_gc_base;
+    #pragma clang loop unroll(full)
+    for (uint c = 0u; c < 32u; c++) {{
+        uint gc = sg_gc_base + c;
+        if (gc < n_out) {{
+            float v = sg_scratch[simd_lane * 32u + c];
+            out[device_row_off + c] = ({t})v;
+        }}
+    }}
 }}
 #else
 // Pre-Metal-4 fallback: write zeros to keep the metallib linkable but
