@@ -49,7 +49,10 @@ use metaltile_std::{
         rms_norm::{mt_gated_mixer_norm, mt_rms_norm},
         steel::attn::steel_attention_mma::mt_sdpa_prefill_mma,
         swiglu::mt_swiglu,
-        unary::{mt_cast_to_f32, mt_gelu, mt_relu, mt_sigmoid, mt_sigmoid_scalar_fma, mt_silu, mt_softplus},
+        unary::{
+            mt_cast_to_f32, mt_gelu, mt_relu, mt_sigmoid, mt_sigmoid_scalar_fma,
+            mt_silu, mt_silu_cast_to_f32, mt_softplus,
+        },
     },
     probe::mpp_matmul_smoke,
 };
@@ -1634,6 +1637,17 @@ fn register_kernels() -> Vec<Kernel> {
     for &dt in &dtypes {
         let mut k = mt_cast_to_f32::kernel_ir_for(dt);
         k.name = format!("mt_cast_to_f32_{}", dtype_suffix(dt));
+        kernels.push(k);
+    }
+
+    // ─── mt_silu_cast_to_f32 (Elementwise) — fused silu + bf16→fp32 ─
+    // Used by FFAI's batched-prefill GDN inner loop to collapse the
+    // `silu(convOutScratch) → castToF32(convActF32Scratch)` two-
+    // dispatch chain into one. At Qwen3.6-A3B T=512 across 30 GDN
+    // layers that's 15360 dispatches removed per prefill.
+    for &dt in &[DType::F16, DType::BF16] {
+        let mut k = mt_silu_cast_to_f32::kernel_ir_for(dt);
+        k.name = format!("mt_silu_cast_to_f32_{}", dtype_suffix(dt));
         kernels.push(k);
     }
 

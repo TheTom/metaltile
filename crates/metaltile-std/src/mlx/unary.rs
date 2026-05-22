@@ -602,6 +602,25 @@ pub fn mt_cast_to_f32<T>(input: Tensor<T>, out: Tensor<f32>) {
     store(out[idx], load(input[idx]).cast::<f32>());
 }
 
+/// Fused silu + cast-to-f32. Replaces the `silu(bf16) → cast_to_f32`
+/// two-dispatch chain in FFAI's batched-prefill GDN inner loop with a
+/// single dispatch: read bf16/f16, apply silu, write f32.
+///
+/// silu(x) = x · sigmoid(x) = x · (1 / (1 + exp(-x))) computed at f32
+/// precision to match the bf16 → fp32 + silu → fp32 chain bit-for-bit
+/// (modulo rounding mode on the final write — same as the standalone
+/// silu kernel).
+///
+/// Saves T·30 ≈ 15k dispatches per Qwen3.6-A3B prefill at T=512 (one
+/// silu + one cast per GDN-layer per-token iter → one fused dispatch).
+#[kernel]
+pub fn mt_silu_cast_to_f32<T>(input: Tensor<T>, out: Tensor<f32>) {
+    let idx = program_id(0);
+    let x = load(input[idx]).cast::<f32>();
+    let sig = 1.0f32 / (1.0f32 + exp(0.0f32 - x));
+    store(out[idx], x * sig);
+}
+
 /// Fused scalar-sigmoid fan-out + FMA. Computes
 ///   `out[i] = base[i] + sigmoid(gate[0]) * value[i]`
 /// for `i in 0..hidden`, broadcasting the scalar `gate` across the
@@ -657,6 +676,22 @@ inventory::submit! {
         kernel_ir: mt_cast_to_f32::kernel_ir_for,
         dtypes: &[DType::F32, DType::F16, DType::BF16],
         tol: 0.0,
+        mlx_src: None,
+        mlx_pattern: None,
+        shapes: &[],
+        dispatch: BenchDispatch::Generic,
+        kernel_mode: Some(KernelMode::Elementwise),
+    }
+}
+
+inventory::submit! {
+    BenchSpec {
+        op: "unary",
+        subop: "silu_cast_to_f32",
+        kernel_name: "mt_silu_cast_to_f32",
+        kernel_ir: mt_silu_cast_to_f32::kernel_ir_for,
+        dtypes: &[DType::F16, DType::BF16],
+        tol: 1e-3,
         mlx_src: None,
         mlx_pattern: None,
         shapes: &[],
