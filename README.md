@@ -23,8 +23,12 @@ A Rust-embedded DSL for writing Apple Metal GPU kernels. Write tile-level algori
 ## Installation
 
 ```sh
-cargo install --path crates/metaltile-cli
+curl -fsSL https://github.com/0xClandestine/metaltile/releases/latest/download/install.sh | sh
 ```
+
+Run `tile update` at any time to upgrade to the latest release.
+
+For contributors building from source, see [Getting Started](docs/getting-started.md).
 
 ## Getting Started
 
