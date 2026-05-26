@@ -101,360 +101,202 @@
 //! values at offsets `pack_idx*8 + i` for i in 0..8, which are
 //! neighbours, not strided slots. Threads can't share registers.
 //! TG memory is the right abstraction here. 3 KiB is cheap.
+//!
+//! ## Source-level dedup via `define_kernel!` macro
+//!
+//! The 8 slot bodies are byte-for-byte identical modulo the 4 per-slot
+//! identifiers (`gate_k`, `up_k`, `exp_k`, `sw_k`). To avoid 8 hand-
+//! copies of a ~50-line block, we wrap the ENTIRE `#[kernel] fn`
+//! declaration in a `macro_rules!` that takes 8 slot tuples and
+//! expands the per-slot body via `$(...)*` repetition. Macro
+//! expansion happens at Rust compile time BEFORE the `#[kernel]`
+//! proc-macro parses the body, so the emitted IR + MSL are byte-
+//! identical to the 8 hand-unrolled blocks.
+//!
+//! NB: the proc-macro's `body_parser` explicitly rejects
+//! `macro_rules!` invocations INSIDE a kernel body (see
+//! `metaltile-macros/src/body_parser.rs:210`) — they'd silently
+//! produce no IR. The "wrap the whole fn" pattern is the supported
+//! workaround called out in that same error message.
 
 use metaltile::{bench_kernel, kernel};
 
-#[bench_kernel(
-    op="moe_down_swiglu_accum",
-    subop="int4_chain8",
-    class=GenericEmpty,
-    tol=0.0,
-    kernel_mode=Reduction,
-)]
-#[kernel]
-#[allow(clippy::too_many_arguments)]
-pub fn ffai_moe_down_swiglu_accum_int4_chain8<T>(
-    gate_0: Tensor<T>,
-    up_0: Tensor<T>,
-    gate_1: Tensor<T>,
-    up_1: Tensor<T>,
-    gate_2: Tensor<T>,
-    up_2: Tensor<T>,
-    gate_3: Tensor<T>,
-    up_3: Tensor<T>,
-    gate_4: Tensor<T>,
-    up_4: Tensor<T>,
-    gate_5: Tensor<T>,
-    up_5: Tensor<T>,
-    gate_6: Tensor<T>,
-    up_6: Tensor<T>,
-    gate_7: Tensor<T>,
-    up_7: Tensor<T>,
-    expert_indices: Tensor<u32>,
-    slot_weights: Tensor<T>,
-    weights_stacked: Tensor<u32>,
-    scales_stacked: Tensor<T>,
-    biases_stacked: Tensor<T>,
-    output: Tensor<T>,
-    #[constexpr] in_dim: u32,
-    #[constexpr] out_dim: u32,
-    #[constexpr] group_size: u32,
-) {
-    // Threadgroup scratch for the active slot's inner activations.
-    // 768 = Qwen3.6-A3B moeIntermediate. Bump the literal (and
-    // re-validate Apple9 TG-mem ceiling) if a future model needs a
-    // larger intermediate. f32 stage so the qmm consumer reads at
-    // accumulation precision.
-    threadgroup_alloc("tg_inner", 768, "f32");
+/// Build the fused MoE down+SwiGLU+chain8 kernel from 8 slot tuples.
+///
+/// Each tuple = `($gate, $up, $exp, $sw, $we, $se, $rpo, $rgo, $trailing)`:
+/// - `$gate`, `$up`: kernel param idents for the slot's gate/up
+///   activations
+/// - `$exp`, `$sw`: local idents that hold the slot's expert index
+///   and routing scalar (declared in the kernel prologue)
+/// - `$we`, `$se`, `$rpo`, `$rgo`: per-slot unique idents for the
+///   weight-expert / scale-expert / row-pack-offset / row-group-offset
+///   locals. Passing them in (instead of declaring `let we = ...`
+///   inside the macro body) gives each slot a distinct C-level name,
+///   so the emitted MSL is byte-identical to the hand-unrolled version
+///   (verified via `tile build --emit` diff across f32/f16/bf16).
+/// - `$trailing`: either `{ threadgroup_barrier(); }` (slots 0..6,
+///   WAR barrier before next slot overwrites `tg_inner`) or `{}`
+///   (slot 7, no further `tg_inner` access after this slot).
+///
+/// All other identifiers (`tg_inner`, `acc`, `row`, `n_packs_per_row`,
+/// `n_groups`, `packs_per_group`, `vals_per_pack`, `mask`, `p_iters`,
+/// `in_iters`, `weights_stacked`, `scales_stacked`, `biases_stacked`,
+/// `out_dim`, `in_dim`, `lsize`, `tid`) are shared kernel scope and
+/// captured by name from the surrounding body.
+macro_rules! define_moe_down_swiglu_accum_chain8 {
+    (
+        $(
+            (
+                $gate:ident, $up:ident, $exp:ident, $sw:ident,
+                $we:ident, $se:ident, $rpo:ident, $rgo:ident,
+                $trailing:tt
+            )
+        ),* $(,)?
+    ) => {
+        #[bench_kernel(
+            op="moe_down_swiglu_accum",
+            subop="int4_chain8",
+            class=GenericEmpty,
+            tol=0.0,
+            kernel_mode=Reduction,
+        )]
+        #[kernel]
+        #[allow(clippy::too_many_arguments)]
+        pub fn ffai_moe_down_swiglu_accum_int4_chain8<T>(
+            gate_0: Tensor<T>,
+            up_0: Tensor<T>,
+            gate_1: Tensor<T>,
+            up_1: Tensor<T>,
+            gate_2: Tensor<T>,
+            up_2: Tensor<T>,
+            gate_3: Tensor<T>,
+            up_3: Tensor<T>,
+            gate_4: Tensor<T>,
+            up_4: Tensor<T>,
+            gate_5: Tensor<T>,
+            up_5: Tensor<T>,
+            gate_6: Tensor<T>,
+            up_6: Tensor<T>,
+            gate_7: Tensor<T>,
+            up_7: Tensor<T>,
+            expert_indices: Tensor<u32>,
+            slot_weights: Tensor<T>,
+            weights_stacked: Tensor<u32>,
+            scales_stacked: Tensor<T>,
+            biases_stacked: Tensor<T>,
+            output: Tensor<T>,
+            #[constexpr] in_dim: u32,
+            #[constexpr] out_dim: u32,
+            #[constexpr] group_size: u32,
+        ) {
+            // Threadgroup scratch for the active slot's inner activations.
+            // 768 = Qwen3.6-A3B moeIntermediate. Bump the literal (and
+            // re-validate Apple9 TG-mem ceiling) if a future model needs a
+            // larger intermediate. f32 stage so the qmm consumer reads at
+            // accumulation precision.
+            threadgroup_alloc("tg_inner", 768, "f32");
 
-    // Int4 dequant constants, match `dequant_gemv_int4_expert_indexed`.
-    let vals_per_pack = 8u32;
-    let mask = 0xFu32;
-    let row = program_id::<0>();
-    let n_packs_per_row = in_dim / vals_per_pack;
-    let n_groups = in_dim / group_size;
-    let packs_per_group = group_size / vals_per_pack;
+            // Int4 dequant constants, match `dequant_gemv_int4_expert_indexed`.
+            let vals_per_pack = 8u32;
+            let mask = 0xFu32;
+            let row = program_id::<0>();
+            let n_packs_per_row = in_dim / vals_per_pack;
+            let n_groups = in_dim / group_size;
+            let packs_per_group = group_size / vals_per_pack;
 
-    // Pre-load all 8 expert indices and slot weights into registers.
-    // Cheap: 8 u32 loads + 8 T loads; reused across the slot loop.
-    let exp_0 = load(expert_indices[0u32]);
-    let exp_1 = load(expert_indices[1u32]);
-    let exp_2 = load(expert_indices[2u32]);
-    let exp_3 = load(expert_indices[3u32]);
-    let exp_4 = load(expert_indices[4u32]);
-    let exp_5 = load(expert_indices[5u32]);
-    let exp_6 = load(expert_indices[6u32]);
-    let exp_7 = load(expert_indices[7u32]);
-    let sw_0 = load(slot_weights[0u32]).cast::<f32>();
-    let sw_1 = load(slot_weights[1u32]).cast::<f32>();
-    let sw_2 = load(slot_weights[2u32]).cast::<f32>();
-    let sw_3 = load(slot_weights[3u32]).cast::<f32>();
-    let sw_4 = load(slot_weights[4u32]).cast::<f32>();
-    let sw_5 = load(slot_weights[5u32]).cast::<f32>();
-    let sw_6 = load(slot_weights[6u32]).cast::<f32>();
-    let sw_7 = load(slot_weights[7u32]).cast::<f32>();
+            // Pre-load all 8 expert indices and slot weights into registers.
+            // Cheap: 8 u32 loads + 8 T loads; reused across the slot loop.
+            let exp_0 = load(expert_indices[0u32]);
+            let exp_1 = load(expert_indices[1u32]);
+            let exp_2 = load(expert_indices[2u32]);
+            let exp_3 = load(expert_indices[3u32]);
+            let exp_4 = load(expert_indices[4u32]);
+            let exp_5 = load(expert_indices[5u32]);
+            let exp_6 = load(expert_indices[6u32]);
+            let exp_7 = load(expert_indices[7u32]);
+            let sw_0 = load(slot_weights[0u32]).cast::<f32>();
+            let sw_1 = load(slot_weights[1u32]).cast::<f32>();
+            let sw_2 = load(slot_weights[2u32]).cast::<f32>();
+            let sw_3 = load(slot_weights[3u32]).cast::<f32>();
+            let sw_4 = load(slot_weights[4u32]).cast::<f32>();
+            let sw_5 = load(slot_weights[5u32]).cast::<f32>();
+            let sw_6 = load(slot_weights[6u32]).cast::<f32>();
+            let sw_7 = load(slot_weights[7u32]).cast::<f32>();
 
-    // Running per-thread accumulator across all 8 slots. Each slot's
-    // contribution = slot_weight * Σ_packs (q*s+b) * tg_inner[d].
-    // Final reduce_sum fuses the 8 slots' partials in one fold.
-    let mut acc = 0.0f32;
+            // Running per-thread accumulator across all 8 slots. Each slot's
+            // contribution = slot_weight * Σ_packs (q*s+b) * tg_inner[d].
+            // Final reduce_sum fuses the 8 slots' partials in one fold.
+            let mut acc = 0.0f32;
 
-    // Iteration counts, same shape as the indexed-expert dequant-gemv.
-    let p_iters = (n_packs_per_row + lsize - 1u32) / lsize;
-    let in_iters = (in_dim + lsize - 1u32) / lsize;
+            // Iteration counts, same shape as the indexed-expert dequant-gemv.
+            let p_iters = (n_packs_per_row + lsize - 1u32) / lsize;
+            let in_iters = (in_dim + lsize - 1u32) / lsize;
 
-    // ── Slot 0 ───────────────────────────────────────────────────────
-    // (a) Cooperatively fill tg_inner with silu(gate_0) * up_0.
-    for s_iter in range(0u32, in_iters, 1u32) {
-        let d = s_iter * lsize + tid;
-        if d < in_dim {
-            let g = load(gate_0[d]).cast::<f32>();
-            let u = load(up_0[d]).cast::<f32>();
-            // Inline silu in f32, same form as gated_rmsnorm.rs and
-            // swiglu.rs. Avoids T→f32→T round-trip and keeps the gate
-            // precise before the multiply.
-            let s = g / (1.0f32 + exp(0.0f32 - g));
-            threadgroup_store("tg_inner", d, s * u);
-        }
-    }
-    threadgroup_barrier();
-    // (b) Dequant-gemv inner loop for slot 0.
-    let we_0 = exp_0 * out_dim * n_packs_per_row;
-    let se_0 = exp_0 * n_groups * out_dim;
-    let rpo_0 = we_0 + row * n_packs_per_row;
-    let rgo_0 = se_0 + row * n_groups;
-    for p_iter in range(0u32, p_iters, 1u32) {
-        let pack_idx = p_iter * lsize + tid;
-        if pack_idx < n_packs_per_row {
-            let g = pack_idx / packs_per_group;
-            let scale = load(scales_stacked[rgo_0 + g]).cast::<f32>();
-            let bias = load(biases_stacked[rgo_0 + g]).cast::<f32>();
-            let packed = load(weights_stacked[rpo_0 + pack_idx]);
-            let p_off = pack_idx * vals_per_pack;
-            for i in range(0u32, vals_per_pack, 1u32) {
-                let q = (packed >> (i * 4u32)) & mask;
-                let dq = q.cast::<f32>() * scale + bias;
-                let inner_v = threadgroup_load("tg_inner", p_off + i);
-                acc = acc + sw_0 * dq * inner_v;
+            // Expand one slot body per tuple. Each body:
+            //   (a) Cooperatively fill tg_inner with silu($gate) * $up.
+            //   (b) RAW barrier.
+            //   (c) Dequant-gemv inner loop, accumulating into `acc`
+            //       with $sw baked in.
+            //   (d) $trailing: WAR barrier for slots 0..6, empty for
+            //       slot 7 (no further tg_inner access).
+            //
+            // The per-slot `$we / $se / $rpo / $rgo` idents are supplied
+            // by the caller so each slot gets a distinct C-level local
+            // (matches the hand-unroll exactly — keeps emit byte-equal).
+            $(
+                for s_iter in range(0u32, in_iters, 1u32) {
+                    let d = s_iter * lsize + tid;
+                    if d < in_dim {
+                        let g = load($gate[d]).cast::<f32>();
+                        let u = load($up[d]).cast::<f32>();
+                        // Inline silu in f32, same form as
+                        // gated_rmsnorm.rs and swiglu.rs. Avoids
+                        // T→f32→T round-trip and keeps the gate
+                        // precise before the multiply.
+                        let s = g / (1.0f32 + exp(0.0f32 - g));
+                        threadgroup_store("tg_inner", d, s * u);
+                    }
+                }
+                threadgroup_barrier();
+                let $we = $exp * out_dim * n_packs_per_row;
+                let $se = $exp * n_groups * out_dim;
+                let $rpo = $we + row * n_packs_per_row;
+                let $rgo = $se + row * n_groups;
+                for p_iter in range(0u32, p_iters, 1u32) {
+                    let pack_idx = p_iter * lsize + tid;
+                    if pack_idx < n_packs_per_row {
+                        let g = pack_idx / packs_per_group;
+                        let scale = load(scales_stacked[$rgo + g]).cast::<f32>();
+                        let bias = load(biases_stacked[$rgo + g]).cast::<f32>();
+                        let packed = load(weights_stacked[$rpo + pack_idx]);
+                        let p_off = pack_idx * vals_per_pack;
+                        for i in range(0u32, vals_per_pack, 1u32) {
+                            let q = (packed >> (i * 4u32)) & mask;
+                            let dq = q.cast::<f32>() * scale + bias;
+                            let inner_v = threadgroup_load("tg_inner", p_off + i);
+                            acc = acc + $sw * dq * inner_v;
+                        }
+                    }
+                }
+                $trailing
+            )*
+
+            // ── Cross-thread fold + store ────────────────────────────
+            let total = reduce_sum(acc);
+            if tid == 0u32 {
+                store(output[row], total.cast::<T>());
             }
         }
-    }
-    threadgroup_barrier();
-
-    // ── Slot 1 ───────────────────────────────────────────────────────
-    for s_iter in range(0u32, in_iters, 1u32) {
-        let d = s_iter * lsize + tid;
-        if d < in_dim {
-            let g = load(gate_1[d]).cast::<f32>();
-            let u = load(up_1[d]).cast::<f32>();
-            let s = g / (1.0f32 + exp(0.0f32 - g));
-            threadgroup_store("tg_inner", d, s * u);
-        }
-    }
-    threadgroup_barrier();
-    let we_1 = exp_1 * out_dim * n_packs_per_row;
-    let se_1 = exp_1 * n_groups * out_dim;
-    let rpo_1 = we_1 + row * n_packs_per_row;
-    let rgo_1 = se_1 + row * n_groups;
-    for p_iter in range(0u32, p_iters, 1u32) {
-        let pack_idx = p_iter * lsize + tid;
-        if pack_idx < n_packs_per_row {
-            let g = pack_idx / packs_per_group;
-            let scale = load(scales_stacked[rgo_1 + g]).cast::<f32>();
-            let bias = load(biases_stacked[rgo_1 + g]).cast::<f32>();
-            let packed = load(weights_stacked[rpo_1 + pack_idx]);
-            let p_off = pack_idx * vals_per_pack;
-            for i in range(0u32, vals_per_pack, 1u32) {
-                let q = (packed >> (i * 4u32)) & mask;
-                let dq = q.cast::<f32>() * scale + bias;
-                let inner_v = threadgroup_load("tg_inner", p_off + i);
-                acc = acc + sw_1 * dq * inner_v;
-            }
-        }
-    }
-    threadgroup_barrier();
-
-    // ── Slot 2 ───────────────────────────────────────────────────────
-    for s_iter in range(0u32, in_iters, 1u32) {
-        let d = s_iter * lsize + tid;
-        if d < in_dim {
-            let g = load(gate_2[d]).cast::<f32>();
-            let u = load(up_2[d]).cast::<f32>();
-            let s = g / (1.0f32 + exp(0.0f32 - g));
-            threadgroup_store("tg_inner", d, s * u);
-        }
-    }
-    threadgroup_barrier();
-    let we_2 = exp_2 * out_dim * n_packs_per_row;
-    let se_2 = exp_2 * n_groups * out_dim;
-    let rpo_2 = we_2 + row * n_packs_per_row;
-    let rgo_2 = se_2 + row * n_groups;
-    for p_iter in range(0u32, p_iters, 1u32) {
-        let pack_idx = p_iter * lsize + tid;
-        if pack_idx < n_packs_per_row {
-            let g = pack_idx / packs_per_group;
-            let scale = load(scales_stacked[rgo_2 + g]).cast::<f32>();
-            let bias = load(biases_stacked[rgo_2 + g]).cast::<f32>();
-            let packed = load(weights_stacked[rpo_2 + pack_idx]);
-            let p_off = pack_idx * vals_per_pack;
-            for i in range(0u32, vals_per_pack, 1u32) {
-                let q = (packed >> (i * 4u32)) & mask;
-                let dq = q.cast::<f32>() * scale + bias;
-                let inner_v = threadgroup_load("tg_inner", p_off + i);
-                acc = acc + sw_2 * dq * inner_v;
-            }
-        }
-    }
-    threadgroup_barrier();
-
-    // ── Slot 3 ───────────────────────────────────────────────────────
-    for s_iter in range(0u32, in_iters, 1u32) {
-        let d = s_iter * lsize + tid;
-        if d < in_dim {
-            let g = load(gate_3[d]).cast::<f32>();
-            let u = load(up_3[d]).cast::<f32>();
-            let s = g / (1.0f32 + exp(0.0f32 - g));
-            threadgroup_store("tg_inner", d, s * u);
-        }
-    }
-    threadgroup_barrier();
-    let we_3 = exp_3 * out_dim * n_packs_per_row;
-    let se_3 = exp_3 * n_groups * out_dim;
-    let rpo_3 = we_3 + row * n_packs_per_row;
-    let rgo_3 = se_3 + row * n_groups;
-    for p_iter in range(0u32, p_iters, 1u32) {
-        let pack_idx = p_iter * lsize + tid;
-        if pack_idx < n_packs_per_row {
-            let g = pack_idx / packs_per_group;
-            let scale = load(scales_stacked[rgo_3 + g]).cast::<f32>();
-            let bias = load(biases_stacked[rgo_3 + g]).cast::<f32>();
-            let packed = load(weights_stacked[rpo_3 + pack_idx]);
-            let p_off = pack_idx * vals_per_pack;
-            for i in range(0u32, vals_per_pack, 1u32) {
-                let q = (packed >> (i * 4u32)) & mask;
-                let dq = q.cast::<f32>() * scale + bias;
-                let inner_v = threadgroup_load("tg_inner", p_off + i);
-                acc = acc + sw_3 * dq * inner_v;
-            }
-        }
-    }
-    threadgroup_barrier();
-
-    // ── Slot 4 ───────────────────────────────────────────────────────
-    for s_iter in range(0u32, in_iters, 1u32) {
-        let d = s_iter * lsize + tid;
-        if d < in_dim {
-            let g = load(gate_4[d]).cast::<f32>();
-            let u = load(up_4[d]).cast::<f32>();
-            let s = g / (1.0f32 + exp(0.0f32 - g));
-            threadgroup_store("tg_inner", d, s * u);
-        }
-    }
-    threadgroup_barrier();
-    let we_4 = exp_4 * out_dim * n_packs_per_row;
-    let se_4 = exp_4 * n_groups * out_dim;
-    let rpo_4 = we_4 + row * n_packs_per_row;
-    let rgo_4 = se_4 + row * n_groups;
-    for p_iter in range(0u32, p_iters, 1u32) {
-        let pack_idx = p_iter * lsize + tid;
-        if pack_idx < n_packs_per_row {
-            let g = pack_idx / packs_per_group;
-            let scale = load(scales_stacked[rgo_4 + g]).cast::<f32>();
-            let bias = load(biases_stacked[rgo_4 + g]).cast::<f32>();
-            let packed = load(weights_stacked[rpo_4 + pack_idx]);
-            let p_off = pack_idx * vals_per_pack;
-            for i in range(0u32, vals_per_pack, 1u32) {
-                let q = (packed >> (i * 4u32)) & mask;
-                let dq = q.cast::<f32>() * scale + bias;
-                let inner_v = threadgroup_load("tg_inner", p_off + i);
-                acc = acc + sw_4 * dq * inner_v;
-            }
-        }
-    }
-    threadgroup_barrier();
-
-    // ── Slot 5 ───────────────────────────────────────────────────────
-    for s_iter in range(0u32, in_iters, 1u32) {
-        let d = s_iter * lsize + tid;
-        if d < in_dim {
-            let g = load(gate_5[d]).cast::<f32>();
-            let u = load(up_5[d]).cast::<f32>();
-            let s = g / (1.0f32 + exp(0.0f32 - g));
-            threadgroup_store("tg_inner", d, s * u);
-        }
-    }
-    threadgroup_barrier();
-    let we_5 = exp_5 * out_dim * n_packs_per_row;
-    let se_5 = exp_5 * n_groups * out_dim;
-    let rpo_5 = we_5 + row * n_packs_per_row;
-    let rgo_5 = se_5 + row * n_groups;
-    for p_iter in range(0u32, p_iters, 1u32) {
-        let pack_idx = p_iter * lsize + tid;
-        if pack_idx < n_packs_per_row {
-            let g = pack_idx / packs_per_group;
-            let scale = load(scales_stacked[rgo_5 + g]).cast::<f32>();
-            let bias = load(biases_stacked[rgo_5 + g]).cast::<f32>();
-            let packed = load(weights_stacked[rpo_5 + pack_idx]);
-            let p_off = pack_idx * vals_per_pack;
-            for i in range(0u32, vals_per_pack, 1u32) {
-                let q = (packed >> (i * 4u32)) & mask;
-                let dq = q.cast::<f32>() * scale + bias;
-                let inner_v = threadgroup_load("tg_inner", p_off + i);
-                acc = acc + sw_5 * dq * inner_v;
-            }
-        }
-    }
-    threadgroup_barrier();
-
-    // ── Slot 6 ───────────────────────────────────────────────────────
-    for s_iter in range(0u32, in_iters, 1u32) {
-        let d = s_iter * lsize + tid;
-        if d < in_dim {
-            let g = load(gate_6[d]).cast::<f32>();
-            let u = load(up_6[d]).cast::<f32>();
-            let s = g / (1.0f32 + exp(0.0f32 - g));
-            threadgroup_store("tg_inner", d, s * u);
-        }
-    }
-    threadgroup_barrier();
-    let we_6 = exp_6 * out_dim * n_packs_per_row;
-    let se_6 = exp_6 * n_groups * out_dim;
-    let rpo_6 = we_6 + row * n_packs_per_row;
-    let rgo_6 = se_6 + row * n_groups;
-    for p_iter in range(0u32, p_iters, 1u32) {
-        let pack_idx = p_iter * lsize + tid;
-        if pack_idx < n_packs_per_row {
-            let g = pack_idx / packs_per_group;
-            let scale = load(scales_stacked[rgo_6 + g]).cast::<f32>();
-            let bias = load(biases_stacked[rgo_6 + g]).cast::<f32>();
-            let packed = load(weights_stacked[rpo_6 + pack_idx]);
-            let p_off = pack_idx * vals_per_pack;
-            for i in range(0u32, vals_per_pack, 1u32) {
-                let q = (packed >> (i * 4u32)) & mask;
-                let dq = q.cast::<f32>() * scale + bias;
-                let inner_v = threadgroup_load("tg_inner", p_off + i);
-                acc = acc + sw_6 * dq * inner_v;
-            }
-        }
-    }
-    threadgroup_barrier();
-
-    // ── Slot 7 ───────────────────────────────────────────────────────
-    for s_iter in range(0u32, in_iters, 1u32) {
-        let d = s_iter * lsize + tid;
-        if d < in_dim {
-            let g = load(gate_7[d]).cast::<f32>();
-            let u = load(up_7[d]).cast::<f32>();
-            let s = g / (1.0f32 + exp(0.0f32 - g));
-            threadgroup_store("tg_inner", d, s * u);
-        }
-    }
-    threadgroup_barrier();
-    let we_7 = exp_7 * out_dim * n_packs_per_row;
-    let se_7 = exp_7 * n_groups * out_dim;
-    let rpo_7 = we_7 + row * n_packs_per_row;
-    let rgo_7 = se_7 + row * n_groups;
-    for p_iter in range(0u32, p_iters, 1u32) {
-        let pack_idx = p_iter * lsize + tid;
-        if pack_idx < n_packs_per_row {
-            let g = pack_idx / packs_per_group;
-            let scale = load(scales_stacked[rgo_7 + g]).cast::<f32>();
-            let bias = load(biases_stacked[rgo_7 + g]).cast::<f32>();
-            let packed = load(weights_stacked[rpo_7 + pack_idx]);
-            let p_off = pack_idx * vals_per_pack;
-            for i in range(0u32, vals_per_pack, 1u32) {
-                let q = (packed >> (i * 4u32)) & mask;
-                let dq = q.cast::<f32>() * scale + bias;
-                let inner_v = threadgroup_load("tg_inner", p_off + i);
-                acc = acc + sw_7 * dq * inner_v;
-            }
-        }
-    }
-    // No trailing barrier: no further tg_inner access after slot 7.
-
-    // ── Cross-thread fold + store ────────────────────────────────────
-    let total = reduce_sum(acc);
-    if tid == 0u32 {
-        store(output[row], total.cast::<T>());
-    }
+    };
 }
+
+define_moe_down_swiglu_accum_chain8!(
+    (gate_0, up_0, exp_0, sw_0, we_0, se_0, rpo_0, rgo_0, { threadgroup_barrier(); }),
+    (gate_1, up_1, exp_1, sw_1, we_1, se_1, rpo_1, rgo_1, { threadgroup_barrier(); }),
+    (gate_2, up_2, exp_2, sw_2, we_2, se_2, rpo_2, rgo_2, { threadgroup_barrier(); }),
+    (gate_3, up_3, exp_3, sw_3, we_3, se_3, rpo_3, rgo_3, { threadgroup_barrier(); }),
+    (gate_4, up_4, exp_4, sw_4, we_4, se_4, rpo_4, rgo_4, { threadgroup_barrier(); }),
+    (gate_5, up_5, exp_5, sw_5, we_5, se_5, rpo_5, rgo_5, { threadgroup_barrier(); }),
+    (gate_6, up_6, exp_6, sw_6, we_6, se_6, rpo_6, rgo_6, { threadgroup_barrier(); }),
+    (gate_7, up_7, exp_7, sw_7, we_7, se_7, rpo_7, rgo_7, {}),
+);
