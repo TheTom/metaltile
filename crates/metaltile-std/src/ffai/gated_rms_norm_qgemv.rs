@@ -165,25 +165,24 @@ pub fn ffai_gated_rms_norm_qgemv_int4_fast<T>(
     // Mirrors `ffai_rms_norm_qgemv_fast` Phase 2 verbatim, except the
     // 16-element X stripe per lane is loaded from `tg_inner` (fp32) in
     // place of the on-the-fly `x[xi] * norm_weight[xi] * inv_rms` fuse.
+    //
+    // The 4-rows-per-simdgroup work is expressed as a `range(0u32, 4u32,
+    // 1u32)` loop with a `stack_alloc("accs", 4, f32)` for the per-row
+    // accumulators — same shape as `dequant_gemv_int4_fast`. Replaces the
+    // four hand-unrolled `acc0/acc1/acc2/acc3` blocks (~140 lines each)
+    // with one ~30-line loop body that the DSL lowers identically.
     let in_dim = hv * dv;
-    let row0 = tg * 8u32 + sg * 4u32;
-    let row1 = row0 + 1u32;
-    let row2 = row0 + 2u32;
-    let row3 = row0 + 3u32;
+    let base_row = tg * 8u32 + sg * 4u32;
     let gs_per_row = in_dim / group_size;
     let packs_per_row = in_dim / 8u32; // 8 int4 values per u32
-    let w_base0 = row0 * packs_per_row;
-    let w_base1 = row1 * packs_per_row;
-    let w_base2 = row2 * packs_per_row;
-    let w_base3 = row3 * packs_per_row;
-    let sb_base0 = row0 * gs_per_row;
-    let sb_base1 = row1 * gs_per_row;
-    let sb_base2 = row2 * gs_per_row;
-    let sb_base3 = row3 * gs_per_row;
-    let mut acc0 = 0.0f32;
-    let mut acc1 = 0.0f32;
-    let mut acc2 = 0.0f32;
-    let mut acc3 = 0.0f32;
+    // Per-row partial-sum accumulators. `stack_alloc` lowers to a
+    // `thread`-private array indexable by a runtime loop variable; the DSL
+    // doesn't lower runtime-indexed `let mut [T; N]` arrays (see the
+    // `_m{16,32}` notes in `ffai/moe.rs` for the same constraint).
+    stack_alloc("accs", 4, "f32");
+    for _r in range(0u32, 4u32, 1u32) {
+        stack_store("accs", _r, 0.0f32);
+    }
     let lane_x_off = lane * 16u32;
     let lane_pack_off = lane * 2u32;
     // Mask-without-shift constants - identical to `rms_norm_qgemv_fast`.
@@ -239,176 +238,48 @@ pub fn ffai_gated_rms_norm_qgemv_int4_fast<T>(
         let n15 = n15_raw * s_4096;
         let g = xb / group_size;
         let pack_off = _b / 8u32 + lane_pack_off;
-        // ── Row 0 ──
-        let p00 = load(q_weight[w_base0 + pack_off]);
-        let p01 = load(q_weight[w_base0 + pack_off + 1u32]);
-        let p00_hi = p00 >> 16u32;
-        let p01_hi = p01 >> 16u32;
-        let s0 = load(q_scales[sb_base0 + g]).cast::<f32>();
-        let bi0 = load(q_biases[sb_base0 + g]).cast::<f32>();
-        let q00 = (p00 & 15u32).cast::<f32>();
-        let q01 = (p00 & 240u32).cast::<f32>();
-        let q02 = (p00 & 3840u32).cast::<f32>();
-        let q03 = (p00 & 61440u32).cast::<f32>();
-        let q04 = (p00_hi & 15u32).cast::<f32>();
-        let q05 = (p00_hi & 240u32).cast::<f32>();
-        let q06 = (p00_hi & 3840u32).cast::<f32>();
-        let q07 = (p00_hi & 61440u32).cast::<f32>();
-        let q08 = (p01 & 15u32).cast::<f32>();
-        let q09 = (p01 & 240u32).cast::<f32>();
-        let q010 = (p01 & 3840u32).cast::<f32>();
-        let q011 = (p01 & 61440u32).cast::<f32>();
-        let q012 = (p01_hi & 15u32).cast::<f32>();
-        let q013 = (p01_hi & 240u32).cast::<f32>();
-        let q014 = (p01_hi & 3840u32).cast::<f32>();
-        let q015 = (p01_hi & 61440u32).cast::<f32>();
-        let qd0 = q00 * n0_raw
-            + q01 * n1
-            + q02 * n2
-            + q03 * n3
-            + q04 * n4_raw
-            + q05 * n5
-            + q06 * n6
-            + q07 * n7
-            + q08 * n8_raw
-            + q09 * n9
-            + q010 * n10
-            + q011 * n11
-            + q012 * n12_raw
-            + q013 * n13
-            + q014 * n14
-            + q015 * n15;
-        acc0 = acc0 + s0 * qd0 + bi0 * ns;
-        // ── Row 1 ──
-        let p10 = load(q_weight[w_base1 + pack_off]);
-        let p11 = load(q_weight[w_base1 + pack_off + 1u32]);
-        let p10_hi = p10 >> 16u32;
-        let p11_hi = p11 >> 16u32;
-        let s1 = load(q_scales[sb_base1 + g]).cast::<f32>();
-        let bi1 = load(q_biases[sb_base1 + g]).cast::<f32>();
-        let q10 = (p10 & 15u32).cast::<f32>();
-        let q11 = (p10 & 240u32).cast::<f32>();
-        let q12 = (p10 & 3840u32).cast::<f32>();
-        let q13 = (p10 & 61440u32).cast::<f32>();
-        let q14 = (p10_hi & 15u32).cast::<f32>();
-        let q15 = (p10_hi & 240u32).cast::<f32>();
-        let q16 = (p10_hi & 3840u32).cast::<f32>();
-        let q17 = (p10_hi & 61440u32).cast::<f32>();
-        let q18 = (p11 & 15u32).cast::<f32>();
-        let q19 = (p11 & 240u32).cast::<f32>();
-        let q110 = (p11 & 3840u32).cast::<f32>();
-        let q111 = (p11 & 61440u32).cast::<f32>();
-        let q112 = (p11_hi & 15u32).cast::<f32>();
-        let q113 = (p11_hi & 240u32).cast::<f32>();
-        let q114 = (p11_hi & 3840u32).cast::<f32>();
-        let q115 = (p11_hi & 61440u32).cast::<f32>();
-        let qd1 = q10 * n0_raw
-            + q11 * n1
-            + q12 * n2
-            + q13 * n3
-            + q14 * n4_raw
-            + q15 * n5
-            + q16 * n6
-            + q17 * n7
-            + q18 * n8_raw
-            + q19 * n9
-            + q110 * n10
-            + q111 * n11
-            + q112 * n12_raw
-            + q113 * n13
-            + q114 * n14
-            + q115 * n15;
-        acc1 = acc1 + s1 * qd1 + bi1 * ns;
-        // ── Row 2 ──
-        let p20 = load(q_weight[w_base2 + pack_off]);
-        let p21 = load(q_weight[w_base2 + pack_off + 1u32]);
-        let p20_hi = p20 >> 16u32;
-        let p21_hi = p21 >> 16u32;
-        let s2 = load(q_scales[sb_base2 + g]).cast::<f32>();
-        let bi2 = load(q_biases[sb_base2 + g]).cast::<f32>();
-        let q20 = (p20 & 15u32).cast::<f32>();
-        let q21 = (p20 & 240u32).cast::<f32>();
-        let q22 = (p20 & 3840u32).cast::<f32>();
-        let q23 = (p20 & 61440u32).cast::<f32>();
-        let q24 = (p20_hi & 15u32).cast::<f32>();
-        let q25 = (p20_hi & 240u32).cast::<f32>();
-        let q26 = (p20_hi & 3840u32).cast::<f32>();
-        let q27 = (p20_hi & 61440u32).cast::<f32>();
-        let q28 = (p21 & 15u32).cast::<f32>();
-        let q29 = (p21 & 240u32).cast::<f32>();
-        let q210 = (p21 & 3840u32).cast::<f32>();
-        let q211 = (p21 & 61440u32).cast::<f32>();
-        let q212 = (p21_hi & 15u32).cast::<f32>();
-        let q213 = (p21_hi & 240u32).cast::<f32>();
-        let q214 = (p21_hi & 3840u32).cast::<f32>();
-        let q215 = (p21_hi & 61440u32).cast::<f32>();
-        let qd2 = q20 * n0_raw
-            + q21 * n1
-            + q22 * n2
-            + q23 * n3
-            + q24 * n4_raw
-            + q25 * n5
-            + q26 * n6
-            + q27 * n7
-            + q28 * n8_raw
-            + q29 * n9
-            + q210 * n10
-            + q211 * n11
-            + q212 * n12_raw
-            + q213 * n13
-            + q214 * n14
-            + q215 * n15;
-        acc2 = acc2 + s2 * qd2 + bi2 * ns;
-        // ── Row 3 ──
-        let p30 = load(q_weight[w_base3 + pack_off]);
-        let p31 = load(q_weight[w_base3 + pack_off + 1u32]);
-        let p30_hi = p30 >> 16u32;
-        let p31_hi = p31 >> 16u32;
-        let s3 = load(q_scales[sb_base3 + g]).cast::<f32>();
-        let bi3 = load(q_biases[sb_base3 + g]).cast::<f32>();
-        let q30 = (p30 & 15u32).cast::<f32>();
-        let q31 = (p30 & 240u32).cast::<f32>();
-        let q32 = (p30 & 3840u32).cast::<f32>();
-        let q33 = (p30 & 61440u32).cast::<f32>();
-        let q34 = (p30_hi & 15u32).cast::<f32>();
-        let q35 = (p30_hi & 240u32).cast::<f32>();
-        let q36 = (p30_hi & 3840u32).cast::<f32>();
-        let q37 = (p30_hi & 61440u32).cast::<f32>();
-        let q38 = (p31 & 15u32).cast::<f32>();
-        let q39 = (p31 & 240u32).cast::<f32>();
-        let q310 = (p31 & 3840u32).cast::<f32>();
-        let q311 = (p31 & 61440u32).cast::<f32>();
-        let q312 = (p31_hi & 15u32).cast::<f32>();
-        let q313 = (p31_hi & 240u32).cast::<f32>();
-        let q314 = (p31_hi & 3840u32).cast::<f32>();
-        let q315 = (p31_hi & 61440u32).cast::<f32>();
-        let qd3 = q30 * n0_raw
-            + q31 * n1
-            + q32 * n2
-            + q33 * n3
-            + q34 * n4_raw
-            + q35 * n5
-            + q36 * n6
-            + q37 * n7
-            + q38 * n8_raw
-            + q39 * n9
-            + q310 * n10
-            + q311 * n11
-            + q312 * n12_raw
-            + q313 * n13
-            + q314 * n14
-            + q315 * n15;
-        acc3 = acc3 + s3 * qd3 + bi3 * ns;
+        // 4 rows × identical work, looped — mirrors `dequant_gemv_int4_fast`
+        // and the `stack_alloc + range` pattern from TheTom/metaltile#1.
+        for _r in range(0u32, 4u32, 1u32) {
+            let row = base_row + _r;
+            let w_base = row * packs_per_row;
+            let sb_base = row * gs_per_row;
+            let p_lo = load(q_weight[w_base + pack_off]);
+            let p_hi_word = load(q_weight[w_base + pack_off + 1u32]);
+            let p_lo_hi = p_lo >> 16u32;
+            let p_hi_hi = p_hi_word >> 16u32;
+            let s = load(q_scales[sb_base + g]).cast::<f32>();
+            let bi = load(q_biases[sb_base + g]).cast::<f32>();
+            // 16-nibble dot, mask-without-shift form. Each u32 carries
+            // 8 nibbles split as 4 in the low 16 bits + 4 in the high
+            // 16 bits; the four masks `15 / 240 / 3840 / 61440` peel off
+            // the nibble at slot 0/1/2/3 of each half.
+            let qd = (p_lo & 15u32).cast::<f32>() * n0_raw
+                + (p_lo & 240u32).cast::<f32>() * n1
+                + (p_lo & 3840u32).cast::<f32>() * n2
+                + (p_lo & 61440u32).cast::<f32>() * n3
+                + (p_lo_hi & 15u32).cast::<f32>() * n4_raw
+                + (p_lo_hi & 240u32).cast::<f32>() * n5
+                + (p_lo_hi & 3840u32).cast::<f32>() * n6
+                + (p_lo_hi & 61440u32).cast::<f32>() * n7
+                + (p_hi_word & 15u32).cast::<f32>() * n8_raw
+                + (p_hi_word & 240u32).cast::<f32>() * n9
+                + (p_hi_word & 3840u32).cast::<f32>() * n10
+                + (p_hi_word & 61440u32).cast::<f32>() * n11
+                + (p_hi_hi & 15u32).cast::<f32>() * n12_raw
+                + (p_hi_hi & 240u32).cast::<f32>() * n13
+                + (p_hi_hi & 3840u32).cast::<f32>() * n14
+                + (p_hi_hi & 61440u32).cast::<f32>() * n15;
+            let prev = stack_load("accs", _r);
+            stack_store("accs", _r, prev + s * qd + bi * ns);
+        }
     }
-    // Cross-lane reduce: each row's partial -> one value per simdgroup.
-    let r0 = simd_sum(acc0);
-    let r1 = simd_sum(acc1);
-    let r2 = simd_sum(acc2);
-    let r3 = simd_sum(acc3);
-    if lane == 0u32 {
-        store(out[row0], r0.cast::<T>());
-        store(out[row1], r1.cast::<T>());
-        store(out[row2], r2.cast::<T>());
-        store(out[row3], r3.cast::<T>());
+    // Cross-lane reduce: one simd_sum per row -> one value per simdgroup.
+    for _r in range(0u32, 4u32, 1u32) {
+        let v = stack_load("accs", _r);
+        let r = simd_sum(v);
+        if lane == 0u32 {
+            store(out[base_row + _r], r.cast::<T>());
+        }
     }
 }
