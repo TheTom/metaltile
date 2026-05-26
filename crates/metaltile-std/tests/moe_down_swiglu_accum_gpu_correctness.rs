@@ -95,6 +95,7 @@ fn quantize_stacked(
 /// Indexes into the stacked buffers exactly the way the kernel does
 /// (`expert * out_dim * <per-row stride>` + per-row stride), to keep the
 /// reference structurally aligned with the GPU code path.
+#[allow(clippy::too_many_arguments)]
 fn dequant_gemv_one_expert(
     weights_stacked: &[u32],
     scales_stacked: &[f32],
@@ -195,14 +196,7 @@ fn source(n: usize, seed: u64, scale: f32, off: f32) -> Vec<f32> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_case(
-    dt: Dt,
-    in_dim: usize,
-    out_dim: usize,
-    group_size: usize,
-    n_experts: usize,
-    tol: f32,
-) {
+fn run_case(dt: Dt, in_dim: usize, out_dim: usize, group_size: usize, n_experts: usize, tol: f32) {
     let _g = gpu_lock();
     assert_eq!(in_dim, 768, "kernel pins tg_inner alloc at 768 (Qwen3.6-A3B moeIntermediate)");
     assert!(n_experts >= 8, "need at least 8 distinct experts to exercise the slot permutation");
@@ -210,16 +204,10 @@ fn run_case(
     // Build 8 gate / 8 up inputs (each [in_dim]), per-dtype round-trip
     // so the oracle sees the same load-cast quantisation the kernel does.
     let gates: [Vec<f32>; 8] = std::array::from_fn(|k| {
-        source(in_dim, 0x1001 + k as u64 * 0x91, 3.0, 0.0)
-            .iter()
-            .map(|&v| dt.round(v))
-            .collect()
+        source(in_dim, 0x1001 + k as u64 * 0x91, 3.0, 0.0).iter().map(|&v| dt.round(v)).collect()
     });
     let ups: [Vec<f32>; 8] = std::array::from_fn(|k| {
-        source(in_dim, 0x2002 + k as u64 * 0x91, 2.0, 0.05)
-            .iter()
-            .map(|&v| dt.round(v))
-            .collect()
+        source(in_dim, 0x2002 + k as u64 * 0x91, 2.0, 0.05).iter().map(|&v| dt.round(v)).collect()
     });
 
     // 8 distinct expert ids spread across the full n_experts range ,
@@ -289,11 +277,7 @@ fn run_case(
         .zip(&expected)
         .map(|(a, e)| (a - e).abs() / e.abs().max(1e-3))
         .fold(0.0_f32, f32::max);
-    assert!(
-        max_rel <= tol,
-        "dt={:?}: max rel = {max_rel:.3e} > {tol:.3e}",
-        dt as u32,
-    );
+    assert!(max_rel <= tol, "dt={:?}: max rel = {max_rel:.3e} > {tol:.3e}", dt as u32,);
 }
 
 // Production-shape coverage: hidden=2048, moeIntermediate=768, gs=64,
@@ -301,18 +285,12 @@ fn run_case(
 // criteria.
 
 #[test]
-fn moe_down_swiglu_accum_qwen36_f32() {
-    run_case(Dt::F32, 768, 2048, 64, 128, 1e-3);
-}
+fn moe_down_swiglu_accum_qwen36_f32() { run_case(Dt::F32, 768, 2048, 64, 128, 1e-3); }
 
 #[test]
-fn moe_down_swiglu_accum_qwen36_bf16() {
-    run_case(Dt::Bf16, 768, 2048, 64, 128, 5e-2);
-}
+fn moe_down_swiglu_accum_qwen36_bf16() { run_case(Dt::Bf16, 768, 2048, 64, 128, 5e-2); }
 
 // f16 too (confirms the load-side `cast::<f32>()` keeps the chain8
 // accumulation stable across the third float dtype the kernel ships.
 #[test]
-fn moe_down_swiglu_accum_qwen36_f16() {
-    run_case(Dt::F16, 768, 2048, 64, 128, 5e-2);
-}
+fn moe_down_swiglu_accum_qwen36_f16() { run_case(Dt::F16, 768, 2048, 64, 128, 5e-2); }

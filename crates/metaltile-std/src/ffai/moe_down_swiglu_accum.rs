@@ -8,9 +8,9 @@
 //!
 //!   1. `mt_swiglu` (many=8): `inner[k][d] = silu(gate[k][d]) * up[k][d]`
 //!   2. `ffai_dequant_gemv_int4_expert_indexed` (many=8): per slot k,
-//!       `down_out[k] = W_down[expert[k]] · inner[k]`  (out_dim = hidden)
+//!      `down_out[k] = W_down[expert[k]] · inner[k]`  (out_dim = hidden)
 //!   3. `mt_scalar_fma_chain8`:
-//!       `acc[i] = Σ_{k=0..8} scalar[k] * down_out[k][i]`
+//!      `acc[i] = Σ_{k=0..8} scalar[k] * down_out[k][i]`
 //!
 //! The three stages have a strict data dependency chain so they MUST
 //! run on separate encoders today. Fusing them eliminates two encoder
@@ -22,19 +22,20 @@
 //! ## Geometry
 //!
 //! - One threadgroup per output row of the down projection.
-//!     grid       = MTLSize(out_dim, 1, 1)        // out_dim = hidden
-//!     threadgroup = MTLSize(lsize, 1, 1)         // caller picks (typ. 128)
+//!   grid       = MTLSize(out_dim, 1, 1)        // out_dim = hidden
+//!   threadgroup = MTLSize(lsize, 1, 1)         // caller picks (typ. 128)
 //!
 //! - Each TG iterates the 8 slots sequentially:
-//!     (a) cooperatively populate `tg_inner[d] = silu(gate[k][d]) * up[k][d]`
-//!         for d in `[0, in_dim)`, every thread writes a strided slice.
-//!     (b) threadgroup_barrier (RAW: qmm reads `tg_inner` filled by all
-//!         lanes in (a)).
-//!     (c) dequant-gemv inner loop against `W_down[expert[k]][row, :]`,
-//!         each thread accumulating into a per-thread `acc` that runs
-//!         across ALL slots (with slot scalar baked in at accumulation).
-//!     (d) threadgroup_barrier (WAR: next slot's swiglu overwrites
-//!         `tg_inner` and must not race with this slot's qmm reads).
+//!   (a) cooperatively populate `tg_inner[d] = silu(gate[k][d]) * up[k][d]`
+//!   for d in `[0, in_dim)`, every thread writes a strided slice.
+//!   (b) threadgroup_barrier (RAW: qmm reads `tg_inner` filled by all
+//!   lanes in (a)).
+//!   (c) dequant-gemv inner loop against `W_down[expert[k]][row, :]`,
+//!   each thread accumulating into a per-thread `acc` that runs
+//!   across ALL slots (with slot scalar baked in at accumulation).
+//!   (d) threadgroup_barrier (WAR: next slot's swiglu overwrites
+//!   `tg_inner` and must not race with this slot's qmm reads).
+//!
 //!   After 8 slots, `reduce_sum(acc)` and lane 0 stores to `out[row]`.
 //!
 //! ## Threadgroup memory
