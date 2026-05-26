@@ -29,8 +29,10 @@ use std::collections::BTreeMap;
 use common::{Dt, gpu_lock, pack_bytes, ramp, unpack_bytes};
 use metaltile_core::ir::KernelMode;
 use metaltile_runtime::Context;
-use metaltile_std::ffai::sdpa_decode_d256::ffai_sdpa_decode_d256;
-use metaltile_std::ffai::sdpa_multi_d256::ffai_sdpa_multi_d256;
+use metaltile_std::ffai::{
+    sdpa_decode_d256::ffai_sdpa_decode_d256,
+    sdpa_multi_d256::ffai_sdpa_multi_d256,
+};
 
 const HEAD_DIM: usize = 256;
 
@@ -165,10 +167,30 @@ fn sdpa_multi_d256_full_mode_matches_decode_oracle_f32() {
     let v = ramp(n_kv_heads * kv_stride * HEAD_DIM, 11, 5.0);
 
     let expected = oracle_per_row_decode_d256(
-        &q, &k, &v, Dt::F32, n_q_heads, n_kv_heads, base_kv, n_query, kv_stride, false, scale,
+        &q,
+        &k,
+        &v,
+        Dt::F32,
+        n_q_heads,
+        n_kv_heads,
+        base_kv,
+        n_query,
+        kv_stride,
+        false,
+        scale,
     );
     let actual = run_multi_d256(
-        &q, &k, &v, Dt::F32, n_q_heads, n_kv_heads, base_kv, n_query, kv_stride, false, scale,
+        &q,
+        &k,
+        &v,
+        Dt::F32,
+        n_q_heads,
+        n_kv_heads,
+        base_kv,
+        n_query,
+        kv_stride,
+        false,
+        scale,
     );
     assert_close(&actual, &expected, 1e-4, "sdpa_multi_d256 full f32");
 }
@@ -187,10 +209,30 @@ fn sdpa_multi_d256_causal_mode_matches_decode_oracle_f32() {
     let v = ramp(n_kv_heads * kv_stride * HEAD_DIM, 11, 5.0);
 
     let expected = oracle_per_row_decode_d256(
-        &q, &k, &v, Dt::F32, n_q_heads, n_kv_heads, base_kv, n_query, kv_stride, true, scale,
+        &q,
+        &k,
+        &v,
+        Dt::F32,
+        n_q_heads,
+        n_kv_heads,
+        base_kv,
+        n_query,
+        kv_stride,
+        true,
+        scale,
     );
     let actual = run_multi_d256(
-        &q, &k, &v, Dt::F32, n_q_heads, n_kv_heads, base_kv, n_query, kv_stride, true, scale,
+        &q,
+        &k,
+        &v,
+        Dt::F32,
+        n_q_heads,
+        n_kv_heads,
+        base_kv,
+        n_query,
+        kv_stride,
+        true,
+        scale,
     );
     assert_close(&actual, &expected, 1e-4, "sdpa_multi_d256 causal f32");
 }
@@ -210,10 +252,30 @@ fn sdpa_multi_d256_with_prefix_and_gqa_matches_decode_oracle_f32() {
     let v = ramp(n_kv_heads * kv_stride * HEAD_DIM, 11, 5.0);
 
     let expected = oracle_per_row_decode_d256(
-        &q, &k, &v, Dt::F32, n_q_heads, n_kv_heads, base_kv, n_query, kv_stride, true, scale,
+        &q,
+        &k,
+        &v,
+        Dt::F32,
+        n_q_heads,
+        n_kv_heads,
+        base_kv,
+        n_query,
+        kv_stride,
+        true,
+        scale,
     );
     let actual = run_multi_d256(
-        &q, &k, &v, Dt::F32, n_q_heads, n_kv_heads, base_kv, n_query, kv_stride, true, scale,
+        &q,
+        &k,
+        &v,
+        Dt::F32,
+        n_q_heads,
+        n_kv_heads,
+        base_kv,
+        n_query,
+        kv_stride,
+        true,
+        scale,
     );
     assert_close(&actual, &expected, 1e-4, "sdpa_multi_d256 prefix+GQA causal f32");
 }
@@ -234,10 +296,30 @@ fn sdpa_multi_d256_full_mode_matches_decode_oracle_f16() {
     // run at Dt::F16), so the only allowed drift comes from f16 storage
     // round-trips in K/V loads — tolerance can stay tight.
     let expected = oracle_per_row_decode_d256(
-        &q, &k, &v, Dt::F16, n_q_heads, n_kv_heads, base_kv, n_query, kv_stride, false, scale,
+        &q,
+        &k,
+        &v,
+        Dt::F16,
+        n_q_heads,
+        n_kv_heads,
+        base_kv,
+        n_query,
+        kv_stride,
+        false,
+        scale,
     );
     let actual = run_multi_d256(
-        &q, &k, &v, Dt::F16, n_q_heads, n_kv_heads, base_kv, n_query, kv_stride, false, scale,
+        &q,
+        &k,
+        &v,
+        Dt::F16,
+        n_q_heads,
+        n_kv_heads,
+        base_kv,
+        n_query,
+        kv_stride,
+        false,
+        scale,
     );
     assert_close(&actual, &expected, 5e-3, "sdpa_multi_d256 full f16");
 }
@@ -255,10 +337,30 @@ fn sdpa_multi_d256_causal_mode_matches_decode_oracle_bf16() {
     let v = ramp(n_kv_heads * kv_stride * HEAD_DIM, 11, 5.0);
 
     let expected = oracle_per_row_decode_d256(
-        &q, &k, &v, Dt::Bf16, n_q_heads, n_kv_heads, base_kv, n_query, kv_stride, true, scale,
+        &q,
+        &k,
+        &v,
+        Dt::Bf16,
+        n_q_heads,
+        n_kv_heads,
+        base_kv,
+        n_query,
+        kv_stride,
+        true,
+        scale,
     );
     let actual = run_multi_d256(
-        &q, &k, &v, Dt::Bf16, n_q_heads, n_kv_heads, base_kv, n_query, kv_stride, true, scale,
+        &q,
+        &k,
+        &v,
+        Dt::Bf16,
+        n_q_heads,
+        n_kv_heads,
+        base_kv,
+        n_query,
+        kv_stride,
+        true,
+        scale,
     );
     assert_close(&actual, &expected, 2e-2, "sdpa_multi_d256 causal bf16");
 }
