@@ -176,8 +176,7 @@ fn run_case(dt: Dt, hv: usize, dv: usize, out_dim: usize, group_size: usize, tol
     // `y` stays fp32 - no per-dtype rounding.
     let y: Vec<f32> = source(in_dim, 0xA1, 2.0, 0.1);
     let z: Vec<f32> = source(in_dim, 0xD4, 1.5, 0.0).iter().map(|&v| dt.round(v)).collect();
-    let norm_weight: Vec<f32> =
-        source(dv, 0xB2, 0.4, 1.0).iter().map(|&v| dt.round(v)).collect();
+    let norm_weight: Vec<f32> = source(dv, 0xB2, 0.4, 1.0).iter().map(|&v| dt.round(v)).collect();
     let w_rows = source(out_dim * in_dim, 0xC3, 3.0, 0.0);
 
     let u32_per_row = in_dim / 8;
@@ -195,11 +194,20 @@ fn run_case(dt: Dt, hv: usize, dv: usize, out_dim: usize, group_size: usize, tol
     let biases_r: Vec<f32> = biases.iter().map(|&v| dt.round(v)).collect();
 
     let expected = naive(
-        &y, &z, &norm_weight, &weight, &scales_r, &biases_r, hv, dv, out_dim, group_size, eps,
+        &y,
+        &z,
+        &norm_weight,
+        &weight,
+        &scales_r,
+        &biases_r,
+        hv,
+        dv,
+        out_dim,
+        group_size,
+        eps,
     );
-    let actual = run(
-        &y, &z, &norm_weight, &weight, &scales, &biases, dt, hv, dv, out_dim, group_size, eps,
-    );
+    let actual =
+        run(&y, &z, &norm_weight, &weight, &scales, &biases, dt, hv, dv, out_dim, group_size, eps);
 
     assert_eq!(actual.len(), out_dim);
     assert!(actual.iter().any(|&v| v != 0.0), "output is all zeros");
@@ -217,22 +225,14 @@ fn run_case(dt: Dt, hv: usize, dv: usize, out_dim: usize, group_size: usize, tol
 
 // ── Smaller f32 shape: hv=4, dv=128, in_dim=512, out_dim=512 ───────────
 #[test]
-fn gated_rms_norm_qgemv_int4_fast_f32_small() {
-    run_case(Dt::F32, 4, 128, 512, 64, 5e-3);
-}
+fn gated_rms_norm_qgemv_int4_fast_f32_small() { run_case(Dt::F32, 4, 128, 512, 64, 5e-3); }
 
 // ── Qwen3.6-A3B production shape: hv=16, dv=128, in_dim=2048, out_dim=2048 ──
 #[test]
-fn gated_rms_norm_qgemv_int4_fast_f32_qwen36() {
-    run_case(Dt::F32, 16, 128, 2048, 64, 5e-3);
-}
+fn gated_rms_norm_qgemv_int4_fast_f32_qwen36() { run_case(Dt::F32, 16, 128, 2048, 64, 5e-3); }
 
 #[test]
-fn gated_rms_norm_qgemv_int4_fast_f16_qwen36() {
-    run_case(Dt::F16, 16, 128, 2048, 64, 3e-2);
-}
+fn gated_rms_norm_qgemv_int4_fast_f16_qwen36() { run_case(Dt::F16, 16, 128, 2048, 64, 3e-2); }
 
 #[test]
-fn gated_rms_norm_qgemv_int4_fast_bf16_qwen36() {
-    run_case(Dt::Bf16, 16, 128, 2048, 64, 6e-2);
-}
+fn gated_rms_norm_qgemv_int4_fast_bf16_qwen36() { run_case(Dt::Bf16, 16, 128, 2048, 64, 6e-2); }

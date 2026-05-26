@@ -7,12 +7,12 @@
 //! into ONE kernel launch:
 //!
 //!   1. `mt_gated_rmsnorm`: per-row RMSNorm with SiLU gate.
-//!        `inner[r, d] = w[d] * y[r, d] * rsqrt(mean(y[r]^2) + eps) * silu(z[r, d])`
+//!      `inner[r, d] = w[d] * y[r, d] * rsqrt(mean(y[r]^2) + eps) * silu(z[r, d])`
 //!      `y` is fp32 (GDN recurrence accumulates in fp32), `z` / `w` /
 //!      `inner` are model dtype `T`.
 //!
 //!   2. `ffai_dequant_gemv_int4` (the GDN out projection):
-//!        `out[o] = sum_i (q[o, i] * scale + bias) * inner_flat[i]`
+//!      `out[o] = sum_i (q[o, i] * scale + bias) * inner_flat[i]`
 //!      where `inner_flat[r * Dv + d] = inner[r, d]` and `i in [0, Hv*Dv)`.
 //!
 //! Fusing them eliminates one encoder begin/end pair per GDN layer plus
@@ -37,6 +37,7 @@
 //!   * `inv_rms[r] = rsqrt(ssq / Dv + eps)` is computed locally per lane.
 //!   * Each lane writes its `Dv/32` gated-and-normed elements to
 //!     `tg_inner` (`silu` of the `z` gate is inlined in fp32).
+//!
 //! After all rows are filled, a single `threadgroup_barrier` flips the
 //! data into Phase-2 visibility.
 //!
