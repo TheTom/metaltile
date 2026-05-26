@@ -291,12 +291,26 @@ macro_rules! define_moe_down_swiglu_accum_chain8 {
 }
 
 define_moe_down_swiglu_accum_chain8!(
-    (gate_0, up_0, exp_0, sw_0, we_0, se_0, rpo_0, rgo_0, { threadgroup_barrier(); }),
-    (gate_1, up_1, exp_1, sw_1, we_1, se_1, rpo_1, rgo_1, { threadgroup_barrier(); }),
-    (gate_2, up_2, exp_2, sw_2, we_2, se_2, rpo_2, rgo_2, { threadgroup_barrier(); }),
-    (gate_3, up_3, exp_3, sw_3, we_3, se_3, rpo_3, rgo_3, { threadgroup_barrier(); }),
-    (gate_4, up_4, exp_4, sw_4, we_4, se_4, rpo_4, rgo_4, { threadgroup_barrier(); }),
-    (gate_5, up_5, exp_5, sw_5, we_5, se_5, rpo_5, rgo_5, { threadgroup_barrier(); }),
-    (gate_6, up_6, exp_6, sw_6, we_6, se_6, rpo_6, rgo_6, { threadgroup_barrier(); }),
+    (gate_0, up_0, exp_0, sw_0, we_0, se_0, rpo_0, rgo_0, {
+        threadgroup_barrier();
+    }),
+    (gate_1, up_1, exp_1, sw_1, we_1, se_1, rpo_1, rgo_1, {
+        threadgroup_barrier();
+    }),
+    (gate_2, up_2, exp_2, sw_2, we_2, se_2, rpo_2, rgo_2, {
+        threadgroup_barrier();
+    }),
+    (gate_3, up_3, exp_3, sw_3, we_3, se_3, rpo_3, rgo_3, {
+        threadgroup_barrier();
+    }),
+    (gate_4, up_4, exp_4, sw_4, we_4, se_4, rpo_4, rgo_4, {
+        threadgroup_barrier();
+    }),
+    (gate_5, up_5, exp_5, sw_5, we_5, se_5, rpo_5, rgo_5, {
+        threadgroup_barrier();
+    }),
+    (gate_6, up_6, exp_6, sw_6, we_6, se_6, rpo_6, rgo_6, {
+        threadgroup_barrier();
+    }),
     (gate_7, up_7, exp_7, sw_7, we_7, se_7, rpo_7, rgo_7, {}),
 );
