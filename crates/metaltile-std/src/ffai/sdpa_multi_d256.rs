@@ -101,61 +101,43 @@ pub fn ffai_sdpa_multi_d256<T>(
     let kv_head_base = kv_head * kv_stride * head_dim;
     let d0 = lane * 8u32;
     // Pre-scale this lane's 8-element Q stripe once, K/V are streamed.
-    let q0 = load(q[q_off + d0]).cast::<f32>() * scale;
-    let q1 = load(q[q_off + d0 + 1u32]).cast::<f32>() * scale;
-    let q2 = load(q[q_off + d0 + 2u32]).cast::<f32>() * scale;
-    let q3 = load(q[q_off + d0 + 3u32]).cast::<f32>() * scale;
-    let q4 = load(q[q_off + d0 + 4u32]).cast::<f32>() * scale;
-    let q5 = load(q[q_off + d0 + 5u32]).cast::<f32>() * scale;
-    let q6 = load(q[q_off + d0 + 6u32]).cast::<f32>() * scale;
-    let q7 = load(q[q_off + d0 + 7u32]).cast::<f32>() * scale;
+    stack_alloc("qs", 8u32, "f32");
+    for _i in range(0u32, 8u32, 1u32) {
+        stack_store("qs", _i, load(q[q_off + d0 + _i]).cast::<f32>() * scale);
+    }
     let mut run_max = neg_infinity();
     let mut run_sum = 0.0f32;
-    let mut o0 = 0.0f32;
-    let mut o1 = 0.0f32;
-    let mut o2 = 0.0f32;
-    let mut o3 = 0.0f32;
-    let mut o4 = 0.0f32;
-    let mut o5 = 0.0f32;
-    let mut o6 = 0.0f32;
-    let mut o7 = 0.0f32;
+    stack_alloc("os", 8u32, "f32");
+    for _i in range(0u32, 8u32, 1u32) {
+        stack_store("os", _i, 0.0f32);
+    }
+    stack_alloc("ks", 8u32, "f32");
     // Each simdgroup walks every ns-th KV position. simd_sum reduces the
     // per-lane stripe dot product into the full score, online softmax
     // updates the running (max, sum), V accumulates into fp32 registers.
     for _t in range(sg, n_kv, ns) {
         let base = kv_head_base + _t * head_dim;
         let kv0 = base + d0;
-        let k0 = load(k[kv0]).cast::<f32>();
-        let k1 = load(k[kv0 + 1u32]).cast::<f32>();
-        let k2 = load(k[kv0 + 2u32]).cast::<f32>();
-        let k3 = load(k[kv0 + 3u32]).cast::<f32>();
-        let k4 = load(k[kv0 + 4u32]).cast::<f32>();
-        let k5 = load(k[kv0 + 5u32]).cast::<f32>();
-        let k6 = load(k[kv0 + 6u32]).cast::<f32>();
-        let k7 = load(k[kv0 + 7u32]).cast::<f32>();
-        let partial = q0 * k0 + q1 * k1 + q2 * k2 + q3 * k3 + q4 * k4 + q5 * k5 + q6 * k6 + q7 * k7;
+        for _i in range(0u32, 8u32, 1u32) {
+            stack_store("ks", _i, load(k[kv0 + _i]).cast::<f32>());
+        }
+        let mut partial = 0.0f32;
+        for _i in range(0u32, 8u32, 1u32) {
+            partial = partial + stack_load("qs", _i) * stack_load("ks", _i);
+        }
         let score = simd_sum(partial);
         let new_max = select(score > run_max, score, run_max);
         let factor = exp(run_max - new_max);
         let weight = exp(score - new_max);
         run_sum = run_sum * factor + weight;
         run_max = new_max;
-        let v0 = load(v[kv0]).cast::<f32>();
-        let v1 = load(v[kv0 + 1u32]).cast::<f32>();
-        let v2 = load(v[kv0 + 2u32]).cast::<f32>();
-        let v3 = load(v[kv0 + 3u32]).cast::<f32>();
-        let v4 = load(v[kv0 + 4u32]).cast::<f32>();
-        let v5 = load(v[kv0 + 5u32]).cast::<f32>();
-        let v6 = load(v[kv0 + 6u32]).cast::<f32>();
-        let v7 = load(v[kv0 + 7u32]).cast::<f32>();
-        o0 = o0 * factor + weight * v0;
-        o1 = o1 * factor + weight * v1;
-        o2 = o2 * factor + weight * v2;
-        o3 = o3 * factor + weight * v3;
-        o4 = o4 * factor + weight * v4;
-        o5 = o5 * factor + weight * v5;
-        o6 = o6 * factor + weight * v6;
-        o7 = o7 * factor + weight * v7;
+        for _i in range(0u32, 8u32, 1u32) {
+            stack_store(
+                "os",
+                _i,
+                stack_load("os", _i) * factor + weight * load(v[kv0 + _i]).cast::<f32>(),
+            );
+        }
     }
     // ── Cross-simdgroup reduction: max + sum_exp ────────────────────
     if lane == 0 {
@@ -184,10 +166,10 @@ pub fn ffai_sdpa_multi_d256<T>(
     // Padded stride (ns + 1) avoids bank conflicts (see sdpa_decode).
     let stride = ns + 1u32;
     let idx = lane * stride + sg;
-    threadgroup_store("tg_out0", idx, o0 * rescale);
-    threadgroup_store("tg_out1", idx, o1 * rescale);
-    threadgroup_store("tg_out2", idx, o2 * rescale);
-    threadgroup_store("tg_out3", idx, o3 * rescale);
+    threadgroup_store("tg_out0", idx, stack_load("os", 0u32) * rescale);
+    threadgroup_store("tg_out1", idx, stack_load("os", 1u32) * rescale);
+    threadgroup_store("tg_out2", idx, stack_load("os", 2u32) * rescale);
+    threadgroup_store("tg_out3", idx, stack_load("os", 3u32) * rescale);
     threadgroup_barrier();
     if sg == 0 {
         let mut so0 = 0.0f32;
@@ -209,10 +191,10 @@ pub fn ffai_sdpa_multi_d256<T>(
     }
     threadgroup_barrier();
     // ── Cross-simdgroup output reduction — phase 2 (dims 4..7) ─────
-    threadgroup_store("tg_out0", idx, o4 * rescale);
-    threadgroup_store("tg_out1", idx, o5 * rescale);
-    threadgroup_store("tg_out2", idx, o6 * rescale);
-    threadgroup_store("tg_out3", idx, o7 * rescale);
+    threadgroup_store("tg_out0", idx, stack_load("os", 4u32) * rescale);
+    threadgroup_store("tg_out1", idx, stack_load("os", 5u32) * rescale);
+    threadgroup_store("tg_out2", idx, stack_load("os", 6u32) * rescale);
+    threadgroup_store("tg_out3", idx, stack_load("os", 7u32) * rescale);
     threadgroup_barrier();
     if sg == 0 {
         let mut so4 = 0.0f32;
