@@ -20,18 +20,13 @@ kernel void mt_qmm_nax(
     constant uint &k [[buffer(5)]],
     constant uint &n [[buffer(6)]],
     constant uint &gs_per_row [[buffer(7)]],
-    uint3 _tid3  [[thread_position_in_threadgroup]],
     uint3 _tgid3 [[threadgroup_position_in_grid]],
-    uint3 _lsize3 [[threads_per_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]
 ) {
 #if defined(__METAL_VERSION__) && __METAL_VERSION__ >= 400
-    uint tid    = _tid3.x;
     uint tgid_x = _tgid3.x;
     uint tgid_y = _tgid3.y;
-    uint lsize  = _lsize3.x;
-    uint n_simd = lsize / 32u;
     threadgroup half Xs[1152];
     threadgroup half Ws[1152];
     threadgroup float OutScratch[1024];

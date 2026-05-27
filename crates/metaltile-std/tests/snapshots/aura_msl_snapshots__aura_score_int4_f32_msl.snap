@@ -17,22 +17,15 @@ kernel void aura_score_int4(
     constant uint &tokens [[buffer(7)]],
     constant uint &repeat_count [[buffer(8)]],
     uint3 _tid3  [[thread_position_in_threadgroup]],
-    uint3 _tgid3 [[threadgroup_position_in_grid]],
-    uint3 _lsize3 [[threads_per_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]
+    uint3 _tgid3 [[threadgroup_position_in_grid]]
 ) {
     uint tid    = _tid3.x;
     uint tgid_x = _tgid3.x;
     uint tgid_y = _tgid3.y;
-    uint lsize  = _lsize3.x;
-    uint n_simd = lsize / 32u;
     auto v_lane = tid;
     auto v_q_idx = tgid_x;
     auto v_k_idx = tgid_y;
     auto v3 = repeat_count;
-    uint v5 = 1u;
-    uint v6 = 4u;
     uint v7 = 16u;
     uint v8 = 1u;
     auto v_mask = v7 - v8;
@@ -43,7 +36,6 @@ kernel void aura_score_int4(
     auto v14 = v13 + v_k_idx;
     auto v15 = packed_width;
     auto v_packed_row = v14 * v15;
-    auto v18 = v13 + v_k_idx;
     auto v19 = norms[v14];
     float v_norm_val = static_cast<float>(v19);
     auto v21 = 0.0f;

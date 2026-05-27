@@ -19,18 +19,13 @@ kernel void mt_fp_qmm_nax(
     constant uint &k [[buffer(4)]],
     constant uint &n [[buffer(5)]],
     constant uint &gs_per_row [[buffer(6)]],
-    uint3 _tid3  [[thread_position_in_threadgroup]],
     uint3 _tgid3 [[threadgroup_position_in_grid]],
-    uint3 _lsize3 [[threads_per_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]
 ) {
 #if defined(__METAL_VERSION__) && __METAL_VERSION__ >= 400
-    uint tid    = _tid3.x;
     uint tgid_x = _tgid3.x;
     uint tgid_y = _tgid3.y;
-    uint lsize  = _lsize3.x;
-    uint n_simd = lsize / 32u;
     threadgroup half Xs[1152];
     threadgroup half Ws[1152];
     threadgroup float OutScratch[1024];
@@ -104,7 +99,6 @@ kernel void mt_fp_qmm_nax(
     uint v79 = 7u;
     uint v81 = 1u;
     uint v83 = 1u;
-    uint v85 = 0u;
     uint v87 = 1u;
     uint v89 = 1u;
     uint v90 = 1u;
@@ -132,7 +126,6 @@ kernel void mt_fp_qmm_nax(
             auto v_mag_bits = (v_code & v79);
             auto v_exp = (v_mag_bits >> v81);
             auto v_mant = (v_mag_bits & v83);
-            auto v_is_subnormal = v_exp == v85;
             auto v91 = (select(v87, v_exp, bool(v_exp)) - v90);
             auto v_pow2 = (v89 << v91);
             auto v_normal_two_m = ((v_mant + v93) * v_pow2);

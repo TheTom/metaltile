@@ -16,15 +16,10 @@ kernel void aura_encode_int4(
     constant uint &dim [[buffer(6)]],
     constant uint &packed_width [[buffer(7)]],
     uint3 _tid3  [[thread_position_in_threadgroup]],
-    uint3 _tgid3 [[threadgroup_position_in_grid]],
-    uint3 _lsize3 [[threads_per_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]
+    uint3 _tgid3 [[threadgroup_position_in_grid]]
 ) {
     uint tid    = _tid3.x;
     uint tgid_x = _tgid3.x;
-    uint lsize  = _lsize3.x;
-    uint n_simd = lsize / 32u;
     threadgroup float shared_norm[16];
     threadgroup float shared_unit[1024];
     threadgroup uint shared_packed[128];
@@ -87,8 +82,6 @@ kernel void aura_encode_int4(
     uint v44 = 0u;
     auto __ml_idx = v44;
     uint v45 = 0u;
-    uint v46 = 16u;
-    uint v47 = 1u;
     uint v48 = 15u;
     uint v49 = 1u;
     for (uint i_2 = v45; i_2 < v48; i_2 += v49) {
@@ -106,8 +99,6 @@ kernel void aura_encode_int4(
     uint v60 = 31u;
     auto v_shift = (v_bit_offset & v60);
     auto v62 = __ml_idx;
-    uint v63 = 1u;
-    uint v64 = 4u;
     uint v65 = 16u;
     uint v66 = 1u;
     auto v67 = v65 - v66;
