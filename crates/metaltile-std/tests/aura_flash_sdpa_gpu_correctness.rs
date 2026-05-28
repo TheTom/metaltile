@@ -130,15 +130,18 @@ fn run(
 ) -> Vec<f32> {
     let kpw = (dim * 4).div_ceil(32);
     let vpw = (dim * 2).div_ceil(32);
+    // All T-typed buffers (q_rot / norms / codebook / sinks / out) pack
+    // in `dt` now that the kernel is generic over T — see the dtype
+    // unification note in `aura_flash_sdpa.rs`. Packed K/V stay u32.
     let mut b: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    b.insert("q_rot".into(), pack_bytes(q_rot, Dt::F32));
+    b.insert("q_rot".into(), pack_bytes(q_rot, dt));
     b.insert("key_packed".into(), pack_u32_bytes(key_packed));
-    b.insert("key_norms".into(), pack_bytes(key_norms, Dt::F32));
-    b.insert("key_codebook".into(), pack_bytes(key_cb, Dt::F32));
+    b.insert("key_norms".into(), pack_bytes(key_norms, dt));
+    b.insert("key_codebook".into(), pack_bytes(key_cb, dt));
     b.insert("val_packed".into(), pack_u32_bytes(val_packed));
-    b.insert("val_norms".into(), pack_bytes(val_norms, Dt::F32));
-    b.insert("val_codebook".into(), pack_bytes(val_cb, Dt::F32));
-    b.insert("sinks".into(), pack_bytes(sinks, Dt::F32));
+    b.insert("val_norms".into(), pack_bytes(val_norms, dt));
+    b.insert("val_codebook".into(), pack_bytes(val_cb, dt));
+    b.insert("sinks".into(), pack_bytes(sinks, dt));
     b.insert("out".into(), pack_bytes(&vec![0.0_f32; q_heads * dim], dt));
     for (k, v) in [
         ("dim", dim as u32),

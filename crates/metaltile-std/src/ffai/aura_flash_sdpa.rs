@@ -12,16 +12,30 @@
 //! side-steps the pass2-with-sinks graph-fusion incoherence that the
 //! two-pass β-with-sinks drafts hit on GPT-OSS-20B.
 //!
-//! Layout (matches `aura_flash_p1`):
-//!   - q_rot:        [B*nQ, dim] f32   (WHT-rotated + pre-scaled by caller)
+//! Layout (matches `aura_flash_p1` / `aura_score` / `aura_value` — all
+//! generic over `T` for the auxiliary float buffers; internal math stays
+//! f32 via cast-at-load. See header note on the dtype unification):
+//!   - q_rot:        [B*nQ, dim] T     (WHT-rotated + pre-scaled by caller)
 //!   - key_packed:   [B*nKV, tokens, key_packed_width]   u32
-//!   - key_norms:    [B*nKV, tokens]   f32
-//!   - key_codebook: [2^key_bits]      f32
+//!   - key_norms:    [B*nKV, tokens]   T
+//!   - key_codebook: [2^key_bits]      T
 //!   - val_packed:   [B*nKV, tokens, value_packed_width] u32
-//!   - val_norms:    [B*nKV, tokens]   f32
-//!   - val_codebook: [2^value_bits]    f32
-//!   - sinks:        [num_q_heads]     f32  (per-head sink logit)
+//!   - val_norms:    [B*nKV, tokens]   T
+//!   - val_codebook: [2^value_bits]    T
+//!   - sinks:        [num_q_heads]     T    (per-head sink logit)
 //!   - out:          [B*nQ, dim]       T    (rotated V space)
+//!
+//! Norms / codebook were f32-typed in the original port (spec 041
+//! phase 1.1), inherited from `mlx-swift-lm`'s TurboQuant codec. The
+//! sibling `aura_flash_p1` / `aura_flash_pass2` / `aura_score` /
+//! `aura_value` kernels were genericised to `Tensor<T>` during the bf16
+//! coverage rollout; this kernel was the last laggard. Unifying the
+//! dtype contract lets FFAI's cache store norms+codebook in the
+//! activation dtype directly — no per-call cast on the decode hot path.
+//! Internal arithmetic still runs in f32 (cast-at-load), matching the
+//! precision of the f32 era; the storage narrowing follows the C++
+//! `llama.cpp` TQ+ fork's production pattern (fp16-stored norms, f32-at-
+//! use, zero PPL impact measured).
 //!
 //! `has_sinks` (0/1) and `window_size` (0 = full causal) are constexpr.
 //! When `has_sinks == 1` the running softmax starts at `(m = sink,
@@ -58,14 +72,14 @@ macro_rules! aura_flash_sdpa_kernel {
             bench(op="aura", subop=$subop, class=GenericEmpty, tol=1e-3, kernel_mode=Grid3D,)
         )]
         pub fn $name<T>(
-            q_rot: Tensor<f32>,
+            q_rot: Tensor<T>,
             key_packed: Tensor<u32>,
-            key_norms: Tensor<f32>,
-            key_codebook: Tensor<f32>,
+            key_norms: Tensor<T>,
+            key_codebook: Tensor<T>,
             val_packed: Tensor<u32>,
-            val_norms: Tensor<f32>,
-            val_codebook: Tensor<f32>,
-            sinks: Tensor<f32>,
+            val_norms: Tensor<T>,
+            val_codebook: Tensor<T>,
+            sinks: Tensor<T>,
             out: Tensor<T>,
             #[constexpr] dim: u32,
             #[constexpr] key_packed_width: u32,
@@ -84,28 +98,34 @@ macro_rules! aura_flash_sdpa_kernel {
             let key_mask = (1u32 << $key_bits) - 1u32;
             let val_mask = (1u32 << $value_bits) - 1u32;
 
-            // Codebook caches in per-thread stack arrays.
+            // Codebook caches in per-thread stack arrays. Loads cast to
+            // f32 so the rest of the kernel stays bit-identical to the
+            // f32-typed era — only the storage narrowing differs.
             stack_alloc("key_cb", $key_levels, "f32");
             for i in range(0u32, $key_levels, 1u32) {
-                stack_store("key_cb", i, load(key_codebook[i]));
+                stack_store("key_cb", i, load(key_codebook[i]).cast::<f32>());
             }
             stack_alloc("val_cb", $value_levels, "f32");
             for i in range(0u32, $value_levels, 1u32) {
-                stack_store("val_cb", i, load(val_codebook[i]));
+                stack_store("val_cb", i, load(val_codebook[i]).cast::<f32>());
             }
 
             // Per-lane slice of the rotated query, loaded once.
             stack_alloc("q_vals", $dims_per_lane, "f32");
             for i in range(0u32, $dims_per_lane, 1u32) {
                 let d = lane + i * 32u32;
-                let v = select(d < dim, load(q_rot[q_idx * dim + d]), 0.0f32);
+                let v = select(
+                    d < dim,
+                    load(q_rot[q_idx * dim + d]).cast::<f32>(),
+                    0.0f32,
+                );
                 stack_store("q_vals", i, v);
             }
 
             // Online-softmax accumulators. With sinks, the running
             // softmax starts at (m = sink, l = 1): the sink is a virtual
             // key whose value is 0.
-            let sink_val = load(sinks[q_idx % num_q_heads]);
+            let sink_val = load(sinks[q_idx % num_q_heads]).cast::<f32>();
             let mut m_acc = select(has_sinks > 0u32, sink_val, neg_infinity());
             let mut l_acc = select(has_sinks > 0u32, 1.0f32, 0.0f32);
             stack_alloc("o", $dims_per_lane, "f32");
@@ -129,7 +149,7 @@ macro_rules! aura_flash_sdpa_kernel {
                     // `kv_stride`, NOT `tokens` — otherwise we'd read head 0's
                     // tail bytes as if they were head 1's rows.
                     let k_packed_row = (kv_idx * kv_stride + t) * key_packed_width;
-                    let k_norm = load(key_norms[kv_idx * kv_stride + t]);
+                    let k_norm = load(key_norms[kv_idx * kv_stride + t]).cast::<f32>();
                     let mut dot_partial = 0.0f32;
                     for i in range(0u32, $dims_per_lane, 1u32) {
                         let d = lane + i * 32u32;
@@ -161,7 +181,7 @@ macro_rules! aura_flash_sdpa_kernel {
                     // V-side update from compressed centroids.
                     // Same `kv_stride` row stride as the K side above.
                     let v_packed_row = (kv_idx * kv_stride + t) * value_packed_width;
-                    let v_norm = load(val_norms[kv_idx * kv_stride + t]);
+                    let v_norm = load(val_norms[kv_idx * kv_stride + t]).cast::<f32>();
                     for i in range(0u32, $dims_per_lane, 1u32) {
                         let d = lane + i * 32u32;
                         if d < dim {

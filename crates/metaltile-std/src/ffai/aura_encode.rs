@@ -23,14 +23,17 @@
 //! ## Layout
 //!
 //! Inputs:
-//! - `input      [rows, dim]`           f32
-//! - `rotation   [dim, dim]`            f32
-//! - `boundaries [2**bits - 1]`         f32  — Lloyd-Max thresholds.
-//! - `codebook   [2**bits]`             f32  — centroid values.
+//! - `input      [rows, dim]`           T    — model dtype (bf16/f16/f32).
+//! - `rotation   [dim, dim]`            f32  — encoder-only; Π precision matters.
+//! - `boundaries [2**bits - 1]`         f32  — Lloyd-Max thresholds; encoder-only.
+//! - `codebook   [2**bits]`             T    — centroid values, dtype matched
+//!   to the decoder cache so the same buffer feeds both paths with no
+//!   per-call cast.
 //!
 //! Outputs:
 //! - `packed_out [rows, packed_width]`  u32
-//! - `norms_out  [rows]`                f32  — norm-correction factor.
+//! - `norms_out  [rows]`                T    — norm-correction factor; cast at
+//!   the final store (the internal reduction stays f32).
 //!
 //! ## Constexpr params
 //!
@@ -76,8 +79,11 @@ macro_rules! aura_encode_kernel {
     ($name:ident, $bits:literal, $levels:literal, $subop:literal) => {
         // `input` is the model-dtype K or V row (typically bf16/f16 in
         // production, f32 in tests). All internal math runs in f32 —
-        // we cast at the load. Everything else stays f32-only because
-        // rotation, codebook, and norm-correction need the precision.
+        // we cast at the load. `rotation` + `boundaries` stay f32
+        // because the rotation matmul and Lloyd-Max comparison need the
+        // precision. `codebook` and `norms_out` follow the model dtype
+        // so the same buffers serve both encoder and decoder paths —
+        // see the AURA dtype unification note in `aura_flash_sdpa.rs`.
         #[kernel(
             bench(op="aura", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Reduction,)
         )]
@@ -85,9 +91,9 @@ macro_rules! aura_encode_kernel {
             input: Tensor<T>,
             rotation: Tensor<f32>,
             boundaries: Tensor<f32>,
-            codebook: Tensor<f32>,
+            codebook: Tensor<T>,
             mut packed_out: Tensor<u32>,
-            mut norms_out: Tensor<f32>,
+            mut norms_out: Tensor<T>,
             #[constexpr] dim: u32,
             #[constexpr] packed_width: u32,
         ) {
@@ -188,7 +194,7 @@ macro_rules! aura_encode_kernel {
             // L2 norm of the reconstructed vector, and
             // `corrected = norm_val / recon_norm` is what the decoder
             // multiplies back through.
-            let centroid_val = load(codebook[idx]);
+            let centroid_val = load(codebook[idx]).cast::<f32>();
             let recon_sq = centroid_val * centroid_val;
             let simd_recon_sq = simd_sum(recon_sq);
             if lane == 0u32 {
@@ -203,7 +209,7 @@ macro_rules! aura_encode_kernel {
             let corrected_norm = select(recon_norm > 1.0e-8f32, norm_val / recon_norm, norm_val);
 
             if d == 0u32 {
-                store(norms_out[row], corrected_norm);
+                store(norms_out[row], corrected_norm.cast::<T>());
             }
         }
     };
