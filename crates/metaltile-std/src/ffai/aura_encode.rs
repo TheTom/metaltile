@@ -23,14 +23,20 @@
 //! ## Layout
 //!
 //! Inputs:
-//! - `input      [rows, dim]`           f32
-//! - `rotation   [dim, dim]`            f32
-//! - `boundaries [2**bits - 1]`         f32  — Lloyd-Max thresholds.
-//! - `codebook   [2**bits]`             f32  — centroid values.
+//! - `input      [rows, dim]`           T    — model dtype (bf16/f16/f32).
+//! - `rotation   [dim, dim]`            T    — Π; the dim×dim read dominates
+//!   this kernel's bandwidth, so it follows the model dtype (cast-to-f32 at
+//!   load, f32 accumulation). f16/bf16 Π rounding (~1e-3) is far below the
+//!   2–4-bit quantization bin width that consumes the rotated value.
+//! - `boundaries [2**bits - 1]`         T    — Lloyd-Max thresholds.
+//! - `codebook   [2**bits]`             T    — centroid values, dtype matched
+//!   to the decoder cache so the same buffer feeds both paths with no
+//!   per-call cast.
 //!
 //! Outputs:
 //! - `packed_out [rows, packed_width]`  u32
-//! - `norms_out  [rows]`                f32  — norm-correction factor.
+//! - `norms_out  [rows]`                T    — norm-correction factor; cast at
+//!   the final store (the internal reduction stays f32).
 //!
 //! ## Constexpr params
 //!
@@ -73,20 +79,30 @@ use metaltile::kernel;
 
 macro_rules! aura_encode_kernel {
     ($name:ident, $bits:literal, $levels:literal, $subop:literal) => {
-        // `input` is the model-dtype K or V row (typically bf16/f16 in
-        // production, f32 in tests). All internal math runs in f32 —
-        // we cast at the load. Everything else stays f32-only because
-        // rotation, codebook, and norm-correction need the precision.
+        // All buffers are the model dtype T (bf16/f16 in production, f32
+        // in tests) — we cast each load to f32 and accumulate in f32.
+        // The f32 *accumulation* is load-bearing and stays: the L2-norm
+        // reductions (Stages 1 & 5) and the dim-length rotation matmul
+        // (Stage 2) each sum up to `dim` (≤512) terms, and the resulting
+        // norm-correction factor scales the *entire* dequantized vector
+        // in the decoder — f16 accumulation there drifts enough to hurt.
+        // The *storage* precision is what was overkill: the dim×dim
+        // rotation matrix dominates this kernel's bandwidth, so storing
+        // it (and the other operands) in T halves the dominant read. Its
+        // f16/bf16 rounding (~1e-3) is far below the 2–4-bit quant bin
+        // the rotated value lands in, and the decoder's inverse rotation
+        // is already a model-dtype gemm — so f32 Π here was strictly more
+        // precise than the round-trip it feeds.
         #[kernel(
             bench(op="aura", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Reduction,)
         )]
         pub fn $name<T>(
             input: Tensor<T>,
-            rotation: Tensor<f32>,
-            boundaries: Tensor<f32>,
-            codebook: Tensor<f32>,
+            rotation: Tensor<T>,
+            boundaries: Tensor<T>,
+            codebook: Tensor<T>,
             mut packed_out: Tensor<u32>,
-            mut norms_out: Tensor<f32>,
+            mut norms_out: Tensor<T>,
             #[constexpr] dim: u32,
             #[constexpr] packed_width: u32,
         ) {
@@ -125,8 +141,9 @@ macro_rules! aura_encode_kernel {
             threadgroup_barrier();
             let mut rotated = 0.0f32;
             for j in range(0u32, dim, 1u32) {
-                rotated =
-                    rotated + load(rotation[d * dim + j]) * threadgroup_load("shared_unit", j);
+                rotated = rotated
+                    + load(rotation[d * dim + j]).cast::<f32>()
+                        * threadgroup_load("shared_unit", j);
             }
 
             // ── Stage 3: branchless boundary comparison → codebook
@@ -135,7 +152,7 @@ macro_rules! aura_encode_kernel {
             // exceeds.
             let mut idx = 0u32;
             for b in range(0u32, $levels - 1u32, 1u32) {
-                idx = idx + (rotated > load(boundaries[b])).cast::<u32>();
+                idx = idx + (rotated > load(boundaries[b]).cast::<f32>()).cast::<u32>();
             }
 
             // ── Stage 4: pack the index into the u32 stream via
@@ -187,7 +204,7 @@ macro_rules! aura_encode_kernel {
             // L2 norm of the reconstructed vector, and
             // `corrected = norm_val / recon_norm` is what the decoder
             // multiplies back through.
-            let centroid_val = load(codebook[idx]);
+            let centroid_val = load(codebook[idx]).cast::<f32>();
             let recon_sq = centroid_val * centroid_val;
             let simd_recon_sq = simd_sum(recon_sq);
             if lane == 0u32 {
@@ -202,7 +219,7 @@ macro_rules! aura_encode_kernel {
             let corrected_norm = select(recon_norm > 1.0e-8f32, norm_val / recon_norm, norm_val);
 
             if d == 0u32 {
-                store(norms_out[row], corrected_norm);
+                store(norms_out[row], corrected_norm.cast::<T>());
             }
         }
     };
@@ -213,6 +230,147 @@ aura_encode_kernel!(aura_encode_int3, 3u32, 8u32, "encode_int3");
 aura_encode_kernel!(aura_encode_int4, 4u32, 16u32, "encode_int4");
 aura_encode_kernel!(aura_encode_int6, 6u32, 64u32, "encode_int6");
 aura_encode_kernel!(aura_encode_int8, 8u32, 256u32, "encode_int8");
+
+/// New-syntax correctness for the AURA fused encode kernel. Mirrors the
+/// affine-quantize tests' strategy: the **packed codes** go through a
+/// branchless boundary-count whose last bit and bit-packing are sensitive to
+/// Metal fast-math FMA fusion, so they stay covered by the legacy bit-exact
+/// `aura_encode_gpu_correctness.rs` A/B test. Here we pin the part that is
+/// robustly checkable — the per-vector **norm-correction factor**
+/// (`norms_out`), which the decoder multiplies back through.
+///
+/// Setup uses an **identity rotation** so the Stage-2 matmul is `rotated =
+/// unit_val` exactly (no reorder ambiguity in the quant index), and a smooth
+/// input chosen to land each rotated coordinate comfortably mid-bin — so the
+/// codebook index feeding `norms_out` is stable under input dtype rounding.
+/// All data operands are now `Tensor<T>` (`input`/`codebook`/`norms_out` from
+/// #212, and `rotation`/`boundaries` from the storage-precision follow-up), so
+/// every one is dtype-rounded here to match the kernel's cast-at-load. The
+/// identity rotation is exact in all dtypes; `norms_out` is compared at the
+/// per-dtype tol. `packed_out` is provided but NOT expected (fast-math packing
+/// — the legacy f32 A/B test owns the bit-exact check).
+///
+/// Grid (Reduction, TPG = dim): `grid_3d(rows, 1, 1, [dim,1,1])`.
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::aura_encode_int4;
+    use crate::utils::{pack_f32, unpack_f32};
+
+    fn u32_bytes(v: &[u32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
+
+    /// Identity rotation `[dim, dim]` — row d is the unit vector e_d.
+    fn identity_rotation(dim: usize) -> Vec<f32> {
+        let mut r = vec![0.0_f32; dim * dim];
+        for d in 0..dim {
+            r[d * dim + d] = 1.0;
+        }
+        r
+    }
+
+    /// Symmetric int4 codebook: 16 evenly-spaced centroids in [-1, 1], with the
+    /// 15 boundaries at the midpoints (mirrors `int4_uniform_codebook` in the
+    /// legacy test).
+    fn int4_uniform_codebook() -> (Vec<f32>, Vec<f32>) {
+        let levels = 16usize;
+        let codebook: Vec<f32> =
+            (0..levels).map(|i| -1.0 + 2.0 * (i as f32) / (levels as f32 - 1.0)).collect();
+        let boundaries: Vec<f32> =
+            (0..levels - 1).map(|i| 0.5 * (codebook[i] + codebook[i + 1])).collect();
+        (codebook, boundaries)
+    }
+
+    /// CPU oracle for `norms_out` only. Replicates Stages 1/3/5 of the kernel
+    /// under an identity rotation (so `rotated = unit_val`): L2-normalise the
+    /// row, boundary-count each coordinate into a codebook index, then
+    /// `corrected = norm / ‖centroids‖`.
+    fn norms_oracle(
+        input: &[f32],
+        boundaries: &[f32],
+        codebook: &[f32],
+        rows: usize,
+        dim: usize,
+    ) -> Vec<f32> {
+        let mut norms = vec![0.0_f32; rows];
+        for r in 0..rows {
+            let row = &input[r * dim..(r + 1) * dim];
+            let norm_sq: f32 = row.iter().map(|&v| v * v).sum();
+            let norm_val = norm_sq.sqrt();
+            let inv_norm = if norm_val > 1.0e-8 { 1.0 / norm_val } else { 0.0 };
+            let mut recon_sq = 0.0_f32;
+            for &v in row {
+                let rotated = v * inv_norm; // identity rotation
+                // Index = count of boundaries the value exceeds.
+                let mut idx = 0usize;
+                for &bnd in boundaries {
+                    if rotated > bnd {
+                        idx += 1;
+                    }
+                }
+                let centroid = codebook[idx];
+                recon_sq += centroid * centroid;
+            }
+            let recon_norm = recon_sq.sqrt();
+            norms[r] = if recon_norm > 1.0e-8 { norm_val / recon_norm } else { norm_val };
+        }
+        norms
+    }
+
+    /// Small AURA-encode shape: dim a multiple of 32, identity rotation. int4.
+    fn setup(dim: usize, rows: usize, dt: DType) -> TestSetup {
+        const BITS: usize = 4;
+        let packed_width = (dim * BITS).div_ceil(32);
+        let (codebook, boundaries) = int4_uniform_codebook();
+        let rotation = identity_rotation(dim);
+        // Smooth input bounded so unit-normed coordinates land mid-bin (away
+        // from the 15 midpoint boundaries) — keeps the quant index stable under
+        // input dtype rounding.
+        let input: Vec<f32> = (0..rows * dim).map(|i| ((i as f32) * 0.013).sin() * 0.6).collect();
+        // `input` and `codebook` are dtype-rounded (both `Tensor<T>` now); the
+        // oracle then matches the GPU's cast-at-load. `norms_out` is stored
+        // through `dt`, so round the expectation through `dt` too.
+        let input_r = unpack_f32(&pack_f32(&input, dt), dt);
+        let codebook_r = unpack_f32(&pack_f32(&codebook, dt), dt);
+        // rotation/boundaries are now Tensor<T> too; round the oracle's
+        // copies to match the kernel's cast-at-load. The identity rotation
+        // (0/1 entries) is exact in every dtype, so only `boundaries`
+        // actually rounds — and the mid-bin inputs keep the quant index
+        // stable regardless.
+        let boundaries_r = unpack_f32(&pack_f32(&boundaries, dt), dt);
+        let expected_norms_f32 = norms_oracle(&input_r, &boundaries_r, &codebook_r, rows, dim);
+        let expected_norms = unpack_f32(&pack_f32(&expected_norms_f32, dt), dt);
+
+        TestSetup::new(aura_encode_int4::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .input(TestBuffer::from_vec("input", pack_f32(&input, dt), dt))
+            .input(TestBuffer::from_vec("rotation", pack_f32(&rotation, dt), dt))
+            .input(TestBuffer::from_vec("boundaries", pack_f32(&boundaries, dt), dt))
+            .input(TestBuffer::from_vec("codebook", pack_f32(&codebook, dt), dt))
+            .input(TestBuffer::from_vec(
+                "packed_out",
+                u32_bytes(&vec![0u32; rows * packed_width]),
+                DType::U32,
+            ))
+            .input(TestBuffer::zeros("norms_out", rows, dt))
+            .constexpr("dim", dim as u32)
+            .constexpr("packed_width", packed_width as u32)
+            // Only verify the norm-correction factor (now `T`). `packed_out` is
+            // fast-math-sensitive — covered bit-exact by the legacy A/B test.
+            .expect(TestBuffer::from_vec("norms_out", pack_f32(&expected_norms, dt), dt))
+            .grid_3d(rows as u32, 1, 1, [dim as u32, 1, 1])
+    }
+
+    // dim=128 (4 simdgroups — exercises the cross-simdgroup `shared_norm`
+    // combine), 2 rows. norms_out is f32; the simd_sum reorder vs the CPU
+    // left-fold drifts a few ulp, so even the f32 cell uses a small absolute
+    // band; f16/bf16 widen only from input rounding.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-4, 1e-3, 5e-3])]
+    fn test_aura_encode_int4_norms(dt: DType) -> TestSetup { setup(128, 2, dt) }
+
+    // dim=32 (exactly one simdgroup — the n_simd=1 path), single row.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-4, 1e-3, 5e-3])]
+    fn test_aura_encode_int4_norms_min_dim(dt: DType) -> TestSetup { setup(32, 1, dt) }
+}
 
 pub mod kernel_benches {
     use metaltile::{bench, test::*};
@@ -230,15 +388,15 @@ pub mod kernel_benches {
         let levels = 1usize << bits;
         s.mode(KernelMode::Reduction)
             .buffer(BenchBuffer::random("input", rows * dim, dt))
-            .buffer(BenchBuffer::random("rotation", dim * dim, DType::F32))
-            .buffer(BenchBuffer::random("boundaries", levels - 1, DType::F32))
-            .buffer(BenchBuffer::random("codebook", levels, DType::F32))
+            .buffer(BenchBuffer::random("rotation", dim * dim, dt))
+            .buffer(BenchBuffer::random("boundaries", levels - 1, dt))
+            .buffer(BenchBuffer::random("codebook", levels, dt))
             .buffer(BenchBuffer::zeros("packed_out", rows * packed_width, DType::U32).output())
-            .buffer(BenchBuffer::zeros("norms_out", rows, DType::F32).output())
+            .buffer(BenchBuffer::zeros("norms_out", rows, dt).output())
             .constexpr("dim", dim as u32)
             .constexpr("packed_width", packed_width as u32)
-            // Rotation matmul dominates: rows reads of a dim×dim f32 matrix.
-            .bytes_moved((rows * dim * dim * 4) as u64)
+            // Rotation matmul dominates: rows reads of a dim×dim T matrix.
+            .bytes_moved((rows * dim * dim * dt.size_bytes()) as u64)
             .grid_3d(rows as u32, 1, 1, [dim as u32, 1, 1])
     }
 
