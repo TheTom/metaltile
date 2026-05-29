@@ -38,7 +38,7 @@
 use std::collections::BTreeMap;
 
 use metaltile_core::{
-    KernelEntry,
+    all_kernels,
     dtype::DType,
     ir::{Kernel, KernelCallArg, Op, ValueId},
 };
@@ -121,14 +121,11 @@ impl Pass for KernelInlinePass {
 // ---------------------------------------------------------------------------
 
 fn lookup_kernel(name: &str, dtype: DType) -> Result<Kernel> {
-    inventory::iter::<KernelEntry>()
-        .find(|e| e.name() == name)
-        .map(|e| e.build(&[dtype]))
-        .ok_or_else(|| {
-            Error::Generation(format!(
-                "KernelInlinePass: unknown kernel `{name}` (not registered via #[kernel])"
-            ))
-        })
+    all_kernels().find(|e| e.name() == name).map(|e| e.build(&[dtype])).ok_or_else(|| {
+        Error::Generation(format!(
+            "KernelInlinePass: unknown kernel `{name}` (not registered via #[kernel])"
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
