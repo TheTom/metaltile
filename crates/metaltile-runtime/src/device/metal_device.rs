@@ -114,19 +114,33 @@ impl MetalDevice {
     /// Get or compile a compute pipeline state.
     ///
     /// `key` is produced by [`pso_cache_key`](crate::pso_cache::pso_cache_key).
+    ///
+    /// MSL generation is deferred — the closure is only invoked on PSO
+    /// cache miss. In steady-state benching the cache is always warm,
+    /// so the 5-12 KB MSL string never gets materialised at all.
     pub fn get_pso(
         &self,
         key: u64,
-        msl: &str,
+        kernel: &metaltile_core::ir::Kernel,
         kernel_name: &str,
         fn_consts: &std::collections::BTreeMap<String, u32>,
     ) -> Result<Pso, MetalTileError> {
-        self.pso_cache.get_or_compile(&self.device, key, msl, kernel_name, fn_consts)
+        self.pso_cache.get_or_compile(
+            &self.device,
+            key,
+            || self.msl_cache.get_or_generate(kernel, key),
+            kernel_name,
+            fn_consts,
+        )
     }
 
     /// Get or generate MSL source for a kernel.
     ///
     /// `key` is produced by [`pso_cache_key`](crate::pso_cache::pso_cache_key).
+    /// Most callers should prefer [`Self::get_pso`] which materialises
+    /// the MSL lazily; this entry-point stays for snapshot tests and
+    /// the MSL-cache perf bench.
+    #[allow(dead_code)]
     pub fn get_msl(
         &self,
         kernel: &metaltile_core::ir::Kernel,

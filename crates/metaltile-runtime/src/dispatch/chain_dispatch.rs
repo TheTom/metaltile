@@ -65,7 +65,7 @@ impl<'a> ChainDispatch<'a> {
     /// results.  GPU time is attributed to the first result (chained
     /// passes share one command buffer and cannot be split).
     pub fn execute(&self) -> Result<Vec<DispatchResult>, MetalTileError> {
-        let (msl_sources, binding_plans) = self.generate_msl_and_plans()?;
+        let binding_plans = self.build_binding_plans()?;
 
         let later_inputs: Vec<HashSet<&str>> = (0..self.specs.len())
             .map(|i| {
@@ -78,7 +78,7 @@ impl<'a> ChainDispatch<'a> {
             })
             .collect();
 
-        let pipes = self.compile_pso_pipeline(&msl_sources)?;
+        let pipes = self.compile_pso_pipeline()?;
 
         let cb = self.dev.command_buffer()?;
         let per_spec_bufs = self.encode_passes(&cb, &pipes, &binding_plans, &later_inputs)?;
@@ -93,31 +93,24 @@ impl<'a> ChainDispatch<'a> {
 
     // ── private helpers ─────────────────────────────────────────────
 
-    fn generate_msl_and_plans(
-        &self,
-    ) -> Result<(Vec<String>, Vec<Vec<ParamBufferPlan>>), MetalTileError> {
-        let mut msl_sources = Vec::with_capacity(self.specs.len());
+    fn build_binding_plans(&self) -> Result<Vec<Vec<ParamBufferPlan>>, MetalTileError> {
         let mut binding_plans = Vec::with_capacity(self.specs.len());
-
         for spec in self.specs {
-            let key = crate::cache::pso_cache::pso_cache_key(spec.kernel, spec.fn_consts);
-            let msl = self.dev.get_msl(spec.kernel, key)?;
-            msl_sources.push(msl);
             binding_plans.push(build_param_buffer_plans(spec.kernel, spec.buffers)?);
         }
-
-        Ok((msl_sources, binding_plans))
+        Ok(binding_plans)
     }
 
     fn compile_pso_pipeline(
         &self,
-        msl_sources: &[String],
     ) -> Result<Vec<Retained<ProtocolObject<dyn MTLComputePipelineState>>>, MetalTileError> {
         let mut pipes = Vec::with_capacity(self.specs.len());
 
-        for (spec, msl) in self.specs.iter().zip(msl_sources) {
+        // MSL fetched lazily by `get_pso` only on PSO-cache miss — no
+        // eager 5-12 KB string clone per spec on steady-state chains.
+        for spec in self.specs {
             let key = crate::cache::pso_cache::pso_cache_key(spec.kernel, spec.fn_consts);
-            let pso = self.dev.get_pso(key, msl, &spec.kernel.name, spec.fn_consts)?;
+            let pso = self.dev.get_pso(key, spec.kernel, &spec.kernel.name, spec.fn_consts)?;
             pipes.push(pso);
         }
 
