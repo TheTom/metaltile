@@ -308,8 +308,9 @@ impl Context {
             };
 
             let key = pso_cache_key(kernel, fn_consts);
-            let msl = dev.get_msl(kernel, key)?;
-            let pso = dev.get_pso(key, &msl, &kernel.name, fn_consts)?;
+            // `get_pso` defers MSL generation to PSO-cache miss only —
+            // steady-state dispatches skip the 5-12 KB string clone.
+            let pso = dev.get_pso(key, kernel, &kernel.name, fn_consts)?;
 
             let dispatch = SingleDispatch::new(dev, kernel, &pso, buffers, grid_override);
             dispatch.execute()

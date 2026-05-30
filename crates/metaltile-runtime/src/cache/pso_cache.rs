@@ -118,20 +118,27 @@ impl PsoCache {
     pub fn new() -> Self { PsoCache { cache: Mutex::new(FxHashMap::default()) } }
 
     /// Return a cached pipeline state for `key`, or compile it from
-    /// `msl_source` on miss.
+    /// `msl_provider()` on miss.
     ///
-    /// `dev` is the Metal device used for compilation.  `kernel_name`
-    /// and `fn_consts` are only needed on a cache miss; on hit the
-    /// method just clones the `Retained` handle (cheap).
+    /// The provider closure is only invoked on PSO cache miss. In
+    /// steady-state benching (cache warm), this avoids the 5-12 KB
+    /// MSL string clone that the previous `msl_source: &str` signature
+    /// forced on every dispatch — the caller had to materialise the
+    /// MSL eagerly even though it was thrown away unread on a cache
+    /// hit. `kernel_name` and `fn_consts` are likewise only consulted
+    /// on miss; on hit the method just clones the `Retained` handle.
     #[cfg(target_os = "macos")]
-    pub(crate) fn get_or_compile(
+    pub(crate) fn get_or_compile<F>(
         &self,
         dev: &ProtocolObject<dyn MTLDevice>,
         key: u64,
-        msl_source: &str,
+        msl_provider: F,
         kernel_name: &str,
         fn_consts: &BTreeMap<String, u32>,
-    ) -> Result<Pso, MetalTileError> {
+    ) -> Result<Pso, MetalTileError>
+    where
+        F: FnOnce() -> Result<String, MetalTileError>,
+    {
         use std::ptr::NonNull;
 
         let mut lock =
@@ -141,9 +148,10 @@ impl PsoCache {
             return Ok(cached.clone());
         }
 
-        // --- cache miss: compile MSL ---
+        // --- cache miss: materialise MSL on demand + compile ---
+        let msl_source = msl_provider()?;
         let lib = dev
-            .newLibraryWithSource_options_error(&NSString::from_str(msl_source), None)
+            .newLibraryWithSource_options_error(&NSString::from_str(&msl_source), None)
             .map_err(|e| MetalTileError::MslCompilation(format!("{e:?}")))?;
 
         let fun = if fn_consts.is_empty() {
