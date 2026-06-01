@@ -404,6 +404,45 @@ pub mod kernel_tests {
     fn test_seg_reduce_min(dt: DType) -> TestSetup {
         seg_setup_for(mt_seg_reduce_min::kernel_ir_for(dt), 64, 48, f32::INFINITY, f32::min, dt)
     }
+
+    // ── prod: separate setups with inputs near 1.0 so the running product
+    // stays O(1) (a `((i%19)-9)*0.1`-style input underflows to 0 over a long
+    // reduction). Modest reduction lengths keep f16/bf16 well-conditioned.
+    fn prod_inputs(n: usize) -> Vec<f32> {
+        (0..n).map(|i| 1.0 + ((i % 7) as f32 - 3.0) * 0.05).collect()
+    }
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 2e-2, 1e-1])]
+    fn test_col_reduce_prod(dt: DType) -> TestSetup {
+        let (rows, cols) = (8usize, 40usize);
+        let inp = prod_inputs(rows * cols);
+        let id = unpack_f32(&pack_f32(&inp, dt), dt);
+        let expected: Vec<f32> =
+            (0..cols).map(|c| (0..rows).map(|r| id[r * cols + c]).product()).collect();
+        TestSetup::new(mt_col_reduce_prod::kernel_ir_for(dt))
+            .input(TestBuffer::from_vec("inp", pack_f32(&inp, dt), dt))
+            .input(TestBuffer::zeros("out", cols, dt))
+            .constexpr("rows", rows as u32)
+            .constexpr("cols", cols as u32)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_1d(cols, 256)
+    }
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 2e-2, 1e-1])]
+    fn test_seg_reduce_prod(dt: DType) -> TestSetup {
+        let (n_segments, seg_len) = (64usize, 12usize);
+        let inp = prod_inputs(n_segments * seg_len);
+        let id = unpack_f32(&pack_f32(&inp, dt), dt);
+        let expected: Vec<f32> =
+            (0..n_segments).map(|s| (0..seg_len).map(|j| id[s * seg_len + j]).product()).collect();
+        TestSetup::new(mt_seg_reduce_prod::kernel_ir_for(dt))
+            .input(TestBuffer::from_vec("inp", pack_f32(&inp, dt), dt))
+            .input(TestBuffer::zeros("out", n_segments, dt))
+            .constexpr("n_segments", n_segments as u32)
+            .constexpr("seg_len", seg_len as u32)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_1d(n_segments, 256)
+    }
 }
 
 /// New-syntax benchmarks for the reduce family (vs MLX `metal/reduce.metal`).
@@ -411,48 +450,127 @@ pub mod kernel_benches {
     use metaltile::{bench, core::ir::Kernel, test::*};
 
     use super::*;
+    use crate::bench_types::{InputDomain, dtype_tol, input_buffer, mlx_tname};
 
-    // all-reduce: one threadgroup folds N elements to a scalar.
-    fn all_b(kernel: Kernel, dt: DType) -> BenchSetup {
-        let n = 16 * 1024 * 1024usize;
-        BenchSetup::new(kernel)
+    const ALL_REDUCE_N: usize = 16 * 1024 * 1024;
+    const ROW_REDUCE_ROWS: usize = 4096;
+    const ROW_REDUCE_N: usize = 4096;
+
+    // all-reduce: one threadgroup folds N elements to a scalar. Attaches the MLX
+    // `metal/reduce.metal` `all_reduce_<sub><tn>` reference for an A/B perf +
+    // correctness comparison. MLX `all_reduce(in, out, in_size, row_size)` folds
+    // a single block when `in_size == row_size == N` (matching MT's single
+    // threadgroup); both are `size_t` (8-byte) scalars.
+    //
+    // `inp` is shared by name with the reference (the runner injects the MT
+    // bytes), so both kernels reduce identical `Positive` data. `tol_floor` is
+    // the legacy reduction floor — large for sum/prod because MT accumulates in
+    // f32 while MLX accumulates in the (lossy) reduce dtype over 16M elements.
+    fn all_ref(
+        kernel: Kernel,
+        dt: DType,
+        mlx_sub: &str,
+        tol_floor: f32,
+        f32_only_ref: bool,
+    ) -> BenchSetup {
+        let n = ALL_REDUCE_N;
+        let tn = mlx_tname(dt);
+        let base = BenchSetup::new(kernel)
             .mode(KernelMode::Reduction)
-            .buffer(BenchBuffer::random("inp", n, dt))
+            .buffer(input_buffer("inp", n, dt, InputDomain::Tiny))
             .buffer(BenchBuffer::zeros("out", 1, dt).output())
             .constexpr("n", n as u32)
             .grid_3d(1, 1, 1, [256, 1, 1])
-            .bytes_moved((n * dt.size_bytes()) as u64)
+            .bytes_moved((n * dt.size_bytes()) as u64);
+        // `sum` folds 16M elements: MT accumulates in f32 but MLX accumulates in
+        // the (lossy) reduce dtype, so for f16/bf16 the two legitimately diverge
+        // by thousands — no meaningful tolerance. Compare only f32, where both
+        // are faithful; f16/bf16 stay perf-only rows.
+        if f32_only_ref && dt != DType::F32 {
+            return base;
+        }
+        base.with_reference(
+                RefKernel::new(
+                    format!("all_reduce_{mlx_sub}{tn}"),
+                    include_str!(concat!(env!("OUT_DIR"), "/metal/reduce.metal")),
+                )
+                // in[0] shared by name with the MT `inp` above (placeholder).
+                .buffer(BenchBuffer::zeros("inp", n, dt))
+                .buffer(BenchBuffer::zeros("out", 1, dt).output())
+                // in_size + row_size are both `size_t` (8 bytes) = N → single block.
+                .buffer(BenchBuffer::from_vec("in_size", (n as u64).to_le_bytes().to_vec(), DType::U32))
+                .buffer(BenchBuffer::from_vec("row_size", (n as u64).to_le_bytes().to_vec(), DType::U32))
+                .grid(Grid::new_3d(1, 1, 1, [256, 1, 1]))
+                .tol(dtype_tol(dt).max(tol_floor)),
+            )
     }
 
     #[bench(name = "mlx/all_reduce/sum", dtypes = [f32, f16, bf16])]
-    fn bench_all_sum(dt: DType) -> BenchSetup { all_b(mt_all_reduce::kernel_ir_for(dt), dt) }
+    fn bench_all_sum(dt: DType) -> BenchSetup {
+        all_ref(mt_all_reduce::kernel_ir_for(dt), dt, "sum", 256.0, true)
+    }
     #[bench(name = "mlx/all_reduce/prod", dtypes = [f32, f16, bf16])]
-    fn bench_all_prod(dt: DType) -> BenchSetup { all_b(mt_all_reduce_prod::kernel_ir_for(dt), dt) }
+    fn bench_all_prod(dt: DType) -> BenchSetup {
+        all_ref(mt_all_reduce_prod::kernel_ir_for(dt), dt, "prod", 1024.0, false)
+    }
     #[bench(name = "mlx/all_reduce/max", dtypes = [f32, f16, bf16])]
-    fn bench_all_max(dt: DType) -> BenchSetup { all_b(mt_all_reduce_max::kernel_ir_for(dt), dt) }
+    fn bench_all_max(dt: DType) -> BenchSetup {
+        all_ref(mt_all_reduce_max::kernel_ir_for(dt), dt, "max", 0.0, false)
+    }
     #[bench(name = "mlx/all_reduce/min", dtypes = [f32, f16, bf16])]
-    fn bench_all_min(dt: DType) -> BenchSetup { all_b(mt_all_reduce_min::kernel_ir_for(dt), dt) }
+    fn bench_all_min(dt: DType) -> BenchSetup {
+        all_ref(mt_all_reduce_min::kernel_ir_for(dt), dt, "min", 0.0, false)
+    }
 
-    // row-reduce: one threadgroup per row.
-    fn row_b(kernel: Kernel, dt: DType) -> BenchSetup {
-        let (rows, n) = (4096usize, 4096usize);
+    // row-reduce: one threadgroup per row. Attaches the MLX
+    // `metal/reduce.metal` `row_reduce_simple_<sub><tn>` reference. That kernel
+    // indexes the row via `gid.y`, so its dispatch grid puts the rows on the Y
+    // axis (`[1, rows, 1]`) — unlike the MT kernel which uses `program_id::<0>()`
+    // (X axis). `reduction_size` is `size_t` (8 bytes) = N; `out_size` is
+    // `int64_t` (8 bytes) = rows.
+    fn row_ref(kernel: Kernel, dt: DType, mlx_sub: &str, tol_floor: f32) -> BenchSetup {
+        let (rows, n) = (ROW_REDUCE_ROWS, ROW_REDUCE_N);
+        let tn = mlx_tname(dt);
         BenchSetup::new(kernel)
             .mode(KernelMode::Reduction)
-            .buffer(BenchBuffer::random("inp", rows * n, dt))
+            .buffer(input_buffer("inp", rows * n, dt, InputDomain::Tiny))
             .buffer(BenchBuffer::zeros("out", rows, dt).output())
             .constexpr("n", n as u32)
             .grid_3d(rows as u32, 1, 1, [256, 1, 1])
             .bytes_moved((rows * n * dt.size_bytes()) as u64)
+            .with_reference(
+                RefKernel::new(
+                    format!("row_reduce_simple_{mlx_sub}{tn}"),
+                    include_str!(concat!(env!("OUT_DIR"), "/metal/reduce.metal")),
+                )
+                // in[0] shared by name with the MT `inp` above (placeholder).
+                .buffer(BenchBuffer::zeros("inp", rows * n, dt))
+                .buffer(BenchBuffer::zeros("out", rows, dt).output())
+                // reduction_size (size_t, 8 bytes) = N; out_size (int64_t, 8 bytes) = rows.
+                .buffer(BenchBuffer::from_vec("reduction_size", (n as u64).to_le_bytes().to_vec(), DType::U32))
+                .buffer(BenchBuffer::from_vec("out_size", (rows as u64).to_le_bytes().to_vec(), DType::U32))
+                // MLX `row_reduce_simple` reads the row from `gid.y` → rows on Y.
+                .grid(Grid::new_3d(1, rows as u32, 1, [256, 1, 1]))
+                .tol(dtype_tol(dt).max(tol_floor)),
+            )
     }
 
     #[bench(name = "mlx/row_reduce/sum", dtypes = [f32, f16, bf16])]
-    fn bench_row_sum(dt: DType) -> BenchSetup { row_b(mt_row_reduce::kernel_ir_for(dt), dt) }
+    fn bench_row_sum(dt: DType) -> BenchSetup {
+        row_ref(mt_row_reduce::kernel_ir_for(dt), dt, "sum", 128.0)
+    }
     #[bench(name = "mlx/row_reduce/prod", dtypes = [f32, f16, bf16])]
-    fn bench_row_prod(dt: DType) -> BenchSetup { row_b(mt_row_reduce_prod::kernel_ir_for(dt), dt) }
+    fn bench_row_prod(dt: DType) -> BenchSetup {
+        row_ref(mt_row_reduce_prod::kernel_ir_for(dt), dt, "prod", 32.0)
+    }
     #[bench(name = "mlx/row_reduce/max", dtypes = [f32, f16, bf16])]
-    fn bench_row_max(dt: DType) -> BenchSetup { row_b(mt_row_reduce_max::kernel_ir_for(dt), dt) }
+    fn bench_row_max(dt: DType) -> BenchSetup {
+        row_ref(mt_row_reduce_max::kernel_ir_for(dt), dt, "max", 0.0)
+    }
     #[bench(name = "mlx/row_reduce/min", dtypes = [f32, f16, bf16])]
-    fn bench_row_min(dt: DType) -> BenchSetup { row_b(mt_row_reduce_min::kernel_ir_for(dt), dt) }
+    fn bench_row_min(dt: DType) -> BenchSetup {
+        row_ref(mt_row_reduce_min::kernel_ir_for(dt), dt, "min", 0.0)
+    }
 
     // col-reduce: Grid3D, one thread per output column of a [rows, cols] matrix.
     fn col_b(kernel: Kernel, dt: DType) -> BenchSetup {

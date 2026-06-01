@@ -49,11 +49,20 @@ pub mod kernel_tests {
     use crate::utils::{pack_f32, unpack_f32};
 
     fn setup(rows: usize, n: usize, dt: DType) -> TestSetup {
+        setup_with(rows, n, dt, |r, i| ((i % 17) as f32 - 8.0) * 0.1 + r as f32 * 0.05)
+    }
+
+    // Shared builder so the standard and large-value tests reuse one oracle.
+    fn setup_with(
+        rows: usize,
+        n: usize,
+        dt: DType,
+        genf: impl Fn(usize, usize) -> f32,
+    ) -> TestSetup {
         let mut inp = Vec::with_capacity(rows * n);
         let mut expected = Vec::with_capacity(rows);
         for r in 0..rows {
-            let row: Vec<f32> =
-                (0..n).map(|i| ((i % 17) as f32 - 8.0) * 0.1 + r as f32 * 0.05).collect();
+            let row: Vec<f32> = (0..n).map(|i| genf(r, i)).collect();
             let rd = unpack_f32(&pack_f32(&row, dt), dt);
             let m = rd.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let s: f32 = rd.iter().map(|&x| (x - m).exp()).sum();
@@ -71,6 +80,16 @@ pub mod kernel_tests {
 
     #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-4, 2e-2, 1e-1])]
     fn test_mt_logsumexp(dt: DType) -> TestSetup { setup(4, 1024, dt) }
+
+    // Large-magnitude logits (50..120): pins the online-max overflow guard
+    // (`m + ln(sum exp(x-m))`). Without the max-subtraction `exp(120)` is
+    // +inf; the running-max path keeps it finite and the GPU result matches
+    // the same-max CPU oracle exactly. f32-only — at large magnitudes
+    // narrow-dtype input rounding, not the guard, dominates.
+    #[test_kernel(dtypes = [f32], tol = [1e-3])]
+    fn test_mt_logsumexp_large_values(dt: DType) -> TestSetup {
+        setup_with(2, 1024, dt, |_r, i| 50.0 + (i % 7) as f32 * 10.0)
+    }
 }
 
 /// New-syntax benchmark for `mt_logsumexp` (vs MLX `metal/logsumexp.metal`).
@@ -78,16 +97,43 @@ pub mod kernel_benches {
     use metaltile::{bench, test::*};
 
     use super::mt_logsumexp;
+    use crate::bench_types::{InputDomain, dtype_tol, input_buffer, mlx_tname};
 
+    // MLX `looped_logsumexp_*` buffer order: `in`[[buffer(0)]],
+    // `out`[[buffer(1)]] (one element per row), `axis_size`(int)[[buffer(2)]].
+    // `inp` is shared by name with the MT input.
+    //
+    // MLX dispatch geometry: one threadgroup per row (grid=[rows,1,1]) at
+    // tpg=1024 — NOT the MT tpg=256. Same threadgroup-array hazard as
+    // `looped_softmax_*`: `local_max[32]`/`local_normalizer[32]` are only valid
+    // when n_simd==32 (tpg=1024); at MT's tpg=256 the stale slots produce NaN.
+    // Pin tpg=1024 (mirrors the legacy RowNorm `mlx_tpg: 1024`).
     #[bench(name = "mlx/logsumexp", dtypes = [f32, f16, bf16])]
     fn bench_logsumexp(dt: DType) -> BenchSetup {
         let (rows, n) = (4096usize, 1024usize);
+        let tn = mlx_tname(dt);
         BenchSetup::new(mt_logsumexp::kernel_ir_for(dt))
             .mode(KernelMode::Reduction)
-            .buffer(BenchBuffer::random("inp", rows * n, dt))
+            .buffer(input_buffer("inp", rows * n, dt, InputDomain::Signed))
             .buffer(BenchBuffer::zeros("out", rows, dt).output())
             .constexpr("n", n as u32)
             .grid_3d(rows as u32, 1, 1, [256, 1, 1])
             .bytes_moved((rows * n * dt.size_bytes()) as u64)
+            .with_reference(
+                RefKernel::new(
+                    format!("looped_logsumexp_{tn}"),
+                    include_str!(concat!(env!("OUT_DIR"), "/metal/logsumexp.metal")),
+                )
+                // `inp` shared by name with the MT input above (placeholder).
+                .buffer(BenchBuffer::zeros("inp", rows * n, dt))
+                .buffer(BenchBuffer::zeros("out", rows, dt).output())
+                .buffer(BenchBuffer::from_vec(
+                    "axis_size",
+                    (n as u32).to_le_bytes().to_vec(),
+                    DType::U32,
+                ))
+                .grid(Grid::new_3d(rows as u32, 1, 1, [1024, 1, 1]))
+                .tol(dtype_tol(dt).max(1e-4)),
+            )
     }
 }

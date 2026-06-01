@@ -348,7 +348,7 @@ mod wide_tests {
 pub mod kernel_tests {
     use metaltile::{test::*, test_kernel};
 
-    use super::{mt_rms_norm, mt_rms_norm_wide};
+    use super::{mt_gated_mixer_norm, mt_rms_norm, mt_rms_norm_wide};
     use crate::utils::{pack_f32, unpack_f32};
 
     // Per-row oracle: out_i = x_i / sqrt(mean(x²) + eps) * w_i, on
@@ -423,6 +423,54 @@ pub mod kernel_tests {
 
     #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-4, 2e-2, 1e-1])]
     fn test_mt_rms_norm_wide_d960(dt: DType) -> TestSetup { setup_wide(3, 960, dt) }
+
+    // Beyond a single TPG sweep: n=5376 = 5·1024 + 256 forces the strided loop
+    // to run 6 iterations with an uneven tail (threads 0..256 do the 6th pass,
+    // 256..1024 do only 5) — the multi-iteration path d960 (single sweep)
+    // leaves dormant. Gemma-class wide hidden, single row.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-4, 2e-2, 1e-1])]
+    fn test_mt_rms_norm_wide_multi_iter(dt: DType) -> TestSetup { setup_wide(1, 5376, dt) }
+
+    // ── mt_gated_mixer_norm: out = (y · rms(y) · w) · silu(z) ──────────────
+    //
+    // Gated-DeltaNet output norm: RMS-normalise the f32 mixer output `y` over
+    // the Dv axis, scale by per-channel `w`, then gate by `silu(z)`. `y` is
+    // always f32; `z`/`w`/`out` are T. One thread owns 4 Dv elements; N = TPG*4.
+    fn setup_mixer(rows: usize, n: usize, dt: DType) -> TestSetup {
+        let eps = 1e-5f32;
+        let y: Vec<f32> =
+            (0..rows * n).map(|i| ((i % 17) as f32 - 8.0) * 0.1 + (i / n) as f32 * 0.03).collect();
+        let z_raw: Vec<f32> = (0..rows * n).map(|i| ((i % 13) as f32 - 6.0) * 0.2).collect();
+        let w_raw: Vec<f32> = (0..n).map(|i| 1.0 + ((i % 11) as f32 - 5.0) * 0.02).collect();
+        let z = unpack_f32(&pack_f32(&z_raw, dt), dt);
+        let w = unpack_f32(&pack_f32(&w_raw, dt), dt);
+        let silu = |x: f32| x / (1.0 + (-x).exp());
+        let mut expected = vec![0.0f32; rows * n];
+        for r in 0..rows {
+            let ssq: f32 = y[r * n..(r + 1) * n].iter().map(|v| v * v).sum();
+            let rms = 1.0 / (ssq / n as f32 + eps).sqrt();
+            for i in 0..n {
+                expected[r * n + i] = (y[r * n + i] * rms * w[i]) * silu(z[r * n + i]);
+            }
+        }
+        TestSetup::new(mt_gated_mixer_norm::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .input(TestBuffer::from_vec("y", pack_f32(&y, DType::F32), DType::F32))
+            .input(TestBuffer::from_vec("z", pack_f32(&z_raw, dt), dt))
+            .input(TestBuffer::from_vec("w", pack_f32(&w_raw, dt), dt))
+            .input(TestBuffer::zeros("out", rows * n, dt))
+            .input(TestBuffer::from_vec("eps_buf", eps.to_le_bytes().to_vec(), DType::F32))
+            .constexpr("n", n as u32)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_3d(rows as u32, 1, 1, [(n / 4) as u32, 1, 1])
+    }
+
+    // Dv=128 (TPG 32, single simdgroup) and Dv=256 (TPG 64, cross-simdgroup
+    // reduce) — the two Qwen3-hybrid mixer widths.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-4, 5e-3, 2e-2])]
+    fn test_mt_gated_mixer_norm(dt: DType) -> TestSetup { setup_mixer(8, 128, dt) }
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-4, 5e-3, 2e-2])]
+    fn test_mt_gated_mixer_norm_dv256(dt: DType) -> TestSetup { setup_mixer(4, 256, dt) }
 }
 
 /// New-syntax benchmark for `mt_rms_norm` (vs MLX `metal/rms_norm.metal`).
@@ -430,35 +478,71 @@ pub mod kernel_benches {
     use metaltile::{bench, test::*};
 
     use super::{mt_gated_mixer_norm, mt_rms_norm, mt_rms_norm_small, mt_rms_norm_wide};
+    use crate::bench_types::{InputDomain, dtype_tol, input_buffer, mlx_tname};
+
+    // Build the MLX `rms_single_row` (`rms{tn}`) reference for a `(rows, n)`
+    // RMSNorm bench. Buffer order: `x`[[buffer(0)]], `w`[[buffer(1)]],
+    // `out`[[buffer(2)]], `eps`(float)[[buffer(3)]], `axis_size`(uint)[[buffer(4)]],
+    // `w_stride`(uint)[[buffer(5)]]. x/w/eps_buf are shared by name with the MT
+    // inputs; w_stride=1 (contiguous per-channel weight, the legacy `U32V(1)`).
+    // `eps` reuses the MT `eps_buf` (1e-5, F32) so both sides match.
+    //
+    // `rms_single_row` reads N_READS=4 elements per thread (`lid*4`), so MLX
+    // dispatches it at one threadgroup per row, tpg=1024 (legacy RowNorm
+    // `mlx_tpg: 1024` — uniform for both shapes; for n=64 the per-lane
+    // `lid*4+4 <= axis_size` guard zeroes the idle lanes so the larger tpg is
+    // still correct). The forward write path does not gate on the `has_w`
+    // function constant, so no constant value is needed (matches the legacy
+    // `runner.compile` path).
+    fn rms_ref(rows: usize, n: usize, dt: DType) -> RefKernel {
+        let tn = mlx_tname(dt);
+        RefKernel::new(
+            format!("rms{tn}"),
+            include_str!(concat!(env!("OUT_DIR"), "/metal/rms_norm.metal")),
+        )
+        // x/w/eps_buf shared by name with the MT inputs (placeholders).
+        .buffer(BenchBuffer::zeros("x", rows * n, dt))
+        .buffer(BenchBuffer::zeros("w", n, dt))
+        .buffer(BenchBuffer::zeros("out", rows * n, dt).output())
+        .buffer(BenchBuffer::zeros("eps_buf", 1, DType::F32))
+        .buffer(BenchBuffer::from_vec("axis_size", (n as u32).to_le_bytes().to_vec(), DType::U32))
+        .buffer(BenchBuffer::from_vec("w_stride", 1u32.to_le_bytes().to_vec(), DType::U32))
+        .grid(Grid::new_3d(rows as u32, 1, 1, [1024, 1, 1]))
+        .tol(dtype_tol(dt).max(1e-4))
+    }
 
     #[bench(name = "mlx/rms_norm", dtypes = [f32, f16, bf16])]
     fn bench_rms_norm(dt: DType) -> BenchSetup {
         let (rows, n) = (4096usize, 4096usize);
         BenchSetup::new(mt_rms_norm::kernel_ir_for(dt))
             .mode(KernelMode::Reduction)
-            .buffer(BenchBuffer::random("x", rows * n, dt))
-            .buffer(BenchBuffer::random("w", n, dt))
+            .buffer(input_buffer("x", rows * n, dt, InputDomain::Signed))
+            .buffer(input_buffer("w", n, dt, InputDomain::Positive))
             .buffer(BenchBuffer::zeros("out", rows * n, dt).output())
             .buffer(BenchBuffer::from_vec("eps_buf", 1e-5f32.to_le_bytes().to_vec(), DType::F32))
             .constexpr("n", n as u32)
             .grid_3d(rows as u32, 1, 1, [(n / 4) as u32, 1, 1])
             .bytes_moved((2 * rows * n * dt.size_bytes()) as u64)
+            .with_reference(rms_ref(rows, n, dt))
     }
 
     // rms_norm_small: 2 elements per thread → tpg = n/2. Per-head shape
-    // (head_dim=64, 1024 rows) matching the legacy bench(b=1024, n=64).
+    // (head_dim=64, 1024 rows) matching the legacy bench(b=1024, n=64). The
+    // MLX reference (`rms_single_row`, 4 elements/thread) is the same kernel as
+    // the parent bench; only the MT-side per-thread layout differs.
     #[bench(name = "mlx/rms_norm/rms_norm_small", dtypes = [f32, f16, bf16])]
     fn bench_rms_norm_small(dt: DType) -> BenchSetup {
         let (rows, n) = (1024usize, 64usize);
         BenchSetup::new(mt_rms_norm_small::kernel_ir_for(dt))
             .mode(KernelMode::Reduction)
-            .buffer(BenchBuffer::random("x", rows * n, dt))
-            .buffer(BenchBuffer::random("w", n, dt))
+            .buffer(input_buffer("x", rows * n, dt, InputDomain::Signed))
+            .buffer(input_buffer("w", n, dt, InputDomain::Positive))
             .buffer(BenchBuffer::zeros("out", rows * n, dt).output())
             .buffer(BenchBuffer::from_vec("eps_buf", 1e-5f32.to_le_bytes().to_vec(), DType::F32))
             .constexpr("n", n as u32)
             .grid_3d(rows as u32, 1, 1, [(n / 2) as u32, 1, 1])
             .bytes_moved((2 * rows * n * dt.size_bytes()) as u64)
+            .with_reference(rms_ref(rows, n, dt))
     }
 
     // rms_norm_wide: strided over the row, one threadgroup (tpg=1024) per

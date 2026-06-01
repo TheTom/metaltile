@@ -147,7 +147,7 @@ fp8_kernel!(mt_fp8_e5m2_quant_dequant, "fp8_e5m2", 2.0f32, -14.0f32, 15.0f32, 57
 pub mod kernel_tests {
     use metaltile::{test::*, test_kernel};
 
-    use super::mt_fp4_quant_dequant;
+    use super::{mt_fp4_quant_dequant, mt_fp8_e4m3_quant_dequant, mt_fp8_e5m2_quant_dequant};
 
     fn fp4_snap(norm: f32) -> f32 {
         if norm < 0.25 {
@@ -215,6 +215,71 @@ pub mod kernel_tests {
             ))
             .grid_3d((n / 32) as u32, 1, 1, [32, 1, 1])
     }
+
+    /// CPU oracle for the fp8 round-trip: per-32-element amax-scale, then snap
+    /// each magnitude to the `mant`-bit-mantissa fp8 grid (binade via
+    /// `floor(log2)`, exponent clamped to `[emin, emax]`, `round` to the
+    /// per-binade quantum, saturate at `fp8max`), then rescale. Mirrors the
+    /// `fp8_kernel!` body exactly.
+    fn fp8_oracle(inp: &[f32], mant: f32, emin: f32, emax: f32, fp8max: f32) -> Vec<f32> {
+        let mut out = vec![0.0f32; inp.len()];
+        for (gi, group) in inp.chunks_exact(32).enumerate() {
+            let group_max = group.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let inv_scale = if group_max > 0.0 { fp8max / group_max } else { 0.0 };
+            let rescale = group_max / fp8max;
+            for (i, &x) in group.iter().enumerate() {
+                let norm = x.abs() * inv_scale;
+                let q = if norm > 0.0 {
+                    let e = norm.log2().floor().clamp(emin, emax);
+                    let quantum = (e - mant).exp2();
+                    ((norm / quantum).round() * quantum).min(fp8max)
+                } else {
+                    0.0
+                };
+                let sign = if x < 0.0 { -1.0 } else { 1.0 };
+                out[gi * 32 + i] = sign * q * rescale;
+            }
+        }
+        out
+    }
+
+    fn fp8_setup(
+        kernel: metaltile::core::ir::Kernel,
+        mant: f32,
+        emin: f32,
+        emax: f32,
+        fp8max: f32,
+    ) -> TestSetup {
+        let inp: Vec<f32> = (0..4).flat_map(synthetic_group).collect();
+        let n = inp.len();
+        let expected = fp8_oracle(&inp, mant, emin, emax, fp8max);
+        TestSetup::new(kernel)
+            .mode(KernelMode::Grid3D)
+            .input(TestBuffer::from_vec(
+                "inp",
+                inp.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                DType::F32,
+            ))
+            .input(TestBuffer::zeros("out", n, DType::F32))
+            .constexpr("n", n as u32)
+            .expect(TestBuffer::from_vec(
+                "out",
+                expected.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                DType::F32,
+            ))
+            .grid_3d((n / 32) as u32, 1, 1, [32, 1, 1])
+    }
+
+    // e4m3: 3 mantissa bits, exponent [-6, 8], max ±448.
+    #[test_kernel(dtypes = [f32], tol = 1e-3)]
+    fn test_mt_fp8_e4m3_quant_dequant(_dt: DType) -> TestSetup {
+        fp8_setup(mt_fp8_e4m3_quant_dequant::kernel_ir_for(), 3.0, -6.0, 8.0, 448.0)
+    }
+    // e5m2: 2 mantissa bits, exponent [-14, 15], max ±57344.
+    #[test_kernel(dtypes = [f32], tol = 1e-3)]
+    fn test_mt_fp8_e5m2_quant_dequant(_dt: DType) -> TestSetup {
+        fp8_setup(mt_fp8_e5m2_quant_dequant::kernel_ir_for(), 2.0, -14.0, 15.0, 57344.0)
+    }
 }
 
 /// New-syntax benchmarks for the fp-quantize round-trip kernels.
@@ -222,9 +287,12 @@ pub mod kernel_benches {
     use metaltile::{bench, core::ir::Kernel, test::*};
 
     use super::{mt_fp4_quant_dequant, mt_fp8_e4m3_quant_dequant, mt_fp8_e5m2_quant_dequant};
+    use crate::bench_types::{InputDomain, input_buffer};
+
+    const QUANT_N: usize = 64 * 1024 * 1024;
 
     fn qb(kernel: Kernel) -> BenchSetup {
-        let n = 64 * 1024 * 1024usize;
+        let n = QUANT_N;
         BenchSetup::new(kernel)
             .mode(KernelMode::Grid3D)
             .buffer(BenchBuffer::random("inp", n, DType::F32))
@@ -234,8 +302,51 @@ pub mod kernel_benches {
             .bytes_moved((2 * n * 4) as u64)
     }
 
+    // fp4 carries the MLX `metal/fp_quantized.metal`
+    // `nvfp4_quantize_dequantize_float_gs_16_b_4` reference. The MLX kernel is
+    // 2-buffer (`w`[[0]] input, `out`[[1]] output, both f32) with no scalars and
+    // no function constants. It is dispatched 2D: `index = tidx.x + grid_dim.x *
+    // tidx.y`, so the legacy `[1, n/32, 1]` threadgroups × `[32,1,1]` tpg gives
+    // `grid_dim.x = 32` and each 32-lane threadgroup is one simdgroup covering 32
+    // consecutive elements — the same element-to-simdgroup grouping the MT Grid3D
+    // dispatch uses. `inp` is shared by name with the MT input below.
+    //
+    // The input is seeded `Signed` (period-8 pattern `[-3..3]`) rather than
+    // `qb`'s raw `BenchBuffer::random` (random f32 *bytes* alias to inf/nan, which
+    // would poison the quantize round-trip and the A/B). The pattern's period (8)
+    // divides every group boundary, so the per-group amax is a uniform 3.0 — which
+    // also neutralises the gs16-vs-gs32 scale split described next.
+    //
+    // NOTE (semantic divergence): MLX `nvfp4` quantises at **group_size 16**
+    // (`use_mx_scale = group_size == 32` is false → each 32-lane simdgroup is
+    // split into two 16-lane amax groups), whereas `mt_fp4_quant_dequant` takes a
+    // full **32-lane** `simd_max` (group_size 32). With a non-uniform input the
+    // two would pick different per-group scales near a 16-boundary and disagree by
+    // up to a codebook step; the `Signed` pattern's uniform amax avoids that, so
+    // the legacy tol=0.5 dequant-band floor holds for the A/B.
     #[bench(name = "mlx/fp_quantized/fp4", dtypes = [f32])]
-    fn bench_fp4(_dt: DType) -> BenchSetup { qb(mt_fp4_quant_dequant::kernel_ir_for()) }
+    fn bench_fp4(_dt: DType) -> BenchSetup {
+        let n = QUANT_N;
+        BenchSetup::new(mt_fp4_quant_dequant::kernel_ir_for())
+            .mode(KernelMode::Grid3D)
+            .buffer(input_buffer("inp", n, DType::F32, InputDomain::Signed))
+            .buffer(BenchBuffer::zeros("out", n, DType::F32).output())
+            .constexpr("n", n as u32)
+            .grid_3d((n / 32) as u32, 1, 1, [32, 1, 1])
+            .bytes_moved((2 * n * 4) as u64)
+            .with_reference(
+                RefKernel::new(
+                    "nvfp4_quantize_dequantize_float_gs_16_b_4".to_string(),
+                    include_str!(concat!(env!("OUT_DIR"), "/metal/fp_quantized.metal")),
+                )
+                // w[[0]] shared by name with the MT `inp`; out[[1]] fresh.
+                .buffer(BenchBuffer::zeros("inp", n, DType::F32))
+                .buffer(BenchBuffer::zeros("out", n, DType::F32).output())
+                // 2D: [1, n/32, 1] threadgroups × [32,1,1] → grid_dim.x = 32.
+                .grid(Grid::new_3d(1, (n / 32) as u32, 1, [32, 1, 1]))
+                .tol(0.5),
+            )
+    }
     #[bench(name = "mlx/fp_quantized/fp8_e4m3", dtypes = [f32])]
     fn bench_fp8_e4m3(_dt: DType) -> BenchSetup { qb(mt_fp8_e4m3_quant_dequant::kernel_ir_for()) }
     #[bench(name = "mlx/fp_quantized/fp8_e5m2", dtypes = [f32])]

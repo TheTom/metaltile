@@ -4,7 +4,10 @@ use std::{cell::RefCell, ptr::NonNull};
 
 use metaltile_codegen::msl::MslGenerator;
 pub use metaltile_core::dtype::DType;
-use metaltile_core::ir::{Kernel, KernelMode};
+use metaltile_core::{
+    bench::BenchBuffer,
+    ir::{Kernel, KernelMode},
+};
 
 use crate::stats::BenchStats;
 
@@ -44,6 +47,55 @@ pub fn mlx_tname(dt: DType) -> &'static str {
         DType::Bool => "bool_",
         _ => "float32",
     }
+}
+
+/// Deterministic, range-controlled input distributions for A/B reference
+/// comparisons.
+///
+/// Random bytes reinterpreted as floats overflow transcendentals (exp, sinh) to
+/// inf/nan and fall outside restricted domains (log needs > 0, asin needs
+/// `|x| ≤ 1`), which would make every MT-vs-reference comparison spuriously
+/// fail. So a reference-compared bench seeds its input from a small repeating
+/// pattern inside the op's valid domain (mirrors the legacy `BufInit`).
+/// Throughput is data-independent, so this does not perturb the GB/s figures.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InputDomain {
+    /// Mixed signs around zero: `[-3, -1.5, -0.5, 0, 0.25, 0.75, 1.5, 3]`.
+    Signed,
+    /// Strictly positive `0.25..=4.0` — for `log`/`sqrt`/`rsqrt`/`acosh` domains.
+    Positive,
+    /// Inside the unit interval: `[-0.9, -0.5, -0.1, 0, 0.1, 0.5, 0.9]` — for
+    /// `asin`/`acos`/`atanh`/`erfinv`.
+    Unit,
+    /// Small positive `1e-4..=1.6e-3` — for long reductions (`sum`/`prod` over
+    /// millions of elements) so the accumulated result stays finite in f16
+    /// (a `sum` of millions of `Positive` values overflows; a `prod` blows up to
+    /// inf). `sum` lands in the tens of thousands; `prod` underflows cleanly to
+    /// 0 on both kernels.
+    Tiny,
+}
+
+impl InputDomain {
+    /// The deterministic value at flat index `i`.
+    pub fn value(self, i: usize) -> f32 {
+        match self {
+            InputDomain::Signed => [-3.0, -1.5, -0.5, 0.0, 0.25, 0.75, 1.5, 3.0][i % 8],
+            InputDomain::Positive => 0.25 + (i % 16) as f32 * 0.25,
+            InputDomain::Unit => [-0.9, -0.5, -0.1, 0.0, 0.1, 0.5, 0.9][i % 7],
+            InputDomain::Tiny => 1e-4 + (i % 16) as f32 * 1e-4,
+        }
+    }
+}
+
+/// Build a `BenchBuffer` of `n` elements filled with `domain`'s deterministic
+/// pattern, packed for `dt`.
+///
+/// Use for the **input** of a reference-compared bench so MetalTile and the
+/// reference kernel see identical, in-domain data (the runner shares this exact
+/// buffer with the reference by name).
+pub fn input_buffer(name: &str, n: usize, dt: DType, domain: InputDomain) -> BenchBuffer {
+    let vals: Vec<f32> = (0..n).map(|i| domain.value(i)).collect();
+    BenchBuffer::from_vec(name, crate::utils::pack_f32(&vals, dt), dt)
 }
 
 /// Bytes per element.
@@ -576,10 +628,66 @@ macro_rules! bench_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{CorrectnessStatus, EquivResult, OpBench, OpResult, check_equiv, validate_results};
+    use super::{
+        CorrectnessStatus,
+        DType,
+        EquivResult,
+        InputDomain,
+        OpBench,
+        OpResult,
+        check_equiv,
+        input_buffer,
+        validate_results,
+    };
 
     fn sample_result(mt_perf: Option<f64>, equiv: Option<EquivResult>) -> OpResult {
         OpBench::new("sample", "GB/s").result("shape", Some(1.0), mt_perf, equiv)
+    }
+
+    #[test]
+    fn input_domains_stay_in_their_valid_range() {
+        // Signed straddles zero; magnitudes bounded so exp/sinh don't overflow.
+        for i in 0..64 {
+            let v = InputDomain::Signed.value(i);
+            assert!((-3.0..=3.0).contains(&v));
+        }
+        // Positive is strictly > 0 (safe for log/sqrt/division denominators).
+        for i in 0..64 {
+            assert!(InputDomain::Positive.value(i) > 0.0);
+        }
+        // Unit stays inside [-1, 1] (asin/acos/atanh domain).
+        for i in 0..64 {
+            assert!(InputDomain::Unit.value(i).abs() <= 1.0);
+        }
+        // Tiny is small and positive so long reductions stay finite.
+        for i in 0..64 {
+            let v = InputDomain::Tiny.value(i);
+            assert!(v > 0.0 && v < 1e-2);
+        }
+    }
+
+    #[test]
+    fn input_domains_are_deterministic_and_periodic() {
+        // The same index always yields the same value (so the MT input and the
+        // reference input — generated independently — are byte-identical), and
+        // the pattern repeats so a bounded compare prefix exercises every value.
+        for d in [InputDomain::Signed, InputDomain::Positive, InputDomain::Unit, InputDomain::Tiny]
+        {
+            assert_eq!(d.value(0), d.value(0));
+            assert_eq!(d.value(3), d.value(3 + 16 * 7)); // 112 is a common multiple of 8/16/7
+        }
+    }
+
+    #[test]
+    fn input_buffer_packs_expected_width_and_round_trips_f32() {
+        let buf = input_buffer("a", 8, DType::F32, InputDomain::Signed);
+        assert_eq!(buf.name(), "a");
+        assert_eq!(buf.len(), 8);
+        // f32 bytes round-trip to the domain pattern.
+        let bytes = buf.initial_bytes();
+        assert_eq!(bytes.len(), 8 * 4);
+        let v0 = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        assert_eq!(v0, InputDomain::Signed.value(0));
     }
 
     #[test]
