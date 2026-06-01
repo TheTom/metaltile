@@ -73,7 +73,10 @@
 //! - Use `<kernel>::build_kernel_ir()` or `metaltile::codegen::msl::MslGenerator` to inspect the
 //!   generated IR and MSL before dispatching.
 
+pub mod harness;
 pub mod prelude;
+/// GPU runner infrastructure for the `__tile_runner` subprocess.
+pub mod runner;
 /// Author-facing re-exports for `#[bench]` / `#[test_kernel]` setups.
 pub mod test;
 

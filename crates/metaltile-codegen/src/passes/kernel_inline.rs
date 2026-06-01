@@ -38,7 +38,6 @@
 use std::collections::BTreeMap;
 
 use metaltile_core::{
-    all_kernels,
     dtype::DType,
     ir::{Kernel, KernelCallArg, Op, ValueId},
 };
@@ -46,6 +45,7 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     error::{Error, Result},
+    kernel_registry::all_kernels,
     passes::{
         Pass,
         remap::{find_max_vid, remap_value_ids},

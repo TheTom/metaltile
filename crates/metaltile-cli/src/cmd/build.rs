@@ -25,12 +25,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use metaltile::harness::{bench::KernelBench, registry::all_benches};
 use metaltile_codegen::{
     emit::{self, compile_metallib, dtype_suffix, write_manifest, write_msl, write_swift_wrappers},
     generator_for_mode,
     passes::{PassStats, PipelineBuilder, run_passes_with_stats},
 };
-use metaltile_core::{all_benches, bench::KernelBench, ir::Kernel};
+use metaltile_core::ir::Kernel;
 use metaltile_std::bench_types::DType;
 
 use crate::{
@@ -51,6 +52,13 @@ fn pad_right(text: &str, width: usize) -> String { format!("{text:>width$}") }
 /// A kernel to emit: its bench (carrying IR + mode + grid) and the union of
 /// dtypes it should be monomorphized over.
 type EmitKernel = (&'static dyn KernelBench, Vec<DType>);
+
+/// `TileCommand` wrapper for `tile build`.
+pub struct BuildCommand<'a>(pub &'a BuildArgs);
+
+impl<'a> super::TileCommand for BuildCommand<'a> {
+    fn run(&self, _harness: &crate::harness::Harness) -> Result<(), crate::CliError> { run(self.0) }
+}
 
 pub fn run(args: &BuildArgs) -> Result<(), CliError> {
     let _span = tracing::info_span!("build", filter = ?args.filter, emit = ?args.emit).entered();

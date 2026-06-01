@@ -8,13 +8,20 @@
 //! `tests/*_gpu_correctness.rs` suite (removed in #240; now in-source
 //! `#[test_kernel]`s).
 
-use metaltile_std::run_kernel::run_kernel_test;
+use metaltile::runner::run_kernel_test;
 
 use crate::{
     TestArgs,
     matches_filter,
     term::{Color, Style, paint_stderr, paint_stdout},
 };
+
+/// `TileCommand` wrapper for `tile test`.
+pub struct TestCommand<'a>(pub &'a TestArgs);
+
+impl<'a> super::TileCommand for TestCommand<'a> {
+    fn run(&self, _harness: &crate::harness::Harness) -> Result<(), crate::CliError> { run(self.0) }
+}
 
 pub fn run(args: &TestArgs) -> Result<(), crate::CliError> {
     let _span = tracing::info_span!("test", filter = ?args.filter).entered();
@@ -39,7 +46,7 @@ pub fn run(args: &TestArgs) -> Result<(), crate::CliError> {
     let mut failures: Vec<String> = Vec::new();
     let mut matched_filter = false;
 
-    for entry in metaltile_core::all_tests() {
+    for entry in metaltile::harness::registry::all_tests() {
         let t = entry.test();
         if !matches_filter(filter.as_deref(), t.name()) {
             continue;

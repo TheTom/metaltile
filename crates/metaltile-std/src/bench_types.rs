@@ -2,14 +2,10 @@
 //! SPDX-License-Identifier: Apache-2.0
 use std::{cell::RefCell, ptr::NonNull};
 
+use metaltile::{harness::bench::BenchBuffer, runner::BenchStats};
 use metaltile_codegen::msl::MslGenerator;
 pub use metaltile_core::dtype::DType;
-use metaltile_core::{
-    bench::BenchBuffer,
-    ir::{Kernel, KernelMode},
-};
-
-use crate::stats::BenchStats;
+use metaltile_core::ir::{Kernel, KernelMode};
 
 // ── Dtype variant helpers ─────────────────────────────────────────────────────
 

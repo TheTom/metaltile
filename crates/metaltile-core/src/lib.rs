@@ -2,31 +2,28 @@
 //! SPDX-License-Identifier: Apache-2.0
 //! MetalTile core: IR types, shape algebra, and DType system.
 //!
-//! This crate defines the foundational types that all other crates share:
-//! - [`DType`]: numeric types (f16, f32, i32, etc.)
+//! This crate defines the foundational types shared across all other crates:
+//! - [`DType`]: numeric element types (f16, f32, i32, etc.)
 //! - [`Shape`]: compile-time dimension tracking via type-level markers
 //! - [`ConstExpr`]: constexpr values resolved at kernel compile time
-//! - Kernel IR nodes: the SSA-form intermediate representation
+//! - Kernel IR: the SSA-form intermediate representation ([`Op`], [`Block`], [`Kernel`])
+//! - [`protocol`]: JSON Lines wire types for the runner ↔ CLI protocol
+//! - [`registry`]: [`KernelEntry`] and the `all_kernels()` accessor used by codegen
 
 pub mod dsl;
 pub mod error;
 pub mod ir;
-pub mod toolchain;
+pub mod protocol;
 
-/// Backward-compat re-export: `metaltile_core::bench` still works.
-pub mod bench {
-    pub use crate::toolchain::{bench::*, test::*};
-}
-
-/// Bench/test inventory wrappers, re-exported at the crate root so the
-/// `#[bench]` / `#[test_kernel]` macros can submit via
-/// `metaltile_core::KernelBenchEntry` / `KernelTestEntry`.
-pub use bench::{KernelBenchEntry, KernelTestEntry};
-// Backward-compat flat re-exports for the DSL types.
+// Flat re-exports for the DSL types used throughout the codebase.
 pub use dsl::{ConstExpr, DType, Dim, DimExpr, Shape, constexpr, dtype, shape, tile};
 pub use error::{Error, Result};
 /// Re-export of `inventory` so generated `inventory::submit!` code in
 /// `#[kernel]`-expanded modules can use `metaltile_core::inventory::submit!`.
+///
+/// `KernelEntry` and `all_kernels()` live in `metaltile-codegen` (runner
+/// concern). This re-export exists solely to provide the submit! path used by
+/// the `#[kernel]` macro without forcing user code to depend on codegen.
 #[doc(hidden)]
 pub use inventory;
 pub use ir::{
@@ -45,4 +42,3 @@ pub use ir::{
     ValueId,
     VarId,
 };
-pub use toolchain::registry::{KernelEntry, all_benches, all_kernels, all_tests};
