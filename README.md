@@ -126,12 +126,14 @@ flowchart LR
     K -.discovered by.-> Build
     K -.discovered by.-> Inspect
     Build --> MSL
-    Bench --> Runner["__tile_runner<br/>(subprocess)"]
+    Bench --> Runner["GpuRunner<br/>(in-process)"]
     Test --> Runner
     Runner --> Metallib
 ```
 
 `#[kernel]` lowers your DSL function to IR; the codegen passes optimise it; MSL emit produces a `.metal` source that `xcrun metal` compiles to a `metallib`. `#[bench]` / `#[test_kernel]` are optional annotations on the same function that register a setup callback the runner uses to dispatch the kernel and measure it (or diff against a CPU oracle).
+
+> Today `tile bench` / `tile test` dispatch through the in-process `GpuRunner`; moving the runner into a dedicated subprocess (for isolation and parallelism) is planned.
 
 ## CLI reference
 
