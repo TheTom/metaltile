@@ -9,8 +9,9 @@ concurrency:
 #
 #   changes
 #   compile ──┬── build
-#             ├── bench (ffai)  ──┐
-#             └── bench (mlx)  ──┴── bench-merge
+#             ├── test
+#             ├── bench-ffai  ──┐
+#             └── bench-mlx   ──┴── bench-merge
 #
 # `changes` (ubuntu, fast) classifies which paths changed so each bench
 # shard only runs when its kernel family was the sole thing modified:
@@ -166,33 +167,14 @@ jobs:
       - name: Build
         run: tile build
 
-  # ── Job 3 + 4: GPU benchmark suite (sharded by kernel family) ────────────────
-  # Two bench jobs run in parallel — one for the `ffai` family (attention/MLP
-  # inference kernels) and one for the `mlx` family (MLX reference comparisons).
-  # `--match-group` narrows each shard to only its family so both finish faster
-  # than a single sequential run.
-  #
-  # Each shard only runs when its kernel family was the sole thing modified
-  # (no other crates or Rust files touched). On workflow_dispatch both shards
-  # always run so a manual trigger can force a full bench.
-  bench:
-    name: Bench (${{ matrix.family }})
+  # ── Job 3: correctness tests ─────────────────────────────────────────────────
+  # Runs `tile test` against the CPU oracle for every registered #[test_kernel].
+  # Runs in parallel with build and the bench shards.
+  test:
+    name: Test
     runs-on: macos-latest
-    timeout-minutes: 60
-    needs: [compile, changes]
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (
-        needs.changes.outputs.other == 'false' &&
-        (
-          (matrix.family == 'ffai' && needs.changes.outputs.ffai == 'true') ||
-          (matrix.family == 'mlx'  && needs.changes.outputs.mlx  == 'true')
-        )
-      )
-    strategy:
-      fail-fast: false
-      matrix:
-        family: [ffai, mlx]
+    timeout-minutes: 30
+    needs: compile
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5.0.0
 
@@ -208,26 +190,109 @@ jobs:
       - name: Add tile to PATH
         run: echo "${GITHUB_WORKSPACE}/target/ci" >> "$GITHUB_PATH"
 
-      # `--allow-dirty` is defensive — CI checks out clean, but a future
-      # codegen step could mutate a tracked file.
-      - name: Bench (${{ matrix.family }})
-        run: tile bench -vv --allow-dirty --match-group '${{ matrix.family }}' --json /tmp/bench-${{ matrix.family }}.json
+      - name: Test
+        run: tile test
 
-      # Snapshot this shard's bench JSON.
-      - name: Snapshot bench result (${{ matrix.family }})
+  # ── Job 4 + 5: GPU benchmark suite (sharded by kernel family) ────────────────
+  # Two bench jobs run in parallel — one for the `ffai` family (attention/MLP
+  # inference kernels) and one for the `mlx` family (MLX reference comparisons).
+  # `--match-group` narrows each shard to only its family so both finish faster
+  # than a single sequential run.
+  #
+  # Each shard only runs when its kernel family was the sole thing modified
+  # (no other crates or Rust files touched). On workflow_dispatch both shards
+  # always run so a manual trigger can force a full bench.
+  #
+  # Note: matrix context is not available in job-level `if:`, so the two
+  # shards are spelled out as separate jobs.
+  bench-ffai:
+    name: Bench (ffai)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    needs: [compile, changes]
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        needs.changes.outputs.other == 'false' &&
+        needs.changes.outputs.ffai == 'true'
+      )
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5.0.0
+
+      - name: Download tile binary
+        uses: actions/download-artifact@v4
+        with:
+          name: tile-binary
+          path: target/ci
+
+      - name: Make tile executable
+        run: chmod +x target/ci/tile
+
+      - name: Add tile to PATH
+        run: echo "${GITHUB_WORKSPACE}/target/ci" >> "$GITHUB_PATH"
+
+      - name: Bench (ffai)
+        run: tile bench -vv --allow-dirty --match-group 'ffai' --json /tmp/bench-ffai.json
+
+      - name: Snapshot bench result (ffai)
         run: |
           tile snap \
-            --from /tmp/bench-${{ matrix.family }}.json \
-            -o /tmp/bench-snapshot-${{ matrix.family }}.json \
-            --note "CI shard=${{ matrix.family }} @ ${{ github.sha }} (${{ github.ref_name }})"
+            --from /tmp/bench-ffai.json \
+            -o /tmp/bench-snapshot-ffai.json \
+            --note "CI shard=ffai @ ${{ github.sha }} (${{ github.ref_name }})"
 
       - name: Upload bench shard
         uses: actions/upload-artifact@v4
         with:
-          name: bench-shard-${{ matrix.family }}
+          name: bench-shard-ffai
           path: |
-            /tmp/bench-${{ matrix.family }}.json
-            /tmp/bench-snapshot-${{ matrix.family }}.json
+            /tmp/bench-ffai.json
+            /tmp/bench-snapshot-ffai.json
+          if-no-files-found: error
+
+  bench-mlx:
+    name: Bench (mlx)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    needs: [compile, changes]
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        needs.changes.outputs.other == 'false' &&
+        needs.changes.outputs.mlx == 'true'
+      )
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5.0.0
+
+      - name: Download tile binary
+        uses: actions/download-artifact@v4
+        with:
+          name: tile-binary
+          path: target/ci
+
+      - name: Make tile executable
+        run: chmod +x target/ci/tile
+
+      - name: Add tile to PATH
+        run: echo "${GITHUB_WORKSPACE}/target/ci" >> "$GITHUB_PATH"
+
+      - name: Bench (mlx)
+        run: tile bench -vv --allow-dirty --match-group 'mlx' --json /tmp/bench-mlx.json
+
+      - name: Snapshot bench result (mlx)
+        run: |
+          tile snap \
+            --from /tmp/bench-mlx.json \
+            -o /tmp/bench-snapshot-mlx.json \
+            --note "CI shard=mlx @ ${{ github.sha }} (${{ github.ref_name }})"
+
+      - name: Upload bench shard
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-shard-mlx
+          path: |
+            /tmp/bench-mlx.json
+            /tmp/bench-snapshot-mlx.json
           if-no-files-found: error
 
   # ── Job 5: merge shards + diff comment ───────────────────────────────────────
@@ -239,9 +304,9 @@ jobs:
     name: Bench (merge + diff)
     runs-on: macos-latest
     timeout-minutes: 15
-    needs: [bench, changes]
+    needs: [bench-ffai, bench-mlx, changes]
     if: >-
-      needs.bench.result == 'success' &&
+      needs.bench-ffai.result == 'success' && needs.bench-mlx.result == 'success' &&
       (
         github.event_name == 'workflow_dispatch' ||
         (
