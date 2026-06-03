@@ -16,7 +16,10 @@ use metaltile_codegen::{CodegenBackend, CudaGenerator};
 use metaltile_core::{
     constexpr::ConstExpr,
     dtype::DType,
-    ir::{BinOpKind, ConstExprDecl, IndexExpr, Kernel, Op, Param, ParamKind, UnaryOpKind, ValueId},
+    ir::{
+        BinOpKind, ConstExprDecl, IndexExpr, Kernel, Op, Param, ParamKind, ReduceKind, UnaryOpKind,
+        ValueId,
+    },
     shape::Shape,
 };
 use metaltile_runtime::CudaDevice;
@@ -105,6 +108,71 @@ fn scale_add_exp_ir() -> Kernel {
         dst: "c".into(),
         indices: vec![IndexExpr::Value(idx)],
         value: e,
+        mask: None,
+    });
+    k
+}
+
+/// out[row] = sum(inp[row*n .. row*n+n]) — KernelMode::Reduction. Exercises
+/// the Phase-2 reduction path: StrideReduce (per-thread grid-stride accum) +
+/// Reduce (warp-shuffle + shared-mem tree).
+fn row_reduce_sum_ir() -> Kernel {
+    let mut k = Kernel::new("row_reduce_sum");
+    k.mode = metaltile_core::ir::KernelMode::Reduction;
+    k.params.push(Param {
+        name: "inp".into(),
+        dtype: DType::F32,
+        shape: Shape::scalar(),
+        is_output: false,
+        kind: ParamKind::Tensor,
+    });
+    k.params.push(Param {
+        name: "out".into(),
+        dtype: DType::F32,
+        shape: Shape::scalar(),
+        is_output: true,
+        kind: ParamKind::Tensor,
+    });
+    k.constexprs.push(ConstExprDecl {
+        name: ConstExpr::new("n"),
+        dtype: DType::U32,
+        value: None,
+    });
+    let row = ValueId::new(0);
+    let nval = ValueId::new(1);
+    let rs = ValueId::new(2);
+    let re = ValueId::new(3);
+    let acc = ValueId::new(4);
+    let res = ValueId::new(5);
+    k.body.push_op(Op::ProgramId { axis: 0 }, row);
+    k.body.name_value(row, "row");
+    k.body.push_op(Op::Load { src: "n".into(), indices: vec![], mask: None, other: None }, nval);
+    k.body.name_value(nval, "n");
+    k.body.push_op(Op::BinOp { op: BinOpKind::Mul, lhs: row, rhs: nval }, rs);
+    k.body.name_value(rs, "rs");
+    k.body.push_op(Op::BinOp { op: BinOpKind::Add, lhs: rs, rhs: nval }, re);
+    k.body.name_value(re, "re");
+    k.body.push_op(
+        Op::StrideReduce {
+            src: "inp".into(),
+            offset: rs,
+            stride: nval, // ignored by the CUDA emitter (uses lsize); any valid vid
+            end: re,
+            op: ReduceKind::Sum,
+            dtype: DType::F32,
+            transform: None,
+            secondary_src: None,
+            secondary_base: None,
+        },
+        acc,
+    );
+    k.body.name_value(acc, "acc");
+    k.body.push_op(Op::Reduce { value: acc, axis: 0, op: ReduceKind::Sum }, res);
+    k.body.name_value(res, "result");
+    k.body.push_op_no_result(Op::Store {
+        dst: "out".into(),
+        indices: vec![IndexExpr::Value(row)],
+        value: res,
         mask: None,
     });
     k
@@ -221,4 +289,50 @@ fn scale_add_exp_cuda_end_to_end() {
     // __expf is the fast-math intrinsic — allow a small abs tolerance.
     eprintln!("max|Δ| = {max_err:.3e} over {N} elements (scale_add_exp, __expf)");
     assert!(max_err <= 1e-3, "CUDA scale_add_exp mismatch: max|Δ|={max_err:.3e}");
+}
+
+#[test]
+fn row_reduce_sum_cuda_end_to_end() {
+    let Some(dev) = CudaDevice::create().expect("CUDA init") else {
+        eprintln!("no CUDA device — skipping CUDA smoke test");
+        return;
+    };
+
+    let src = CudaGenerator::new().generate(&row_reduce_sum_ir()).expect("cuda codegen");
+    eprintln!("--- generated CUDA ---\n{src}\n----------------------");
+    let module = dev.compile(&src, "row_reduce_sum.cu").expect("nvrtc compile");
+    let func = module.function("row_reduce_sum").expect("get function");
+
+    const ROWS: usize = 128;
+    const N: usize = 256;
+    let inp: Vec<f32> = (0..ROWS * N).map(|i| ((i % 17) as f32 - 8.0) * 0.01).collect();
+    let expected: Vec<f32> = (0..ROWS)
+        .map(|r| inp[r * N..(r + 1) * N].iter().sum::<f32>())
+        .collect();
+
+    let dinp = dev.upload(&f32s_to_bytes(&inp)).expect("upload inp");
+    let dout = dev.alloc(ROWS * 4).expect("alloc out");
+
+    let mut pin = dinp.device_ptr();
+    let mut pout = dout.device_ptr();
+    let mut n: u32 = N as u32;
+    // Arg order: inp, out, <constexpr n>. (Reduction mode → no _n_elems.)
+    let mut args: [*mut c_void; 3] = [
+        &mut pin as *mut _ as *mut c_void,
+        &mut pout as *mut _ as *mut c_void,
+        &mut n as *mut _ as *mut c_void,
+    ];
+    // One block per output row; 256 threads per block (8 warps).
+    dev.launch_1d(func, ROWS as u32, 256, &mut args).expect("launch");
+
+    let mut out_bytes = vec![0u8; ROWS * 4];
+    dev.download(&dout, &mut out_bytes).expect("download out");
+    let got = bytes_to_f32s(&out_bytes);
+
+    let mut max_err = 0.0f32;
+    for (g, e) in got.iter().zip(&expected) {
+        max_err = max_err.max((g - e).abs());
+    }
+    eprintln!("max|Δ| = {max_err:.3e} over {ROWS} rows (row_reduce_sum)");
+    assert!(max_err <= 1e-3, "CUDA row_reduce_sum mismatch: max|Δ|={max_err:.3e}");
 }

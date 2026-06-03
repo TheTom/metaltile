@@ -34,7 +34,10 @@ use std::fmt::Write as _;
 
 use metaltile_core::{
     dtype::DType,
-    ir::{BinOpKind, Block, IndexExpr, Kernel, KernelMode, Op, Param, ParamKind, UnaryOpKind, ValueId},
+    ir::{
+        BinOpKind, Block, IndexExpr, Kernel, KernelMode, Op, Param, ParamKind, ReduceKind,
+        UnaryOpKind, ValueId,
+    },
 };
 
 use crate::{
@@ -113,8 +116,12 @@ impl CudaGenerator {
             // Scalars are passed by value as kernel arguments.
             args.push(format!("    {} {}", cuda_type_name(ce.dtype), ce.name.name()));
         }
-        // Synthetic bounds param.
-        args.push(format!("    unsigned int {N_ELEMS_PARAM}"));
+        // Elementwise kernels carry a synthetic element-count for the bounds
+        // guard. Reduction kernels are bounded per-row by the strided loop's
+        // `end`, so they need no such param.
+        if kernel.mode == KernelMode::Elementwise {
+            args.push(format!("    unsigned int {N_ELEMS_PARAM}"));
+        }
         writeln!(out, "{}", args.join(",\n")).ok();
         writeln!(out, ") {{").ok();
         Ok(())
@@ -139,19 +146,23 @@ impl CudaGenerator {
 
     // ── Body ───────────────────────────────────────────────────────────
     fn emit_body(&self, kernel: &Kernel, out: &mut String) -> Result<()> {
-        if kernel.mode != KernelMode::Elementwise {
-            return Err(Error::UnsupportedOp(format!(
-                "cuda Phase 1: only KernelMode::Elementwise (got {:?})",
-                kernel.mode
-            )));
+        match kernel.mode {
+            KernelMode::Elementwise => {
+                // Global linear thread id + bounds guard.
+                writeln!(
+                    out,
+                    "    const unsigned int _gtid = blockIdx.x * blockDim.x + threadIdx.x;"
+                )
+                .ok();
+                writeln!(out, "    if (_gtid >= {N_ELEMS_PARAM}) return;").ok();
+            }
+            KernelMode::Reduction => self.emit_reduction_preamble(out),
+            other => {
+                return Err(Error::UnsupportedOp(format!(
+                    "cuda Phase 1/2: KernelMode {other:?} (only Elementwise + Reduction)"
+                )));
+            }
         }
-        // Global linear thread id + bounds guard.
-        writeln!(
-            out,
-            "    const unsigned int _gtid = blockIdx.x * blockDim.x + threadIdx.x;"
-        )
-        .ok();
-        writeln!(out, "    if (_gtid >= {N_ELEMS_PARAM}) return;").ok();
 
         let block = &kernel.body;
         for (i, op) in block.ops.iter().enumerate() {
@@ -162,21 +173,53 @@ impl CudaGenerator {
         Ok(())
     }
 
+    /// Reduction-mode preamble: maps Metal's threadgroup/simd built-ins to
+    /// CUDA. Block-per-output-row; warp = 32-lane (the lucky match). The
+    /// `n_simd == 0` guard mirrors the Metal freeze-hazard guard (harmless
+    /// on CUDA, kept for parity).
+    fn emit_reduction_preamble(&self, out: &mut String) {
+        let lw = self.profile.lane_width;
+        for line in [
+            "    const unsigned int tid       = threadIdx.x;".to_string(),
+            "    const unsigned int tgid_x    = blockIdx.x;".to_string(),
+            "    const unsigned int tgid_y    = blockIdx.y;".to_string(),
+            "    const unsigned int tgid_z    = blockIdx.z;".to_string(),
+            "    const unsigned int lsize     = blockDim.x;".to_string(),
+            format!("    const unsigned int n_simd    = lsize / {lw}u;"),
+            "    if (n_simd == 0u) return;".to_string(),
+            format!("    const unsigned int simd_lane  = threadIdx.x % {lw}u;"),
+            format!("    const unsigned int simd_group = threadIdx.x / {lw}u;"),
+        ] {
+            writeln!(out, "{line}").ok();
+        }
+    }
+
     fn emit_op(
         &self,
         op: &Op,
         vid: Option<ValueId>,
         block: &Block,
-        _kernel: &Kernel,
+        kernel: &Kernel,
         out: &mut String,
     ) -> Result<()> {
         let pad = "    ";
         match op {
             Op::ProgramId { axis } => {
                 let v = self.vname(vid, block);
-                match axis {
-                    0 => writeln!(out, "{pad}unsigned int {v} = _gtid;").ok(),
-                    _ => writeln!(out, "{pad}unsigned int {v} = 0;").ok(),
+                match kernel.mode {
+                    // Elementwise: the single linear thread id.
+                    KernelMode::Elementwise => {
+                        writeln!(out, "{pad}unsigned int {v} = _gtid;").ok();
+                    }
+                    // Reduction: which output row this block owns.
+                    _ => {
+                        let src = match axis {
+                            0 => "tgid_x",
+                            1 => "tgid_y",
+                            _ => "tgid_z",
+                        };
+                        writeln!(out, "{pad}unsigned int {v} = {src};").ok();
+                    }
                 };
             }
             Op::Const { value } => {
@@ -226,6 +269,44 @@ impl CudaGenerator {
                 // CUDA C-style cast; source type comes from `auto` inference.
                 writeln!(out, "{pad}{ty} {v} = ({ty})({rv});").ok();
             }
+            // Per-thread grid-stride accumulation over a row (Phase 2).
+            // Each thread sums src[offset+tid], src[offset+tid+lsize], …
+            // Correctness-first: the 4-wide vectorized form the MSL path uses
+            // is a Phase-3 perf retune (SCOPE §6).
+            Op::StrideReduce {
+                src, offset, end, op: rk, transform, secondary_src, ..
+            } => {
+                if transform.as_ref().is_some_and(|t| !t.is_empty()) || secondary_src.is_some() {
+                    return Err(Error::UnsupportedOp(
+                        "cuda Phase 2: StrideReduce transform/secondary_src (rms/gemv → Phase 3)"
+                            .into(),
+                    ));
+                }
+                let v = self.vname(vid, block);
+                let off = self.vname(Some(*offset), block);
+                let en = self.vname(Some(*end), block);
+                writeln!(out, "{pad}float {v} = {};", reduce_init(*rk)).ok();
+                writeln!(
+                    out,
+                    "{pad}for (unsigned int _i = {off} + tid; _i < {en}; _i += lsize) {{"
+                )
+                .ok();
+                writeln!(out, "{pad}    float _e = (float)({src}[_i]);").ok();
+                writeln!(out, "{pad}    {v} = {};", reduce_combine(*rk, &v, "_e")).ok();
+                writeln!(out, "{pad}}}").ok();
+            }
+            // Threadgroup-scope reduction: warp shuffle + shared-mem tree
+            // (the CUDA analog of msl::reduce two-level simd_sum). Phase 2.
+            Op::Reduce { value, axis, op: rk } => {
+                if *axis != 0 {
+                    return Err(Error::UnsupportedOp(
+                        "cuda Phase 2: Reduce axis != 0 (Phase 3)".into(),
+                    ));
+                }
+                let v = self.vname(vid, block);
+                let input = self.vname(Some(*value), block);
+                self.emit_reduce_tree(&v, &input, *rk, out);
+            }
             other => {
                 return Err(Error::UnsupportedOp(format!(
                     "cuda Phase 1: op {} not supported yet",
@@ -234,6 +315,48 @@ impl CudaGenerator {
             }
         }
         Ok(())
+    }
+
+    /// Two-level threadgroup reduction: warp shuffle (`__shfl_down_sync`)
+    /// then a `__shared__` tree across warps — the CUDA analog of
+    /// `msl::reduce`'s `simd_sum` + threadgroup-memory path. Lane width 32
+    /// matches Metal's simdgroup (the lucky structural match). Assumes
+    /// `blockDim.x` is a multiple of 32 (Phase-2 constraint; partial-warp
+    /// masking is a Phase-3 refinement).
+    fn emit_reduce_tree(&self, result: &str, input: &str, kind: ReduceKind, out: &mut String) {
+        let pad = "    ";
+        let lw = self.profile.lane_width;
+        let half = lw / 2;
+        let init = reduce_init(kind);
+        let buf = format!("{result}_sg");
+        writeln!(out, "{pad}__shared__ float {buf}[32];").ok();
+        writeln!(out, "{pad}float {result};").ok();
+        writeln!(out, "{pad}{{").ok();
+        // Phase 1: intra-warp reduction.
+        writeln!(out, "{pad}    float _sv = (float)({input});").ok();
+        writeln!(out, "{pad}    for (int _o = {half}; _o > 0; _o >>= 1) {{").ok();
+        writeln!(out, "{pad}        float _ov = __shfl_down_sync(0xffffffffu, _sv, _o);").ok();
+        writeln!(out, "{pad}        _sv = {};", reduce_combine(kind, "_sv", "_ov")).ok();
+        writeln!(out, "{pad}    }}").ok();
+        // Phase 2: lane 0 of each warp publishes its total.
+        writeln!(out, "{pad}    if (simd_lane == 0u) {buf}[simd_group] = _sv;").ok();
+        writeln!(out, "{pad}    __syncthreads();").ok();
+        // Phase 3: warp 0 reduces the per-warp totals and broadcasts via [0].
+        writeln!(out, "{pad}    if (simd_group == 0u) {{").ok();
+        writeln!(out, "{pad}        float _wv = simd_lane < n_simd ? {buf}[simd_lane] : {init};").ok();
+        writeln!(out, "{pad}        for (int _o = {half}; _o > 0; _o >>= 1) {{").ok();
+        writeln!(out, "{pad}            float _ov = __shfl_down_sync(0xffffffffu, _wv, _o);").ok();
+        writeln!(out, "{pad}            _wv = {};", reduce_combine(kind, "_wv", "_ov")).ok();
+        writeln!(out, "{pad}        }}").ok();
+        writeln!(out, "{pad}        if (simd_lane == 0u) {buf}[0] = _wv;").ok();
+        writeln!(out, "{pad}    }}").ok();
+        writeln!(out, "{pad}    __syncthreads();").ok();
+        if kind == ReduceKind::Mean {
+            writeln!(out, "{pad}    {result} = {buf}[0] / (float)lsize;").ok();
+        } else {
+            writeln!(out, "{pad}    {result} = {buf}[0];").ok();
+        }
+        writeln!(out, "{pad}}}").ok();
     }
 
     fn cuda_unary(&self, op: UnaryOpKind, arg: &str) -> String {
@@ -319,6 +442,26 @@ fn cuda_binop(op: BinOpKind, l: &str, r: &str) -> String {
     }
 }
 
+/// Identity / initial accumulator value for a reduction kind.
+fn reduce_init(kind: ReduceKind) -> &'static str {
+    match kind {
+        ReduceKind::Sum | ReduceKind::Mean => "0.0f",
+        ReduceKind::Max => "-INFINITY",
+        ReduceKind::Min => "INFINITY",
+        ReduceKind::Product => "1.0f",
+    }
+}
+
+/// Binary combine for a reduction kind: `combine(a, b)` as a CUDA expr.
+fn reduce_combine(kind: ReduceKind, a: &str, b: &str) -> String {
+    match kind {
+        ReduceKind::Sum | ReduceKind::Mean => format!("{a} + {b}"),
+        ReduceKind::Max => format!("fmaxf({a}, {b})"),
+        ReduceKind::Min => format!("fminf({a}, {b})"),
+        ReduceKind::Product => format!("{a} * {b}"),
+    }
+}
+
 fn op_name(op: &Op) -> &'static str {
     match op {
         Op::Reduce { .. } => "Reduce",
@@ -398,10 +541,75 @@ mod tests {
         assert!(src.contains("c[v_idx] = v_sum;"));
     }
 
-    #[test]
-    fn rejects_non_elementwise() {
-        let mut k = vector_add_ir();
+    fn row_reduce_ir() -> Kernel {
+        // out[row] = sum(inp[row*n .. row*n+n]) — Reduction mode.
+        let mut k = Kernel::new("row_reduce_sum");
         k.mode = KernelMode::Reduction;
+        k.params.push(Param {
+            name: "inp".into(), dtype: DType::F32, shape: Shape::scalar(),
+            is_output: false, kind: ParamKind::Tensor,
+        });
+        k.params.push(Param {
+            name: "out".into(), dtype: DType::F32, shape: Shape::scalar(),
+            is_output: true, kind: ParamKind::Tensor,
+        });
+        k.constexprs.push(metaltile_core::ir::ConstExprDecl {
+            name: metaltile_core::constexpr::ConstExpr::new("n"),
+            dtype: DType::U32,
+            value: None,
+        });
+        let (row, nv, rs, re, acc, res) = (
+            ValueId::new(0), ValueId::new(1), ValueId::new(2),
+            ValueId::new(3), ValueId::new(4), ValueId::new(5),
+        );
+        k.body.push_op(Op::ProgramId { axis: 0 }, row);
+        k.body.name_value(row, "row");
+        k.body.push_op(Op::Load { src: "n".into(), indices: vec![], mask: None, other: None }, nv);
+        k.body.push_op(Op::BinOp { op: BinOpKind::Mul, lhs: row, rhs: nv }, rs);
+        k.body.name_value(rs, "rs");
+        k.body.push_op(Op::BinOp { op: BinOpKind::Add, lhs: rs, rhs: nv }, re);
+        k.body.name_value(re, "re");
+        k.body.push_op(
+            Op::StrideReduce {
+                src: "inp".into(), offset: rs, stride: nv, end: re,
+                op: ReduceKind::Sum, dtype: DType::F32,
+                transform: None, secondary_src: None, secondary_base: None,
+            },
+            acc,
+        );
+        k.body.name_value(acc, "acc");
+        k.body.push_op(Op::Reduce { value: acc, axis: 0, op: ReduceKind::Sum }, res);
+        k.body.name_value(res, "result");
+        k.body.push_op_no_result(Op::Store {
+            dst: "out".into(), indices: vec![IndexExpr::Value(row)], value: res, mask: None,
+        });
+        k
+    }
+
+    #[test]
+    fn emits_row_reduce_cuda() {
+        let src = CudaGenerator::new().generate(&row_reduce_ir()).unwrap();
+        // Reduction signature: no synthetic _n_elems param.
+        assert!(src.contains("extern \"C\" __global__ void row_reduce_sum("));
+        assert!(src.contains("unsigned int n"));
+        assert!(!src.contains(N_ELEMS_PARAM));
+        // Reduction preamble (block-per-row, warp = 32 lanes).
+        assert!(src.contains("const unsigned int tgid_x    = blockIdx.x;"));
+        assert!(src.contains("const unsigned int n_simd    = lsize / 32u;"));
+        assert!(src.contains("const unsigned int simd_lane  = threadIdx.x % 32u;"));
+        // Per-thread grid-stride accumulation.
+        assert!(src.contains("for (unsigned int _i = v_rs + tid; _i < v_re; _i += lsize)"));
+        // Two-level tree: warp shuffle + shared mem + barriers.
+        assert!(src.contains("__shfl_down_sync(0xffffffffu"));
+        assert!(src.contains("__shared__ float v_result_sg[32];"));
+        assert!(src.contains("__syncthreads();"));
+        assert!(src.contains("out[v_row] = v_result;"));
+    }
+
+    #[test]
+    fn rejects_unsupported_mode() {
+        let mut k = vector_add_ir();
+        k.mode = KernelMode::Tile2D;
         assert!(CudaGenerator::new().generate(&k).is_err());
     }
 
