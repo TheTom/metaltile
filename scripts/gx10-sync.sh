@@ -9,4 +9,8 @@ ssh "$HOST" "mkdir -p $REMOTE"
 rsync -az --delete \
   --exclude target/ --exclude .git/ --exclude '*.app' --exclude .cache/ \
   "$LOCAL" "$HOST:$REMOTE/"
-ssh "$HOST" "bash -lc 'export PATH=/usr/local/cuda/bin:\$PATH; cd $REMOTE && cargo ${*:-build}'"
+ssh "$HOST" "bash -lc '\
+  export CUDA_PATH=/usr/local/cuda; \
+  export PATH=/usr/local/cuda/bin:\$PATH; \
+  export LD_LIBRARY_PATH=/usr/local/cuda/lib64:\$LD_LIBRARY_PATH; \
+  cd $REMOTE && cargo ${*:-build}'"

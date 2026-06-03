@@ -196,8 +196,18 @@ impl CodegenBackend for crate::msl::MslGenerator {
 
 #[cfg(test)]
 mod tests {
+    use metaltile_core::ir::KernelMode;
+
     use super::*;
-    use crate::msl::MslGenerator;
+
+    #[test]
+    fn msl_generator_impls_codegen_backend_as_metal() {
+        // The Metal generator is the `Metal` CodegenBackend impl.
+        let g = crate::generator_for_mode(KernelMode::Elementwise, None);
+        let backend: &dyn CodegenBackend = &g;
+        assert_eq!(backend.target(), Target::Metal);
+        assert_eq!(backend.profile().shared_mem_kw, "threadgroup");
+    }
 
     #[test]
     fn lane_widths_match_the_lucky_32() {

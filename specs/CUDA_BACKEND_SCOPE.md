@@ -18,7 +18,8 @@ not just theoretical. NOTE: Spark not yet in `~/.ssh/config`/hosts on this Mac �
 - [x] **GX10 wired** (§5) — ssh alias, CUDA 13.0/sm_121 confirmed, remote build loop, full workspace green on aarch64.
 - [x] **Cooperative-kernel inventory** — **~52 files** in `metaltile-std` use `mpp::`/`coop_tile_`/`simdgroup`/`nax` (mlx/steel/ffai). Sizes Phase 5; most are quant/tile variants of a few primitives (simdgroup-MMA, MPP, NAX, coop_tile).
 - [x] **Op surface mapped** — `Op` has ~65 emit arms (`emit_block.rs`). Categorized: ~45 pure arith/mem/control (port mechanically), ~13 simd/reduce (warp-shuffle, lucky 32-match), ~10 cooperative MMA (Phase 3 re-tile), 1 `InlineMsl` (Phase 5). Decode intrinsics live in `UnaryOpKind` → pure arithmetic, port verbatim.
-- [x] **Phase 0 seam landed** — `codegen/src/backend.rs` (`Target`, `CodegenBackend` trait, `TargetProfile` encoding §4.2 as data + the metal/cuda intrinsic maps), `cuda/mod.rs` (`CudaGenerator` stub), `MslGenerator` impls the trait. Non-breaking; Metal unchanged; **187 codegen tests green on GX10**.
+- [x] **Phase 0 seam landed** — `codegen/src/backend.rs` (`Target`, `CodegenBackend` trait, `TargetProfile` encoding §4.2 as data + the metal/cuda intrinsic maps), `cuda/mod.rs` (`CudaGenerator` stub), `MslGenerator` impls the trait. Non-breaking; Metal unchanged.
+- [x] **Phase 1 — smoke kernel GREEN end-to-end on GX10 (sm_121).** `vector_add` (f32): IR → `CudaGenerator` (CUDA C++ op-walker for the elementwise subset) → NVRTC → module → `cuLaunchKernel` → readback → CPU oracle, **max|Δ| = 0.0 (bit-exact)**. Codegen: `cuda/mod.rs` op-walker (ProgramId/Const/Load/Store/BinOp/UnaryOp/Cast/Fma, dtype→CUDA types, binop/intrinsic maps). Runtime: `runtime/src/device/cuda/{mod,ffi}.rs` — `CudaDevice` (hand-rolled `libcuda`+`libnvrtc` FFI: ctx, NVRTC compile w/ `--gpu-architecture=compute_121` + `--include-path`, alloc/upload/launch/download), `cuda` cargo feature + `build.rs` link config, integration test `tests/cuda_smoke.rs`. **macOS Metal build unaffected (cuda off by default, no warnings); 172+17 codegen tests still green.**
 
 **Strategy decided (was §6 open q):** `emit.rs` is file/manifest/Swift-wrapper/metallib glue — the real op-walker is `msl/mod.rs::emit_kernel` + `emit_block.rs` (61 KB). Do **not** fork it up front. Stand up a minimal CUDA op-walker for the Phase-1 subset, grow per phase, extract a shared walker only once both emitters exist and the common shape is empirical. Premature extraction = wrong abstraction over a hot path.
 
@@ -105,8 +106,8 @@ CPU-oracle harness (backend-agnostic).
 
 | # | Phase | New/changed files | Exit criteria |
 |---|---|---|---|
-| 0 | **Seam refactor** | `codegen/src/backend.rs`, `runtime/src/device/mod.rs` trait, `Context` generic | Metal still green via trait; no CUDA yet. No behavior change. |
-| 1 | **Smoke kernel** | `codegen/src/cuda/{mod,preamble}.rs`, `runtime/src/device/cuda_device.rs`, NVRTC compile+launch | one `copy`/`binary` `#[test_kernel]` green on `--target cuda` on Spark |
+| 0 | **Seam refactor** ✅ | `codegen/src/backend.rs`, trait + `TargetProfile` | DONE — Metal green via trait; non-breaking. |
+| 1 | **Smoke kernel** ✅ | `codegen/src/cuda/mod.rs` walker, `runtime/src/device/cuda/{mod,ffi}.rs`, `build.rs`, `tests/cuda_smoke.rs` | DONE — `vector_add` f32 bit-exact on GX10 sm_121 via NVRTC compile+launch. (Standalone test, not yet `--target` in the `#[test_kernel]` harness — that's Phase 6.) |
 | 2 | **Elementwise + reduction** | cuda emitter: `Grid3D`, `Reduction` (warp-shuffle `__shfl_down_sync` + shared-mem tree) | dequant, qgemv, rms-norm, gather, conv-direct, flash-scalar green |
 | 3 | **MMA (software-dequant block-scaled)** | cuda `matmul.rs` analog: `wmma`/`mma.sync` 16×16×16 re-tiling | qmm-MMA, patch-embed-MMA, conv-MMA green; correctness before perf |
 | 4 | **Blackwell scaled-MMA** | `tcgen05` path, `MmaStrategy::Tcgen05`, gated `cc>=sm_100` | mx*/mxint* hardware path matches software oracle **bit-for-bit on Spark** |
