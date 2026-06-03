@@ -63,10 +63,11 @@ headers, barrier-scope, atomics ordering).
 ## 0b. Status snapshot (latest)
 
 **CUDA backend runs the real registered `#[test_kernel]` corpus on GX10 (sm_121):
-`PASS=3591, MISMATCH=0, ERROR=0`** (~**86%** of the full corpus) — bit-accurate
+`PASS=3699, MISMATCH=0, ERROR=0`** (~**89%** of the full corpus) — bit-accurate
 against the same CPU oracle the Metal harness uses (`tests/cuda_kernel_corpus.rs`).
-Now includes the **simdgroup_matrix MMA path** (software emulation w/ Apple's exact
-8×8 lane layout — 464 cooperative-matrix kernels bit-accurate). Covered:
+Now includes **BOTH cooperative-matmul paths**: `simdgroup_matrix` (software, Apple's
+exact 8×8 lane layout) AND `CoopTile` (`mpp::matmul2d` software GEMM + dynamic
+shared memory) — most quantized qmm/gather/moe/conv MMA kernels bit-accurate. Covered:
 - Modes: Elementwise, Reduction, Grid3D
 - Ops: const/binop/unary/cast/fma/select; load/store/gather/scatter; program-id;
   reduce + stride-reduce (incl. **transform chain + secondary_src = gemv/qgemv**);
@@ -77,14 +78,15 @@ Now includes the **simdgroup_matrix MMA path** (software emulation w/ Apple's ex
 - Runtime: `CudaDevice` (NVRTC + Driver API), generic `run_kernel` dispatch,
   `cuda` feature, `build.rs`.
 
-**Remaining ~516 unsupported = the `CoopTile*` MPP/NAX cooperative-tensor path**
-(`mpp::tensor_ops::matmul2d` / `metal::tensor` — Metal-4 hardware tensor API, 31
-distinct kernels × formats). No CUDA analog → spec **Phase 5 (CUTLASS-equivalent
-reimplementation)**, the genuinely hard remainder. Tiny tail: SimdScan (6),
-Strided params (3). `KNOWN_HARD=57` (documented: mhc-sinkhorn SSA-shadow, col/seg-
-reduce axis, hadamard warp-xor-mask, nax, fishspeech conv1d, sdpa-prefill-mma
-48KB-shared-cap). The `Simdgroup*`-matrix path (was here) is now **done** via
-software emulation; CoopTile is a separate, higher abstraction.
+**Remaining ~465 not-passing:** `KNOWN_HARD=456` (generate+run but need bespoke
+semantics) — dominated by the **`_nax` Metal-4 neural-accelerator** cooperative
+ops (a distinct tensor path, not `mpp::matmul2d`) + specific **MPP block-tiled**
+qmm variants (`qmm_mma_mpp`, `*_bm8/bm16_mpp` — while plain/`bm64` qmm pass);
+plus the earlier small set (mhc-sinkhorn SSA-shadow, col/seg-reduce axis, hadamard
+warp-xor-mask). Plus `UNSUPPORTED=9` (SimdScan 6, Strided params 3). Both
+cooperative-matmul subsystems (`Simdgroup*`-matrix AND `CoopTile` mpp::matmul2d)
+are **implemented + bit-accurate** for the standard paths; NAX is the last
+genuinely-distinct hardware op needing its own lowering.
 
 ---
 
