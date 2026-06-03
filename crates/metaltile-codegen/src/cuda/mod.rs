@@ -35,7 +35,7 @@ use std::fmt::Write as _;
 use metaltile_core::{
     dtype::DType,
     ir::{
-        BinOpKind, Block, IndexExpr, Kernel, KernelMode, Op, Param, ParamKind, ReduceKind,
+        ActKind, BinOpKind, Block, IndexExpr, Kernel, KernelMode, Op, Param, ParamKind, ReduceKind,
         UnaryOpKind, ValueId,
     },
 };
@@ -87,6 +87,17 @@ __device__ __forceinline__ float mt_decode_e5m2(unsigned int bits) {
 // Symmetric int8: reinterpret the byte as i8 (sign-extend low 8 bits).
 __device__ __forceinline__ float mt_decode_int8(unsigned int bits) {
     return (float)((int)(bits << 24u) >> 24);
+}
+
+// Neural activations (ported from msl/preamble.rs).
+__device__ __forceinline__ float mt_silu(float x) { return x / (1.0f + __expf(-x)); }
+__device__ __forceinline__ float mt_relu(float x) { return fmaxf(0.0f, x); }
+__device__ __forceinline__ float mt_sigmoid(float x) { return 1.0f / (1.0f + __expf(-x)); }
+__device__ __forceinline__ float mt_gelu(float x) {
+    const float k = 0.7978845608f;
+    float arg = k * (x + 0.044715f * x*x*x);
+    arg = fminf(fmaxf(arg, -15.0f), 15.0f);
+    return 0.5f * x * (1.0f + tanhf(arg));
 }
 
 "#;
@@ -327,6 +338,48 @@ impl CudaGenerator {
                 let a = self.vname(Some(*on_true), block);
                 let b = self.vname(Some(*on_false), block);
                 writeln!(out, "{pad}auto {v} = ({c}) ? ({a}) : ({b});").ok();
+            }
+            Op::Activation { kind, value } => {
+                let v = self.vname(vid, block);
+                let rv = self.vname(Some(*value), block);
+                let expr = match kind {
+                    ActKind::Silu => format!("mt_silu((float)({rv}))"),
+                    ActKind::Gelu => format!("mt_gelu((float)({rv}))"),
+                    ActKind::Relu => format!("mt_relu((float)({rv}))"),
+                    ActKind::Sigmoid => format!("mt_sigmoid((float)({rv}))"),
+                    ActKind::Tanh => format!("tanhf((float)({rv}))"),
+                };
+                writeln!(out, "{pad}auto {v} = {expr};").ok();
+            }
+            // Single-warp SIMD reduction → xor butterfly so ALL lanes get
+            // the result (matches Metal `simd_*` broadcast semantics).
+            Op::SimdReduce { value, op: rk } => {
+                let v = self.vname(vid, block);
+                let rv = self.vname(Some(*value), block);
+                let half = self.profile.lane_width / 2;
+                writeln!(out, "{pad}float {v};").ok();
+                writeln!(out, "{pad}{{").ok();
+                writeln!(out, "{pad}    float _s = (float)({rv});").ok();
+                writeln!(out, "{pad}    for (int _o = {half}; _o > 0; _o >>= 1) {{").ok();
+                writeln!(out, "{pad}        float _x = __shfl_xor_sync(0xffffffffu, _s, _o);").ok();
+                writeln!(out, "{pad}        _s = {};", reduce_combine(*rk, "_s", "_x")).ok();
+                writeln!(out, "{pad}    }}").ok();
+                if *rk == ReduceKind::Mean {
+                    writeln!(out, "{pad}    {v} = _s / {}.0f;", self.profile.lane_width).ok();
+                } else {
+                    writeln!(out, "{pad}    {v} = _s;").ok();
+                }
+                writeln!(out, "{pad}}}").ok();
+            }
+            // Scalar (rank-0) splat / zeros. Tile (array) shapes need the
+            // threadgroup/stack allocation path (cooperative kernels, P3+).
+            Op::Zeros { shape, .. } if shape.rank() == 0 => {
+                let v = self.vname(vid, block);
+                writeln!(out, "{pad}float {v} = 0.0f;").ok();
+            }
+            Op::Splat { value, shape, .. } if shape.rank() == 0 => {
+                let v = self.vname(vid, block);
+                writeln!(out, "{pad}float {v} = {value}f;").ok();
             }
             // Per-thread grid-stride accumulation over a row (Phase 2).
             // Each thread sums src[offset+tid], src[offset+tid+lsize], …
