@@ -57,6 +57,14 @@ const KNOWN_HARD: &[(&str, &str)] = &[
     ("hadamard_m", "Hadamard transform: warp-shuffle xor pattern mismatch (active-mask / partial-warp semantics)"),
     ("gated_delta_prep_chunk", "GDN chunk prep: subtle simd/shared accumulation mismatch under investigation"),
     ("sdpa_prefill_mma", "many simdgroup-matrix tiles exceed GB10's 48KB static-shared cap → PTX JIT load fails; needs dynamic-smem opt-in (cuFuncSetAttribute) — follow-up"),
+    // CoopTile NAX (Metal-4 neural-accelerator) cooperative ops: a distinct
+    // hardware tensor path, not the mpp::matmul2d our emulation replicates.
+    ("_nax", "NAX (Metal-4 neural-accelerator) cooperative op — distinct from mpp::matmul2d; needs its own lowering (Phase 5)"),
+    // Specific MPP-blocked qmm variants mismatch while the plain qmm_mma and
+    // bm64 MPP path pass — a block-tiling-specific CoopTile detail.
+    ("qmm_mma_mpp", "MPP-blocked qmm: block-tiling-specific cooperative layout differs from the bm64/plain path (Phase 5)"),
+    ("_bm8_mpp", "MPP bm8 block tiling — cooperative layout detail (Phase 5)"),
+    ("_bm16_mpp", "MPP bm16 block tiling — cooperative layout detail (Phase 5)"),
 ];
 
 fn known_hard(name: &str) -> bool {
