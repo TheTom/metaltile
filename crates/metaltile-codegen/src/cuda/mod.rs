@@ -36,8 +36,8 @@ use std::fmt::Write as _;
 use metaltile_core::{
     dtype::DType,
     ir::{
-        ActKind, BinOpKind, Block, IndexExpr, Kernel, KernelMode, Op, Param, ParamKind, ReduceKind,
-        UnaryOpKind, ValueId,
+        ActKind, AtomicKind, BinOpKind, Block, IndexExpr, Kernel, KernelMode, Op, Param, ParamKind,
+        ReduceKind, UnaryOpKind, ValueId,
     },
 };
 
@@ -247,9 +247,30 @@ impl CudaGenerator {
             }
         }
 
+        // Hoist threadgroup/stack array declarations to function scope so
+        // they're visible across nested Loop/If blocks (mirrors MSL hoists).
+        self.emit_allocs(kernel, out);
         self.emit_ops(&kernel.body, kernel, &Names::new(), out)?;
         writeln!(out, "}}").ok();
         Ok(())
+    }
+
+    /// Emit `__shared__` (ThreadgroupAlloc) and per-thread array (StackAlloc)
+    /// declarations from every block, at function scope.
+    fn emit_allocs(&self, kernel: &Kernel, out: &mut String) {
+        for blk in std::iter::once(&kernel.body).chain(kernel.blocks.values()) {
+            for op in &blk.ops {
+                match op {
+                    Op::ThreadgroupAlloc { dtype, size, name } => {
+                        writeln!(out, "    __shared__ {} {name}[{size}];", cuda_type_name(*dtype)).ok();
+                    }
+                    Op::StackAlloc { dtype, size, name } => {
+                        writeln!(out, "    {} {name}[{size}];", cuda_type_name(*dtype)).ok();
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     /// Walk a block's ops, emitting each. `ov` carries name overrides from
@@ -478,6 +499,58 @@ impl CudaGenerator {
                 let v = self.vname(vid, block, ov);
                 let input = self.vname(Some(*value), block, ov);
                 self.emit_reduce_tree(&v, &input, *rk, out);
+            }
+            // ── Threadgroup / warp primitives (non-MMA) ────────────────
+            // Allocs are hoisted by emit_allocs; the ops themselves are no-ops.
+            Op::ThreadgroupAlloc { .. } | Op::StackAlloc { .. } => {}
+            Op::ThreadgroupLoad { name, index } | Op::StackLoad { name, index } => {
+                let v = self.vname(vid, block, ov);
+                let iv = self.vname(Some(*index), block, ov);
+                writeln!(out, "{pad}auto {v} = {name}[{iv}];").ok();
+            }
+            Op::ThreadgroupStore { name, index, value }
+            | Op::StackStore { name, index, value } => {
+                let iv = self.vname(Some(*index), block, ov);
+                let rv = self.vname(Some(*value), block, ov);
+                writeln!(out, "{pad}{name}[{iv}] = {rv};").ok();
+            }
+            Op::SimdLaneId => {
+                let v = self.vname(vid, block, ov);
+                writeln!(out, "{pad}unsigned int {v} = simd_lane;").ok();
+            }
+            Op::SimdGroupId => {
+                let v = self.vname(vid, block, ov);
+                writeln!(out, "{pad}unsigned int {v} = simd_group;").ok();
+            }
+            Op::SimdBroadcast { value, lane } => {
+                let v = self.vname(vid, block, ov);
+                let rv = self.vname(Some(*value), block, ov);
+                let rl = self.vname(Some(*lane), block, ov);
+                writeln!(out, "{pad}auto {v} = __shfl_sync(0xffffffffu, {rv}, {rl});").ok();
+            }
+            Op::SimdShuffleXor { value, mask } => {
+                let v = self.vname(vid, block, ov);
+                let rv = self.vname(Some(*value), block, ov);
+                writeln!(out, "{pad}auto {v} = __shfl_xor_sync(0xffffffffu, {rv}, {mask}u);").ok();
+            }
+            Op::Barrier => {
+                writeln!(out, "{pad}__syncthreads();").ok();
+            }
+            Op::Atomic { op: ak, dst, index, value, .. } => {
+                let iv = self.vname(Some(*index), block, ov);
+                let rv = self.vname(Some(*value), block, ov);
+                let f = match ak {
+                    AtomicKind::Add => "atomicAdd",
+                    AtomicKind::Max => "atomicMax",
+                    AtomicKind::Min => "atomicMin",
+                    AtomicKind::And => "atomicAnd",
+                    AtomicKind::Or => "atomicOr",
+                    AtomicKind::Xor => "atomicXor",
+                };
+                writeln!(out, "{pad}{f}(&{dst}[{iv}], {rv});").ok();
+            }
+            Op::SimdgroupBarrier => {
+                writeln!(out, "{pad}__syncwarp();").ok();
             }
             // ── Control flow (nested-block recursion) ──────────────────
             Op::Loop { var, start, end, step, body } => {
