@@ -54,7 +54,6 @@ const KNOWN_HARD: &[(&str, &str)] = &[
     ("fishspeech_conv1d", "fp8 conv1d: subtle decode/accumulate mismatch under investigation"),
     ("hadamard_m", "Hadamard transform: warp-shuffle xor pattern mismatch (active-mask / partial-warp semantics)"),
     ("gated_delta_prep_chunk", "GDN chunk prep: subtle simd/shared accumulation mismatch under investigation"),
-    ("sdpa_prefill_mma", "many simdgroup-matrix tiles exceed GB10's 48KB static-shared cap → PTX JIT load fails; needs dynamic-smem opt-in (cuFuncSetAttribute) — follow-up"),
     // CoopTile NAX (Metal-4 neural-accelerator) cooperative ops: a distinct
     // hardware tensor path, not the mpp::matmul2d our emulation replicates.
     ("_nax", "NAX (Metal-4 neural-accelerator) cooperative op — distinct from mpp::matmul2d; needs its own lowering (Phase 5)"),
