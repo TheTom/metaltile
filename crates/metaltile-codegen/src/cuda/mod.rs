@@ -588,10 +588,21 @@ impl CodegenBackend for CudaGenerator {
     fn profile(&self) -> &TargetProfile { &self.profile }
 
     fn generate(&self, kernel: &Kernel) -> Result<String> {
+        // Resolve cross-kernel calls (Op::KernelCall) via the backend-neutral
+        // inline pass. Non-call kernels are unaffected; on failure we fall
+        // back to the raw IR.
+        let mut inlined = kernel.clone();
+        let k: &Kernel = match crate::passes::run_passes(
+            &mut inlined,
+            &[Box::new(crate::passes::kernel_inline::KernelInlinePass)],
+        ) {
+            Ok(()) => &inlined,
+            Err(_) => kernel,
+        };
         let mut out = String::new();
         out.push_str(CUDA_PREAMBLE);
-        self.emit_signature(kernel, &mut out)?;
-        self.emit_body(kernel, &mut out)?;
+        self.emit_signature(k, &mut out)?;
+        self.emit_body(k, &mut out)?;
         Ok(out)
     }
 }
