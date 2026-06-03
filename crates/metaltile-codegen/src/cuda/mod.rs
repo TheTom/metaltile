@@ -30,6 +30,7 @@
 //! - A trailing `unsigned int _n_elems` param + an `if (gtid >= _n_elems)
 //!   return;` guard replace Metal's non-uniform-threadgroup bounds model.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use metaltile_core::{
@@ -107,6 +108,10 @@ __device__ __forceinline__ float mt_gelu(float x) {
 /// param names.
 pub const N_ELEMS_PARAM: &str = "_n_elems";
 
+/// SSA value-name override map (loop vars + parent-block names) threaded
+/// into nested Loop/If body emission. See `CudaGenerator::vname`.
+type Names = BTreeMap<ValueId, String>;
+
 /// CUDA C++ generator. Mirror of `msl::MslGenerator` for the NVIDIA target.
 #[derive(Debug, Clone)]
 pub struct CudaGenerator {
@@ -130,21 +135,30 @@ impl CudaGenerator {
     }
 
     // ── SSA value naming (mirrors msl helpers::vname) ──────────────────
-    fn vname(&self, vid: Option<ValueId>, block: &Block) -> String {
+    // `ov` is the name-override map: loop-induction vars and parent-block
+    // SSA names introduced when recursing into nested Loop/If bodies. It is
+    // consulted before the block's own name hints (matches MSL's
+    // `extra_names`).
+    fn vname(&self, vid: Option<ValueId>, block: &Block, ov: &Names) -> String {
         match vid {
-            Some(v) => match block.names.get(&v) {
-                Some(hint) => format!("v_{hint}"),
-                None => format!("v{}", v.as_u32()),
-            },
+            Some(v) => {
+                if let Some(n) = ov.get(&v) {
+                    return n.clone();
+                }
+                match block.names.get(&v) {
+                    Some(hint) => format!("v_{hint}"),
+                    None => format!("v{}", v.as_u32()),
+                }
+            }
             None => "/*<no-value>*/".to_string(),
         }
     }
 
     // ── Flat index expression for Load/Store (Phase-1: single index) ───
-    fn emit_idx(&self, indices: &[IndexExpr], block: &Block) -> Result<String> {
+    fn emit_idx(&self, indices: &[IndexExpr], block: &Block, ov: &Names) -> Result<String> {
         match indices {
             [] => Ok(String::new()),
-            [one] => Ok(self.idx_term(one, block)),
+            [one] => Ok(self.idx_term(one, block, ov)),
             // Multi-dim row-major flatten is a Phase-2 concern (needs the
             // shape-stride model the MSL path has). Smoke kernels are 1-D.
             _ => Err(Error::UnsupportedOp(
@@ -153,11 +167,11 @@ impl CudaGenerator {
         }
     }
 
-    fn idx_term(&self, ix: &IndexExpr, block: &Block) -> String {
+    fn idx_term(&self, ix: &IndexExpr, block: &Block, ov: &Names) -> String {
         match ix {
-            IndexExpr::Value(v) => self.vname(Some(*v), block),
+            IndexExpr::Value(v) => self.vname(Some(*v), block, ov),
             IndexExpr::Const(c) => c.to_string(),
-            IndexExpr::Range(v, off) => format!("({} + {off})", self.vname(Some(*v), block)),
+            IndexExpr::Range(v, off) => format!("({} + {off})", self.vname(Some(*v), block, ov)),
         }
     }
 
@@ -214,6 +228,7 @@ impl CudaGenerator {
                 // `tid` alias: the DSL's `tid` lowers to Load{src:"tid"}; in
                 // Elementwise mode it is the global linear index.
                 writeln!(out, "    const unsigned int tid = _gtid;").ok();
+                self.emit_simd_aliases(out);
             }
             KernelMode::Reduction => self.emit_reduction_preamble(out),
             KernelMode::Grid3D => {
@@ -223,6 +238,7 @@ impl CudaGenerator {
                 writeln!(out, "    const unsigned int gid_x = blockIdx.x * blockDim.x + threadIdx.x;").ok();
                 writeln!(out, "    const unsigned int gid_y = blockIdx.y * blockDim.y + threadIdx.y;").ok();
                 writeln!(out, "    const unsigned int gid_z = blockIdx.z * blockDim.z + threadIdx.z;").ok();
+                self.emit_simd_aliases(out);
             }
             other => {
                 return Err(Error::UnsupportedOp(format!(
@@ -231,13 +247,44 @@ impl CudaGenerator {
             }
         }
 
-        let block = &kernel.body;
-        for (i, op) in block.ops.iter().enumerate() {
-            let vid = block.results.get(i).and_then(|x| *x);
-            self.emit_op(op, vid, block, kernel, out)?;
-        }
+        self.emit_ops(&kernel.body, kernel, &Names::new(), out)?;
         writeln!(out, "}}").ok();
         Ok(())
+    }
+
+    /// Walk a block's ops, emitting each. `ov` carries name overrides from
+    /// any enclosing Loop/If scope.
+    fn emit_ops(&self, blk: &Block, kernel: &Kernel, ov: &Names, out: &mut String) -> Result<()> {
+        for (i, op) in blk.ops.iter().enumerate() {
+            let vid = blk.results.get(i).and_then(|x| *x);
+            self.emit_op(op, vid, blk, kernel, ov, out)?;
+        }
+        Ok(())
+    }
+
+    /// Build the override map for a nested block: the parent block's name
+    /// hints (as `v_<hint>`) plus the parent's own overrides — mirrors
+    /// MSL's `child_names` so SSA values defined in the parent are visible
+    /// inside the child.
+    fn child_ov(&self, parent: &Block, ov: &Names) -> Names {
+        let mut child: Names =
+            parent.names.iter().map(|(&k, v)| (k, format!("v_{v}"))).collect();
+        for (&k, v) in ov {
+            child.insert(k, v.clone());
+        }
+        child
+    }
+
+    /// Common threadgroup/warp aliases available in every mode (kernels
+    /// reference `lsize`/`simd_lane`/`simd_group`/`n_simd` regardless of
+    /// thread-index mode). Reduction defines these in its own preamble, so
+    /// this is only called for Elementwise/Grid3D.
+    fn emit_simd_aliases(&self, out: &mut String) {
+        let lw = self.profile.lane_width;
+        writeln!(out, "    const unsigned int lsize      = blockDim.x;").ok();
+        writeln!(out, "    const unsigned int n_simd     = blockDim.x / {lw}u;").ok();
+        writeln!(out, "    const unsigned int simd_lane  = threadIdx.x % {lw}u;").ok();
+        writeln!(out, "    const unsigned int simd_group = threadIdx.x / {lw}u;").ok();
     }
 
     /// Reduction-mode preamble: maps Metal's threadgroup/simd built-ins to
@@ -267,12 +314,13 @@ impl CudaGenerator {
         vid: Option<ValueId>,
         block: &Block,
         kernel: &Kernel,
+        ov: &Names,
         out: &mut String,
     ) -> Result<()> {
         let pad = "    ";
         match op {
             Op::ProgramId { axis } => {
-                let v = self.vname(vid, block);
+                let v = self.vname(vid, block, ov);
                 let src = match kernel.mode {
                     // Elementwise: the single linear thread id.
                     KernelMode::Elementwise => "_gtid".to_string(),
@@ -286,7 +334,7 @@ impl CudaGenerator {
                 writeln!(out, "{pad}unsigned int {v} = {src};").ok();
             }
             Op::Const { value } => {
-                let v = self.vname(vid, block);
+                let v = self.vname(vid, block, ov);
                 if *value >= 0 {
                     writeln!(out, "{pad}unsigned int {v} = {value}u;").ok();
                 } else {
@@ -294,54 +342,66 @@ impl CudaGenerator {
                 }
             }
             Op::Load { src, indices, .. } => {
-                let v = self.vname(vid, block);
+                let v = self.vname(vid, block, ov);
+                // DSL builtin alias: `simd_id` → the warp index `simd_group`.
+                let src = if src == "simd_id" { "simd_group" } else { src.as_str() };
                 if indices.is_empty() {
                     writeln!(out, "{pad}auto {v} = {src};").ok();
                 } else {
-                    let idx = self.emit_idx(indices, block)?;
+                    let idx = self.emit_idx(indices, block, ov)?;
                     writeln!(out, "{pad}auto {v} = {src}[{idx}];").ok();
                 }
             }
             Op::Store { dst, indices, value, .. } => {
-                let val = self.vname(Some(*value), block);
-                let idx = self.emit_idx(indices, block)?;
+                let val = self.vname(Some(*value), block, ov);
+                let idx = self.emit_idx(indices, block, ov)?;
                 writeln!(out, "{pad}{dst}[{idx}] = {val};").ok();
             }
             Op::BinOp { op: bop, lhs, rhs } => {
-                let v = self.vname(vid, block);
-                let l = self.vname(Some(*lhs), block);
-                let r = self.vname(Some(*rhs), block);
+                let v = self.vname(vid, block, ov);
+                let l = self.vname(Some(*lhs), block, ov);
+                let r = self.vname(Some(*rhs), block, ov);
                 writeln!(out, "{pad}auto {v} = {};", cuda_binop(*bop, &l, &r)).ok();
             }
             Op::Fma { a, b, c } => {
-                let v = self.vname(vid, block);
-                let av = self.vname(Some(*a), block);
-                let bv = self.vname(Some(*b), block);
-                let cv = self.vname(Some(*c), block);
+                let v = self.vname(vid, block, ov);
+                let av = self.vname(Some(*a), block, ov);
+                let bv = self.vname(Some(*b), block, ov);
+                let cv = self.vname(Some(*c), block, ov);
                 writeln!(out, "{pad}auto {v} = fmaf({av}, {bv}, {cv});").ok();
             }
             Op::UnaryOp { op: uop, value } => {
-                let v = self.vname(vid, block);
-                let rv = self.vname(Some(*value), block);
+                let v = self.vname(vid, block, ov);
+                let rv = self.vname(Some(*value), block, ov);
                 writeln!(out, "{pad}auto {v} = {};", self.cuda_unary(*uop, &rv)).ok();
             }
             Op::Cast { value, dtype } => {
-                let v = self.vname(vid, block);
-                let rv = self.vname(Some(*value), block);
+                let v = self.vname(vid, block, ov);
+                let rv = self.vname(Some(*value), block, ov);
                 let ty = cuda_type_name(*dtype);
                 // CUDA C-style cast; source type comes from `auto` inference.
                 writeln!(out, "{pad}{ty} {v} = ({ty})({rv});").ok();
             }
             Op::Select { cond, on_true, on_false } => {
-                let v = self.vname(vid, block);
-                let c = self.vname(Some(*cond), block);
-                let a = self.vname(Some(*on_true), block);
-                let b = self.vname(Some(*on_false), block);
+                let v = self.vname(vid, block, ov);
+                let c = self.vname(Some(*cond), block, ov);
+                let a = self.vname(Some(*on_true), block, ov);
+                let b = self.vname(Some(*on_false), block, ov);
                 writeln!(out, "{pad}auto {v} = ({c}) ? ({a}) : ({b});").ok();
             }
+            // Mutable locals: the macro lowers `let mut x` to DeclareLocal and
+            // reads to Load{src:"__ml_x"} (body.rs), so the names line up.
+            Op::DeclareLocal { name, value } => {
+                let rv = self.vname(Some(*value), block, ov);
+                writeln!(out, "{pad}auto __ml_{name} = {rv};").ok();
+            }
+            Op::SetLocal { name, value } => {
+                let rv = self.vname(Some(*value), block, ov);
+                writeln!(out, "{pad}__ml_{name} = {rv};").ok();
+            }
             Op::Activation { kind, value } => {
-                let v = self.vname(vid, block);
-                let rv = self.vname(Some(*value), block);
+                let v = self.vname(vid, block, ov);
+                let rv = self.vname(Some(*value), block, ov);
                 let expr = match kind {
                     ActKind::Silu => format!("mt_silu((float)({rv}))"),
                     ActKind::Gelu => format!("mt_gelu((float)({rv}))"),
@@ -354,8 +414,8 @@ impl CudaGenerator {
             // Single-warp SIMD reduction → xor butterfly so ALL lanes get
             // the result (matches Metal `simd_*` broadcast semantics).
             Op::SimdReduce { value, op: rk } => {
-                let v = self.vname(vid, block);
-                let rv = self.vname(Some(*value), block);
+                let v = self.vname(vid, block, ov);
+                let rv = self.vname(Some(*value), block, ov);
                 let half = self.profile.lane_width / 2;
                 writeln!(out, "{pad}float {v};").ok();
                 writeln!(out, "{pad}{{").ok();
@@ -374,11 +434,11 @@ impl CudaGenerator {
             // Scalar (rank-0) splat / zeros. Tile (array) shapes need the
             // threadgroup/stack allocation path (cooperative kernels, P3+).
             Op::Zeros { shape, .. } if shape.rank() == 0 => {
-                let v = self.vname(vid, block);
+                let v = self.vname(vid, block, ov);
                 writeln!(out, "{pad}float {v} = 0.0f;").ok();
             }
             Op::Splat { value, shape, .. } if shape.rank() == 0 => {
-                let v = self.vname(vid, block);
+                let v = self.vname(vid, block, ov);
                 writeln!(out, "{pad}float {v} = {value}f;").ok();
             }
             // Per-thread grid-stride accumulation over a row (Phase 2).
@@ -394,9 +454,9 @@ impl CudaGenerator {
                             .into(),
                     ));
                 }
-                let v = self.vname(vid, block);
-                let off = self.vname(Some(*offset), block);
-                let en = self.vname(Some(*end), block);
+                let v = self.vname(vid, block, ov);
+                let off = self.vname(Some(*offset), block, ov);
+                let en = self.vname(Some(*end), block, ov);
                 writeln!(out, "{pad}float {v} = {};", reduce_init(*rk)).ok();
                 writeln!(
                     out,
@@ -415,9 +475,42 @@ impl CudaGenerator {
                         "cuda Phase 2: Reduce axis != 0 (Phase 3)".into(),
                     ));
                 }
-                let v = self.vname(vid, block);
-                let input = self.vname(Some(*value), block);
+                let v = self.vname(vid, block, ov);
+                let input = self.vname(Some(*value), block, ov);
                 self.emit_reduce_tree(&v, &input, *rk, out);
+            }
+            // ── Control flow (nested-block recursion) ──────────────────
+            Op::Loop { var, start, end, step, body } => {
+                let s = self.vname(Some(*start), block, ov);
+                let e = self.vname(Some(*end), block, ov);
+                let st = self.vname(Some(*step), block, ov);
+                let lv = format!("i_{}", var.as_u32());
+                writeln!(out, "{pad}for (unsigned int {lv} = {s}; {lv} < {e}; {lv} += {st}) {{").ok();
+                if let Some(bb) = kernel.blocks.get(body) {
+                    let mut child = self.child_ov(block, ov);
+                    // The loop induction var is referenced inside the body by
+                    // two macro-assigned magic ValueIds (see msl emit_block).
+                    child.insert(ValueId::new(0xC000_0000 | var.as_u32()), lv.clone());
+                    child.insert(ValueId::new(var.as_u32() + 0x4000_0000), lv.clone());
+                    self.emit_ops(bb, kernel, &child, out)?;
+                }
+                writeln!(out, "{pad}}}").ok();
+            }
+            Op::If { cond, then_block, else_block } => {
+                let c = self.vname(Some(*cond), block, ov);
+                writeln!(out, "{pad}if ({c}) {{").ok();
+                if let Some(tb) = kernel.blocks.get(then_block) {
+                    let child = self.child_ov(block, ov);
+                    self.emit_ops(tb, kernel, &child, out)?;
+                }
+                if let Some(ebid) = else_block {
+                    writeln!(out, "{pad}}} else {{").ok();
+                    if let Some(eb) = kernel.blocks.get(ebid) {
+                        let child = self.child_ov(block, ov);
+                        self.emit_ops(eb, kernel, &child, out)?;
+                    }
+                }
+                writeln!(out, "{pad}}}").ok();
             }
             other => {
                 return Err(Error::UnsupportedOp(format!(
