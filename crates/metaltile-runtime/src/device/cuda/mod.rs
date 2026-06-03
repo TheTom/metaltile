@@ -16,9 +16,13 @@
 
 mod ffi;
 
+use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
 use std::ptr;
+
+use metaltile_codegen::{CodegenBackend, CudaGenerator};
+use metaltile_core::ir::Kernel;
 
 use crate::error::MetalTileError;
 
@@ -270,16 +274,23 @@ impl CudaDevice {
         block_threads: u32,
         args: &mut [*mut c_void],
     ) -> Result<(), MetalTileError> {
+        self.launch(func, [grid_blocks, 1, 1], [block_threads, 1, 1], args)
+    }
+
+    /// Launch `func` over a 3-D grid (blocks × threads-per-block).
+    pub fn launch(
+        &self,
+        func: CudaFunction,
+        grid: [u32; 3],
+        block: [u32; 3],
+        args: &mut [*mut c_void],
+    ) -> Result<(), MetalTileError> {
         cu_check(
             unsafe {
                 cuLaunchKernel(
                     func.func,
-                    grid_blocks,
-                    1,
-                    1,
-                    block_threads,
-                    1,
-                    1,
+                    grid[0], grid[1], grid[2],
+                    block[0], block[1], block[2],
                     0,
                     ptr::null_mut(),
                     args.as_mut_ptr(),
@@ -289,6 +300,92 @@ impl CudaDevice {
             "cuLaunchKernel",
         )?;
         self.synchronize()
+    }
+
+    /// End-to-end generic dispatch: generate CUDA for `kernel`, compile,
+    /// allocate + upload every param (by name from `buffers`), pack kernel
+    /// args in signature order, launch over (`grid`×`block`), and read back
+    /// the output params. The CUDA analog of `Context::dispatch_with_grid`
+    /// + `SingleDispatch`, used to run the registered kernel-test corpus on
+    /// CUDA. `buffers` must contain every param's bytes (inputs AND
+    /// pre-sized outputs) plus each constexpr's name→LE-bytes.
+    pub fn run_kernel(
+        &self,
+        kernel: &Kernel,
+        buffers: &BTreeMap<String, Vec<u8>>,
+        grid: [u32; 3],
+        block: [u32; 3],
+    ) -> Result<BTreeMap<String, Vec<u8>>, MetalTileError> {
+        // 1. IR → CUDA C++ → module.
+        let src = CudaGenerator::new()
+            .generate(kernel)
+            .map_err(|e| MetalTileError::Codegen(e))?;
+        let module = self.compile(&src, &format!("{}.cu", kernel.name))?;
+        let func = module.function(&kernel.name)?;
+
+        // 2. Allocate + upload each param buffer (in kernel.params order).
+        //    Strided params are not yet supported by the emitter (it errors
+        //    in generate() above), so every param here is Tensor/Scalar.
+        let mut dev_bufs: Vec<DeviceBuffer> = Vec::with_capacity(kernel.params.len());
+        let mut dev_ptrs: Vec<CUdeviceptr> = Vec::with_capacity(kernel.params.len());
+        let mut out_lens: Vec<Option<usize>> = Vec::with_capacity(kernel.params.len());
+        for p in &kernel.params {
+            let bytes = buffers.get(&p.name).ok_or_else(|| {
+                MetalTileError::Dispatch(format!("missing buffer for param '{}'", p.name))
+            })?;
+            let buf = self.upload(bytes)?;
+            dev_ptrs.push(buf.device_ptr());
+            out_lens.push(if p.is_output { Some(bytes.len()) } else { None });
+            dev_bufs.push(buf);
+        }
+
+        // 3. Scalar arg storage: constexprs (signature order) then the
+        //    synthetic _n_elems for Elementwise.
+        let mut scalars: Vec<Vec<u8>> = Vec::new();
+        for ce in &kernel.constexprs {
+            let name = ce.name.name();
+            let bytes = buffers.get(name).ok_or_else(|| {
+                MetalTileError::Dispatch(format!("missing constexpr '{name}'"))
+            })?;
+            scalars.push(bytes.clone());
+        }
+        if kernel.mode == metaltile_core::ir::KernelMode::Elementwise {
+            // Bounds = element count of the first output param.
+            let n_elems = kernel
+                .params
+                .iter()
+                .position(|p| p.is_output)
+                .and_then(|i| {
+                    let p = &kernel.params[i];
+                    buffers.get(&p.name).map(|b| (b.len() / p.dtype.size_bytes().max(1)) as u32)
+                })
+                .unwrap_or(0);
+            scalars.push(n_elems.to_le_bytes().to_vec());
+        }
+
+        // 4. Build kernelParams: param device-ptrs, then scalar values.
+        //    Pointers are taken after both vecs are fully built (no realloc).
+        let mut args: Vec<*mut c_void> = Vec::with_capacity(dev_ptrs.len() + scalars.len());
+        for p in &dev_ptrs {
+            args.push(p as *const CUdeviceptr as *mut c_void);
+        }
+        for s in &scalars {
+            args.push(s.as_ptr() as *mut c_void);
+        }
+
+        // 5. Launch.
+        self.launch(func, grid, block, &mut args)?;
+
+        // 6. Read back outputs.
+        let mut out = BTreeMap::new();
+        for (i, p) in kernel.params.iter().enumerate() {
+            if let Some(len) = out_lens[i] {
+                let mut host = vec![0u8; len];
+                self.download(&dev_bufs[i], &mut host)?;
+                out.insert(p.name.clone(), host);
+            }
+        }
+        Ok(out)
     }
 
     pub fn synchronize(&self) -> Result<(), MetalTileError> {

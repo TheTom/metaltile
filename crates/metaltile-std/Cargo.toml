@@ -9,6 +9,11 @@ publish = true
 [lints]
 workspace = true
 
+[features]
+# Run the registered #[test_kernel] corpus on the CUDA backend
+# (tests/cuda_kernel_corpus.rs). Forwards to metaltile-runtime/cuda.
+cuda = ["metaltile-runtime/cuda"]
+
 [dependencies]
 metaltile.workspace = true
 metaltile-core.workspace = true
