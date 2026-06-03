@@ -29,12 +29,44 @@ not just theoretical. NOTE: Spark not yet in `~/.ssh/config`/hosts on this Mac �
 
 ---
 
+## 0c. Hardware reality + research findings (deep-research, cited)
+
+**GB10 / sm_121 is CONSUMER Blackwell = `mma.sync`-class, NOT `tcgen05`.** TMEM,
+`tcgen05.mma`, UMMA, 2-SM cooperative MMA are **sm_100 (datacenter) only**. GB10
+gets FP4/FP6 + block-scaling but **via warp-level `mma.sync`**. → **Spec §4.3/§4.5
+Phase-4 `tcgen05` plan does NOT apply to our box.** The real Blackwell MMA path
+here is **inline-PTX `mma.sync`** (documented per-lane fragment layout), not
+`wmma` (fragment interior is *unspecified* → unusable for bit-accuracy) and not
+`tcgen05`. cuda-oxide's tcgen05 intrinsics are likewise sm_100-oriented.
+
+Top silent-correctness traps to guard (apply as we extend):
+1. **`__shfl_*_sync` mask** — blanket `0xffffffff` on a partial/divergent warp is
+   UB (reads undefined, not 0). Likely root cause of the hadamard / col-seg-reduce
+   KNOWN_HARD mismatches. Fix = derive mask from the active set / pad to full warps.
+2. **`cuLaunchKernel` overhang** — Metal `dispatchThreads` is exact; CUDA is
+   blocks×threads → needs bounds guards (we already emit them for Elementwise;
+   Grid3D/Reduction rely on Metal-parity launch geometry).
+3. **fast-math / `--fmad`** — `__expf` etc. + default FMA fusion diverge from an
+   IEEE CPU oracle. We pass within per-dtype tol; for strict bit-accuracy add
+   NVRTC `--fmad=false` and avoid `__`-intrinsics.
+4. **fp8/fp4** — CUDA 13 has native `__nv_fp8_*`/`__nv_fp4_*` + `__nv_cvt_*`
+   (faster/safer than our manual decode) — swap only after matching oracle rounding.
+5. **Shared mem** — GB10 static cap **48 KB** (per-block max 99 KB via *dynamic*
+   smem + `cuFuncSetAttribute` opt-in). Our per-warp simdgroup tiles hit this on
+   `sdpa_prefill_mma` (many tiles) → dynamic-smem follow-up.
+
+Full report: `tasks/` deep-research (mma.sync shapes for sm_121, NVRTC bundled
+headers, barrier-scope, atomics ordering).
+
+---
+
 ## 0b. Status snapshot (latest)
 
 **CUDA backend runs the real registered `#[test_kernel]` corpus on GX10 (sm_121):
-`PASS=3127, MISMATCH=0, ERROR=0`** — every non-cooperative-matrix kernel passes
-bit-accurately against the same CPU oracle the Metal harness uses (`tests/
-cuda_kernel_corpus.rs`). ~76% of the full corpus. Covered:
+`PASS=3591, MISMATCH=0, ERROR=0`** (~**86%** of the full corpus) — bit-accurate
+against the same CPU oracle the Metal harness uses (`tests/cuda_kernel_corpus.rs`).
+Now includes the **simdgroup_matrix MMA path** (software emulation w/ Apple's exact
+8×8 lane layout — 464 cooperative-matrix kernels bit-accurate). Covered:
 - Modes: Elementwise, Reduction, Grid3D
 - Ops: const/binop/unary/cast/fma/select; load/store/gather/scatter; program-id;
   reduce + stride-reduce (incl. **transform chain + secondary_src = gemv/qgemv**);
@@ -45,13 +77,14 @@ cuda_kernel_corpus.rs`). ~76% of the full corpus. Covered:
 - Runtime: `CudaDevice` (NVRTC + Driver API), generic `run_kernel` dispatch,
   `cuda` feature, `build.rs`.
 
-**Remaining ~990 unsupported = the cooperative-matrix MMA path** (`CoopTile*`,
-`Simdgroup*`-matrix, `SimdGroup2D` mode, MPP/NAX). This is spec **Phase 3 (wmma
-re-tiling)** + **Phase 5 (CUTLASS for MPP/NAX)** — the hardware-cooperative
-matmul subsystem, explicitly scoped as multi-week work needing bit-accurate
-fragment layouts. Not yet implemented. Tiny tail: SimdScan (6), Strided params
-(3), `KNOWN_HARD=45` (documented mismatches: mhc-sinkhorn SSA-shadow, col/seg-
-reduce axis lowering, hadamard warp-xor, nax cooperative, fishspeech conv1d).
+**Remaining ~516 unsupported = the `CoopTile*` MPP/NAX cooperative-tensor path**
+(`mpp::tensor_ops::matmul2d` / `metal::tensor` — Metal-4 hardware tensor API, 31
+distinct kernels × formats). No CUDA analog → spec **Phase 5 (CUTLASS-equivalent
+reimplementation)**, the genuinely hard remainder. Tiny tail: SimdScan (6),
+Strided params (3). `KNOWN_HARD=57` (documented: mhc-sinkhorn SSA-shadow, col/seg-
+reduce axis, hadamard warp-xor-mask, nax, fishspeech conv1d, sdpa-prefill-mma
+48KB-shared-cap). The `Simdgroup*`-matrix path (was here) is now **done** via
+software emulation; CoopTile is a separate, higher abstraction.
 
 ---
 
