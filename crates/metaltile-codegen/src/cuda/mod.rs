@@ -534,6 +534,28 @@ impl CudaGenerator {
                 }
                 writeln!(out, "{pad}}}").ok();
             }
+            // Warp prefix scan (Hillis-Steele via __shfl_up_sync), matching
+            // Metal's simd_prefix_{inclusive,exclusive}_*.
+            Op::SimdScan { value, op: rk, exclusive } => {
+                let v = self.vname(vid, block, ov);
+                let rv = self.vname(Some(*value), block, ov);
+                let lw = self.profile.lane_width;
+                writeln!(out, "{pad}float {v};").ok();
+                writeln!(out, "{pad}{{").ok();
+                writeln!(out, "{pad}    float _s = (float)({rv});").ok();
+                writeln!(out, "{pad}    for (int _o = 1; _o < {lw}; _o <<= 1) {{").ok();
+                writeln!(out, "{pad}        float _t = __shfl_up_sync(0xffffffffu, _s, _o);").ok();
+                writeln!(out, "{pad}        if (simd_lane >= (unsigned int)_o) _s = {};", reduce_combine(*rk, "_s", "_t")).ok();
+                writeln!(out, "{pad}    }}").ok();
+                if *exclusive {
+                    // Shift right one lane; lane 0 gets the identity.
+                    writeln!(out, "{pad}    float _x = __shfl_up_sync(0xffffffffu, _s, 1);").ok();
+                    writeln!(out, "{pad}    {v} = (simd_lane == 0u) ? ({}) : _x;", reduce_init(*rk)).ok();
+                } else {
+                    writeln!(out, "{pad}    {v} = _s;").ok();
+                }
+                writeln!(out, "{pad}}}").ok();
+            }
             // Scalar (rank-0) splat / zeros. Tile (array) shapes need the
             // threadgroup/stack allocation path (cooperative kernels, P3+).
             Op::Zeros { shape, .. } if shape.rank() == 0 => {
@@ -549,11 +571,24 @@ impl CudaGenerator {
             // Correctness-first: the 4-wide vectorized form the MSL path uses
             // is a Phase-3 perf retune (SCOPE §6).
             Op::StrideReduce {
-                src, offset, end, op: rk, transform, secondary_src, secondary_base, ..
+                src, offset, stride, end, op: rk, transform, secondary_src, secondary_base, ..
             } => {
                 let v = self.vname(vid, block, ov);
                 let off = self.vname(Some(*offset), block, ov);
                 let en = self.vname(Some(*end), block, ov);
+                // Two layouts:
+                //  - Reduction/Tile2D: the threadgroup *cooperates* over one
+                //    row — each thread strides by `lsize`, a later Op::Reduce
+                //    combines (start at off+tid).
+                //  - Grid3D/Elementwise: each thread folds its OWN run
+                //    (col-reduce: stride=cols; seg-reduce: stride=1) with no
+                //    threadgroup combine — start at `off`, step by `stride`.
+                let coop = matches!(kernel.mode, KernelMode::Reduction | KernelMode::Tile2D);
+                let (start, step) = if coop {
+                    (format!("{off} + tid"), "lsize".to_string())
+                } else {
+                    (off.clone(), self.vname(Some(*stride), block, ov))
+                };
                 // Base element: optional dot-product against a second buffer
                 // (GEMV/qgemv: src[_i] * sec[_i - base]).
                 let base_elem = match secondary_src {
@@ -601,7 +636,7 @@ impl CudaGenerator {
                 writeln!(out, "{pad}float {v} = {};", reduce_init(*rk)).ok();
                 writeln!(
                     out,
-                    "{pad}for (unsigned int _i = {off} + tid; _i < {en}; _i += lsize) {{"
+                    "{pad}for (unsigned int _i = {start}; _i < {en}; _i += {step}) {{"
                 )
                 .ok();
                 writeln!(out, "{pad}    float _e = {elem_expr};").ok();
