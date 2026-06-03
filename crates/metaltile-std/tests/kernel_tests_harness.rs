@@ -28,7 +28,13 @@ fn all_registered_kernel_tests_pass() {
     let mut total = 0usize;
     let mut failures: Vec<String> = Vec::new();
 
-    for entry in metaltile::harness::registry::all_tests() {
+    // NB: iterate via `metaltile_std::all_tests()` (not `metaltile::harness::
+    // registry::all_tests()`). Per the `metaltile-std` lib docs, importing the
+    // registry accessor through `metaltile_std` is what pulls the std rlib into
+    // this integration-test link so the `#[test_kernel]` inventory statics are
+    // retained — going through `metaltile::…` directly leaves them dead-code-
+    // eliminated and the harness silently iterates an EMPTY set.
+    for entry in metaltile_std::all_tests() {
         let t = entry.test();
         for &dt in t.dtypes() {
             total += 1;
