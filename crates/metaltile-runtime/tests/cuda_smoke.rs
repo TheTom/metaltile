@@ -178,6 +178,62 @@ fn row_reduce_sum_ir() -> Kernel {
     k
 }
 
+/// out[r,i] = x[r,i] * rsqrt(mean(x[r,:]²) + eps) * w[i] — RMSNorm.
+/// One element per thread (N == blockDim), Reduction mode. The real fused
+/// LLM kernel, built from ops the Phase-2 emitter already supports:
+/// square = Mul(x,x), threadgroup Reduce(sum), Cast, Div, Rsqrt, weighted
+/// Store. No StrideReduce/StrideStore needed for the 1-elem/thread layout.
+fn rms_norm_ir() -> Kernel {
+    let mut k = Kernel::new("rms_norm");
+    k.mode = metaltile_core::ir::KernelMode::Reduction;
+    for (name, is_out) in [("x", false), ("w", false), ("out", true)] {
+        k.params.push(Param {
+            name: name.into(),
+            dtype: DType::F32,
+            shape: Shape::scalar(),
+            is_output: is_out,
+            kind: ParamKind::Tensor,
+        });
+    }
+    k.constexprs.push(ConstExprDecl { name: ConstExpr::new("n"), dtype: DType::U32, value: None });
+    k.constexprs.push(ConstExprDecl { name: ConstExpr::new("eps"), dtype: DType::F32, value: None });
+
+    let v = |i| ValueId::new(i);
+    let (row, tidv, nval, rs, col, x, sq, ssq, nf, msq, epsv, t, inv, w, xn, outv) =
+        (v(0), v(1), v(2), v(3), v(4), v(5), v(6), v(7), v(8), v(9), v(10), v(11), v(12), v(13), v(14), v(15));
+    let ld = |src: &str, idx: Vec<IndexExpr>| Op::Load { src: src.into(), indices: idx, mask: None, other: None };
+
+    k.body.push_op(Op::ProgramId { axis: 0 }, row);
+    k.body.name_value(row, "row");
+    k.body.push_op(ld("tid", vec![]), tidv);
+    k.body.name_value(tidv, "tid");
+    k.body.push_op(ld("n", vec![]), nval);
+    k.body.push_op(Op::BinOp { op: BinOpKind::Mul, lhs: row, rhs: nval }, rs);
+    k.body.push_op(Op::BinOp { op: BinOpKind::Add, lhs: rs, rhs: tidv }, col);
+    k.body.name_value(col, "col");
+    k.body.push_op(ld("x", vec![IndexExpr::Value(col)]), x);
+    k.body.name_value(x, "x");
+    k.body.push_op(Op::BinOp { op: BinOpKind::Mul, lhs: x, rhs: x }, sq); // square
+    k.body.push_op(Op::Reduce { value: sq, axis: 0, op: ReduceKind::Sum }, ssq);
+    k.body.name_value(ssq, "ssq");
+    k.body.push_op(Op::Cast { value: nval, dtype: DType::F32 }, nf);
+    k.body.push_op(Op::BinOp { op: BinOpKind::Div, lhs: ssq, rhs: nf }, msq);
+    k.body.push_op(ld("eps", vec![]), epsv);
+    k.body.push_op(Op::BinOp { op: BinOpKind::Add, lhs: msq, rhs: epsv }, t);
+    k.body.push_op(Op::UnaryOp { op: UnaryOpKind::Rsqrt, value: t }, inv);
+    k.body.name_value(inv, "inv");
+    k.body.push_op(ld("w", vec![IndexExpr::Value(tidv)]), w);
+    k.body.push_op(Op::BinOp { op: BinOpKind::Mul, lhs: x, rhs: inv }, xn);
+    k.body.push_op(Op::BinOp { op: BinOpKind::Mul, lhs: xn, rhs: w }, outv);
+    k.body.push_op_no_result(Op::Store {
+        dst: "out".into(),
+        indices: vec![IndexExpr::Value(col)],
+        value: outv,
+        mask: None,
+    });
+    k
+}
+
 fn f32s_to_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_ne_bytes()).collect()
 }
@@ -335,4 +391,64 @@ fn row_reduce_sum_cuda_end_to_end() {
     }
     eprintln!("max|Δ| = {max_err:.3e} over {ROWS} rows (row_reduce_sum)");
     assert!(max_err <= 1e-3, "CUDA row_reduce_sum mismatch: max|Δ|={max_err:.3e}");
+}
+
+#[test]
+fn rms_norm_cuda_end_to_end() {
+    let Some(dev) = CudaDevice::create().expect("CUDA init") else {
+        eprintln!("no CUDA device — skipping CUDA smoke test");
+        return;
+    };
+
+    let src = CudaGenerator::new().generate(&rms_norm_ir()).expect("cuda codegen");
+    eprintln!("--- generated CUDA ---\n{src}\n----------------------");
+    let module = dev.compile(&src, "rms_norm.cu").expect("nvrtc compile");
+    let func = module.function("rms_norm").expect("get function");
+
+    const ROWS: usize = 64;
+    const N: usize = 256; // one element per thread → blockDim = 256
+    let eps: f32 = 1e-5;
+    let x: Vec<f32> = (0..ROWS * N).map(|i| ((i % 23) as f32 - 11.0) * 0.05).collect();
+    let w: Vec<f32> = (0..N).map(|i| 0.5 + (i as f32 * 0.01).sin() * 0.2).collect();
+
+    // CPU oracle.
+    let mut expected = vec![0.0f32; ROWS * N];
+    for r in 0..ROWS {
+        let row = &x[r * N..(r + 1) * N];
+        let ssq: f32 = row.iter().map(|v| v * v).sum();
+        let inv = 1.0f32 / (ssq / N as f32 + eps).sqrt();
+        for i in 0..N {
+            expected[r * N + i] = row[i] * inv * w[i];
+        }
+    }
+
+    let dx = dev.upload(&f32s_to_bytes(&x)).expect("upload x");
+    let dw = dev.upload(&f32s_to_bytes(&w)).expect("upload w");
+    let dout = dev.alloc(ROWS * N * 4).expect("alloc out");
+
+    let mut px = dx.device_ptr();
+    let mut pw = dw.device_ptr();
+    let mut pout = dout.device_ptr();
+    let mut n: u32 = N as u32;
+    let mut ep = eps;
+    // Arg order: x, w, out, <constexpr n>, <constexpr eps>.
+    let mut args: [*mut c_void; 5] = [
+        &mut px as *mut _ as *mut c_void,
+        &mut pw as *mut _ as *mut c_void,
+        &mut pout as *mut _ as *mut c_void,
+        &mut n as *mut _ as *mut c_void,
+        &mut ep as *mut _ as *mut c_void,
+    ];
+    dev.launch_1d(func, ROWS as u32, N as u32, &mut args).expect("launch");
+
+    let mut out_bytes = vec![0u8; ROWS * N * 4];
+    dev.download(&dout, &mut out_bytes).expect("download out");
+    let got = bytes_to_f32s(&out_bytes);
+
+    let mut max_err = 0.0f32;
+    for (g, e) in got.iter().zip(&expected) {
+        max_err = max_err.max((g - e).abs());
+    }
+    eprintln!("max|Δ| = {max_err:.3e} over {} elems (rms_norm)", ROWS * N);
+    assert!(max_err <= 1e-3, "CUDA rms_norm mismatch: max|Δ|={max_err:.3e}");
 }
