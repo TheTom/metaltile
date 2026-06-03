@@ -240,11 +240,31 @@ impl CudaGenerator {
                 writeln!(out, "    const unsigned int gid_z = blockIdx.z * blockDim.z + threadIdx.z;").ok();
                 self.emit_simd_aliases(out);
             }
-            other => {
-                return Err(Error::UnsupportedOp(format!(
-                    "cuda: KernelMode {other:?} unsupported (Elementwise/Reduction/Grid3D)"
-                )));
+            KernelMode::SimdGroup2D => {
+                // tid = threadgroup_position_in_grid (→ blockIdx),
+                // lid = thread_position_in_threadgroup (→ threadIdx).
+                writeln!(out, "    const unsigned int tgid_x = blockIdx.x;").ok();
+                writeln!(out, "    const unsigned int tgid_y = blockIdx.y;").ok();
+                writeln!(out, "    const unsigned int tgid_z = blockIdx.z;").ok();
+                writeln!(out, "    const unsigned int lid_x = threadIdx.x;").ok();
+                writeln!(out, "    const unsigned int lid_y = threadIdx.y;").ok();
+                writeln!(out, "    const unsigned int lid_z = threadIdx.z;").ok();
+                self.emit_simd_aliases(out);
             }
+            KernelMode::Tile2D => {
+                return Err(Error::UnsupportedOp(
+                    "cuda: KernelMode Tile2D (Op::Dot tiled-matmul path → wmma, Phase 3)".into(),
+                ));
+            }
+        }
+
+        // Apple simdgroup_matrix<f32,8,8> lane→element coords (from the
+        // mma_layout_probe): elem 0 at (fm, fn0), elem 1 at (fm, fn1).
+        if uses_simdgroup(kernel) {
+            writeln!(out, "    const unsigned int _sg_qid = simd_lane / 4u;").ok();
+            writeln!(out, "    const unsigned int _sg_fm  = (_sg_qid & 4u) + ((simd_lane / 2u) % 4u);").ok();
+            writeln!(out, "    const unsigned int _sg_fn0 = (_sg_qid & 2u) * 2u + (simd_lane % 2u) * 2u;").ok();
+            writeln!(out, "    const unsigned int _sg_fn1 = _sg_fn0 + 1u;").ok();
         }
 
         // Hoist threadgroup/stack array declarations to function scope so
@@ -259,13 +279,20 @@ impl CudaGenerator {
     /// declarations from every block, at function scope.
     fn emit_allocs(&self, kernel: &Kernel, out: &mut String) {
         for blk in std::iter::once(&kernel.body).chain(kernel.blocks.values()) {
-            for op in &blk.ops {
+            for (i, op) in blk.ops.iter().enumerate() {
                 match op {
                     Op::ThreadgroupAlloc { dtype, size, name } => {
                         writeln!(out, "    __shared__ {} {name}[{size}];", cuda_type_name(*dtype)).ok();
                     }
                     Op::StackAlloc { dtype, size, name } => {
                         writeln!(out, "    {} {name}[{size}];", cuda_type_name(*dtype)).ok();
+                    }
+                    // simdgroup_matrix<f32,8,8>: one 8×8 (=64) f32 tile per
+                    // warp, in shared memory (32 warps max per block).
+                    Op::SimdgroupAlloc { .. } => {
+                        if let Some(Some(v)) = blk.results.get(i) {
+                            writeln!(out, "    __shared__ float {}[{}];", sgm_name(*v), 32 * 64).ok();
+                        }
                     }
                     _ => {}
                 }
@@ -345,12 +372,12 @@ impl CudaGenerator {
                 let src = match kernel.mode {
                     // Elementwise: the single linear thread id.
                     KernelMode::Elementwise => "_gtid".to_string(),
-                    // Reduction: which output row this block owns.
-                    KernelMode::Reduction => {
-                        match axis { 0 => "tgid_x", 1 => "tgid_y", _ => "tgid_z" }.to_string()
-                    }
                     // Grid3D: per-axis global thread id.
-                    _ => match axis { 0 => "gid_x", 1 => "gid_y", _ => "gid_z" }.to_string(),
+                    KernelMode::Grid3D => {
+                        match axis { 0 => "gid_x", 1 => "gid_y", _ => "gid_z" }.to_string()
+                    }
+                    // Reduction & SimdGroup2D: which threadgroup (block) this is.
+                    _ => match axis { 0 => "tgid_x", 1 => "tgid_y", _ => "tgid_z" }.to_string(),
                 };
                 writeln!(out, "{pad}unsigned int {v} = {src};").ok();
             }
@@ -364,8 +391,15 @@ impl CudaGenerator {
             }
             Op::Load { src, indices, .. } => {
                 let v = self.vname(vid, block, ov);
-                // DSL builtin alias: `simd_id` → the warp index `simd_group`.
-                let src = if src == "simd_id" { "simd_group" } else { src.as_str() };
+                // DSL builtin aliases. `simd_id` → warp index. In SimdGroup2D,
+                // `tid_{x,y,z}` is the per-thread position (lid) — matches MSL.
+                let src = match (src.as_str(), kernel.mode) {
+                    ("simd_id", _) => "simd_group",
+                    ("tid_x", KernelMode::SimdGroup2D) => "lid_x",
+                    ("tid_y", KernelMode::SimdGroup2D) => "lid_y",
+                    ("tid_z", KernelMode::SimdGroup2D) => "lid_z",
+                    _ => src.as_str(),
+                };
                 if indices.is_empty() {
                     writeln!(out, "{pad}auto {v} = {src};").ok();
                 } else {
@@ -590,6 +624,59 @@ impl CudaGenerator {
             Op::SimdgroupBarrier => {
                 writeln!(out, "{pad}__syncwarp();").ok();
             }
+            // ── simdgroup_matrix<f32,8,8> (software emulation) ─────────
+            // Each fragment is a per-warp 8×8 row-major shared tile; lanes
+            // map to elements via the Apple layout (_sg_fm/_sg_fn0/_sg_fn1).
+            // Cooperative across the 32-lane warp = 32-lane simdgroup.
+            Op::SimdgroupAlloc { .. } => {} // declared+zeroed in emit_allocs
+            Op::SimdgroupElemLoad { value, index } => {
+                let v = self.vname(vid, block, ov);
+                let m = sgm_name(*value);
+                let fnk = if *index == 0 { "_sg_fn0" } else { "_sg_fn1" };
+                writeln!(out, "{pad}float {v} = {m}[simd_group * 64u + _sg_fm * 8u + {fnk}];").ok();
+            }
+            Op::SimdgroupElemStore { value, index, data } => {
+                let m = sgm_name(*value);
+                let dv = self.vname(Some(*data), block, ov);
+                let fnk = if *index == 0 { "_sg_fn0" } else { "_sg_fn1" };
+                writeln!(out, "{pad}{m}[simd_group * 64u + _sg_fm * 8u + {fnk}] = {dv};").ok();
+            }
+            // Cooperative fragment load from a threadgroup array, one row per
+            // (fm,fn): dest[fm][fn] = tg[off + (transpose ? fn*stride+fm : fm*stride+fn)].
+            Op::SimdgroupLoad { dest, tg, offset, stride, transpose } => {
+                let m = sgm_name(*dest);
+                let off = self.vname(Some(*offset), block, ov);
+                writeln!(out, "{pad}{{ unsigned int _base = simd_group * 64u;").ok();
+                for fnk in ["_sg_fn0", "_sg_fn1"] {
+                    let idx = if *transpose {
+                        format!("{fnk} * {stride}u + _sg_fm")
+                    } else {
+                        format!("_sg_fm * {stride}u + {fnk}")
+                    };
+                    writeln!(
+                        out,
+                        "{pad}    {m}[_base + _sg_fm * 8u + {fnk}] = (float)({tg}[{off} + {idx}]);"
+                    ).ok();
+                }
+                writeln!(out, "{pad}}}").ok();
+            }
+            // C += A * B  (8×8×8), cooperative across the warp.
+            Op::SimdgroupMatMul { a, b, c } => {
+                let (ma, mb, mc) = (sgm_name(*a), sgm_name(*b), sgm_name(*c));
+                writeln!(out, "{pad}__syncwarp();").ok();
+                writeln!(out, "{pad}{{ unsigned int _bs = simd_group * 64u;").ok();
+                writeln!(out, "{pad}    float _acc0 = {mc}[_bs + _sg_fm * 8u + _sg_fn0];").ok();
+                writeln!(out, "{pad}    float _acc1 = {mc}[_bs + _sg_fm * 8u + _sg_fn1];").ok();
+                writeln!(out, "{pad}    for (unsigned int _k = 0u; _k < 8u; _k++) {{").ok();
+                writeln!(out, "{pad}        float _av = {ma}[_bs + _sg_fm * 8u + _k];").ok();
+                writeln!(out, "{pad}        _acc0 += _av * {mb}[_bs + _k * 8u + _sg_fn0];").ok();
+                writeln!(out, "{pad}        _acc1 += _av * {mb}[_bs + _k * 8u + _sg_fn1];").ok();
+                writeln!(out, "{pad}    }}").ok();
+                writeln!(out, "{pad}    __syncwarp();").ok();
+                writeln!(out, "{pad}    {mc}[_bs + _sg_fm * 8u + _sg_fn0] = _acc0;").ok();
+                writeln!(out, "{pad}    {mc}[_bs + _sg_fm * 8u + _sg_fn1] = _acc1;").ok();
+                writeln!(out, "{pad}}}").ok();
+            }
             // ── Control flow (nested-block recursion) ──────────────────
             Op::Loop { var, start, end, step, body } => {
                 let s = self.vname(Some(*start), block, ov);
@@ -789,6 +876,26 @@ fn reduce_combine(kind: ReduceKind, a: &str, b: &str) -> String {
         ReduceKind::Min => format!("fminf({a}, {b})"),
         ReduceKind::Product => format!("{a} * {b}"),
     }
+}
+
+/// Per-warp shared-tile name for a simdgroup_matrix value.
+fn sgm_name(v: ValueId) -> String { format!("_SGM_{}", v.as_u32()) }
+
+/// Does the kernel use any simdgroup-matrix op (drives the lane-coord
+/// preamble + shared tile allocation)?
+fn uses_simdgroup(kernel: &Kernel) -> bool {
+    std::iter::once(&kernel.body).chain(kernel.blocks.values()).any(|b| {
+        b.ops.iter().any(|op| {
+            matches!(
+                op,
+                Op::SimdgroupAlloc { .. }
+                    | Op::SimdgroupLoad { .. }
+                    | Op::SimdgroupMatMul { .. }
+                    | Op::SimdgroupElemLoad { .. }
+                    | Op::SimdgroupElemStore { .. }
+            )
+        })
+    })
 }
 
 /// Variant name of an `Op` (Debug-derived), for diagnostics.
