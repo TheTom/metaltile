@@ -467,24 +467,62 @@ impl CudaGenerator {
             // Correctness-first: the 4-wide vectorized form the MSL path uses
             // is a Phase-3 perf retune (SCOPE §6).
             Op::StrideReduce {
-                src, offset, end, op: rk, transform, secondary_src, ..
+                src, offset, end, op: rk, transform, secondary_src, secondary_base, ..
             } => {
-                if transform.as_ref().is_some_and(|t| !t.is_empty()) || secondary_src.is_some() {
-                    return Err(Error::UnsupportedOp(
-                        "cuda Phase 2: StrideReduce transform/secondary_src (rms/gemv → Phase 3)"
-                            .into(),
-                    ));
-                }
                 let v = self.vname(vid, block, ov);
                 let off = self.vname(Some(*offset), block, ov);
                 let en = self.vname(Some(*end), block, ov);
+                // Base element: optional dot-product against a second buffer
+                // (GEMV/qgemv: src[_i] * sec[_i - base]).
+                let base_elem = match secondary_src {
+                    Some(sec) => {
+                        let bv = self.vname(*secondary_base, block, ov);
+                        format!("(float)({src}[_i]) * (float)({sec}[_i - {bv}])")
+                    }
+                    None => format!("(float)({src}[_i])"),
+                };
+                // Per-element transform chain (e.g. square for sum-of-squares,
+                // decode, activation), applied to the loaded element.
+                let elem_expr = match transform.as_ref().map(|t| t.as_slice()) {
+                    None | Some([]) => base_elem,
+                    Some(ops) => {
+                        let mut e = base_elem;
+                        for sub in ops {
+                            e = match sub {
+                                Op::UnaryOp { op, .. } => self.cuda_unary(*op, &e),
+                                Op::Activation { kind, .. } => match kind {
+                                    ActKind::Silu => format!("mt_silu({e})"),
+                                    ActKind::Gelu => format!("mt_gelu({e})"),
+                                    ActKind::Relu => format!("mt_relu({e})"),
+                                    ActKind::Sigmoid => format!("mt_sigmoid({e})"),
+                                    ActKind::Tanh => format!("tanhf({e})"),
+                                },
+                                Op::Cast { dtype, .. } => {
+                                    format!("({})({e})", cuda_type_name(*dtype))
+                                }
+                                Op::BinOp { op, rhs, .. } => {
+                                    let rv = self.vname(Some(*rhs), block, ov);
+                                    match op {
+                                        BinOpKind::Mul => format!("(({e}) * (float)({rv}))"),
+                                        BinOpKind::Add => format!("(({e}) + (float)({rv}))"),
+                                        BinOpKind::Sub => format!("(({e}) - (float)({rv}))"),
+                                        BinOpKind::Div => format!("(({e}) / (float)({rv}))"),
+                                        _ => e,
+                                    }
+                                }
+                                _ => e,
+                            };
+                        }
+                        e
+                    }
+                };
                 writeln!(out, "{pad}float {v} = {};", reduce_init(*rk)).ok();
                 writeln!(
                     out,
                     "{pad}for (unsigned int _i = {off} + tid; _i < {en}; _i += lsize) {{"
                 )
                 .ok();
-                writeln!(out, "{pad}    float _e = (float)({src}[_i]);").ok();
+                writeln!(out, "{pad}    float _e = {elem_expr};").ok();
                 writeln!(out, "{pad}    {v} = {};", reduce_combine(*rk, &v, "_e")).ok();
                 writeln!(out, "{pad}}}").ok();
             }
