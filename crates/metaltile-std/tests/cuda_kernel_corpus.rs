@@ -60,11 +60,11 @@ const KNOWN_HARD: &[(&str, &str)] = &[
     // CoopTile NAX (Metal-4 neural-accelerator) cooperative ops: a distinct
     // hardware tensor path, not the mpp::matmul2d our emulation replicates.
     ("_nax", "NAX (Metal-4 neural-accelerator) cooperative op — distinct from mpp::matmul2d; needs its own lowering (Phase 5)"),
+    ("qmm_mma_mpp", "MPP CoopTile qmm: staging-layout discrepancy vs the (passing) simdgroup path — numerical debug needed (Phase 5)"),
+    ("_bm8_mpp", "MPP bm8 CoopTile qmm — staging-layout discrepancy (Phase 5)"),
+    ("_bm16_mpp", "MPP bm16 CoopTile qmm — staging-layout discrepancy (Phase 5)"),
     // Specific MPP-blocked qmm variants mismatch while the plain qmm_mma and
     // bm64 MPP path pass — a block-tiling-specific CoopTile detail.
-    ("qmm_mma_mpp", "MPP-blocked qmm: block-tiling-specific cooperative layout differs from the bm64/plain path (Phase 5)"),
-    ("_bm8_mpp", "MPP bm8 block tiling — cooperative layout detail (Phase 5)"),
-    ("_bm16_mpp", "MPP bm16 block tiling — cooperative layout detail (Phase 5)"),
 ];
 
 fn known_hard(name: &str) -> bool {
@@ -117,6 +117,16 @@ fn run_corpus_on_cuda() {
 
             let grid = setup.grid();
             let label = format!("{} [{dt}]", t.name());
+
+            // Debug: DUMP=<exact kernel name> prints its generated CUDA.
+            if let Ok(want) = std::env::var("DUMP") {
+                if t.name() == want && dt == DType::F32 {
+                    use metaltile_codegen::{CodegenBackend, CudaGenerator};
+                    if let Ok(src) = CudaGenerator::new().generate(kernel) {
+                        eprintln!("==== {} ====\n{src}\n==== end ====", t.name());
+                    }
+                }
+            }
 
             match dev.run_kernel(kernel, &buffers, grid.grid, grid.tpg) {
                 Ok(outputs) => {
