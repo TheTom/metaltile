@@ -773,36 +773,40 @@ impl CudaGenerator {
                 let base = coop_base(simd, m * n);
                 writeln!(out, "{pad}for (unsigned int _e = {sid}; _e < {}u; _e += {ssize}) _CTC_{nm}[{base} + _e] = 0.0f;", m * n).ok();
             }
-            Op::CoopTileLoadA { name, ptr_name, ptr_offset, dtype: _, eo, .. } => {
+            // Per Apple MPP headers: metal::extents<int, EI, EO> is {inner,
+            // outer}; with tensor_inline the leading-dim stride ld == EI (the
+            // inner extent), and the *descriptor flag* (ta/tb) — not the
+            // extents — chooses transpose. So stride = ei always.
+            Op::CoopTileLoadA { name, ptr_name, ptr_offset, dtype: _, ei, .. } => {
                 let (m, _, k, ta, _, _, _, simd) = self.coop_cfg(kernel, name)
                     .ok_or_else(|| Error::UnsupportedOp(format!("cuda: CoopTile `{name}` no Setup")))?;
                 let nm = ct_ident(name);
                 let (sid, ssize, _) = coop_scope(simd);
                 let base = coop_base(simd, m * k);
                 let off = ptr_offset.map(|o| self.vname(Some(o), block, ov)).unwrap_or_else(|| "0".into());
-                // A is m×k. Source-view orientation is encoded by the stride
-                // eo: eo==k → view m×k (non-transpose); eo==m → view k×m
-                // (transpose). Flag `ta` is the fallback when ambiguous.
-                let src = if coop_transpose(*eo, k, m, ta) {
-                    format!("(_e % {k}u) * {eo}u + (_e / {k}u)")
+                // A is m×k, leading dim ei. ta=false: ptr[i*ei+j]; ta=true:
+                // memory is k×m → ptr[j*ei+i]. (i=_e/k row, j=_e%k col.)
+                let src = if ta {
+                    format!("(_e % {k}u) * {ei}u + (_e / {k}u)")
                 } else {
-                    format!("(_e / {k}u) * {eo}u + (_e % {k}u)")
+                    format!("(_e / {k}u) * {ei}u + (_e % {k}u)")
                 };
                 writeln!(out, "{pad}__syncthreads();").ok();
                 writeln!(out, "{pad}for (unsigned int _e = {sid}; _e < {}u; _e += {ssize}) _CTA_{nm}[{base} + _e] = (float)({ptr_name}[{off} + {src}]);", m * k).ok();
             }
-            Op::CoopTileLoadB { name, ptr_name, ptr_offset, dtype: _, eo, .. } => {
+            Op::CoopTileLoadB { name, ptr_name, ptr_offset, dtype: _, ei, .. } => {
                 let (_, n, k, _, tb, _, _, simd) = self.coop_cfg(kernel, name)
                     .ok_or_else(|| Error::UnsupportedOp(format!("cuda: CoopTile `{name}` no Setup")))?;
                 let nm = ct_ident(name);
                 let (sid, ssize, _) = coop_scope(simd);
                 let base = coop_base(simd, k * n);
                 let off = ptr_offset.map(|o| self.vname(Some(o), block, ov)).unwrap_or_else(|| "0".into());
-                // B is k×n: eo==n → view k×n (non-transpose); eo==k → n×k.
-                let src = if coop_transpose(*eo, n, k, tb) {
-                    format!("(_e % {n}u) * {eo}u + (_e / {n}u)")
+                // B is k×n, leading dim ei. tb=false: ptr[i*ei+j]; tb=true:
+                // memory is n×k → ptr[j*ei+i]. (i=_e/n row, j=_e%n col.)
+                let src = if tb {
+                    format!("(_e % {n}u) * {ei}u + (_e / {n}u)")
                 } else {
-                    format!("(_e / {n}u) * {eo}u + (_e % {n}u)")
+                    format!("(_e / {n}u) * {ei}u + (_e % {n}u)")
                 };
                 writeln!(out, "{pad}for (unsigned int _e = {sid}; _e < {}u; _e += {ssize}) _CTB_{nm}[{base} + _e] = (float)({ptr_name}[{off} + {src}]);", k * n).ok();
             }
@@ -823,20 +827,17 @@ impl CudaGenerator {
                 writeln!(out, "{pad}}}").ok();
                 writeln!(out, "{pad}__syncthreads();").ok();
             }
-            Op::CoopTileStoreC { name, ptr_name, ptr_offset, dtype, eo, .. } => {
-                let (m, n, _, _, _, tc, _, simd) = self.coop_cfg(kernel, name)
+            Op::CoopTileStoreC { name, ptr_name, ptr_offset, dtype, ei, .. } => {
+                let (m, n, _, _, _, _, _, simd) = self.coop_cfg(kernel, name)
                     .ok_or_else(|| Error::UnsupportedOp(format!("cuda: CoopTile `{name}` no Setup")))?;
                 let nm = ct_ident(name);
                 let (sid, ssize, _) = coop_scope(simd);
                 let base = coop_base(simd, m * n);
                 let off = ptr_offset.map(|o| self.vname(Some(o), block, ov)).unwrap_or_else(|| "0".into());
                 let ty = cuda_type_name(*dtype);
-                // C is m×n: eo==n → view m×n (non-transpose); eo==m → n×m.
-                let dst = if coop_transpose(*eo, n, m, tc) {
-                    format!("(_e % {n}u) * {eo}u + (_e / {n}u)")
-                } else {
-                    format!("(_e / {n}u) * {eo}u + (_e % {n}u)")
-                };
+                // C is m×n, leading dim ei. No transpose_c in matmul2d.
+                let dst = format!("(_e / {n}u) * {ei}u + (_e % {n}u)");
+                let _ = m;
                 writeln!(out, "{pad}__syncthreads();").ok();
                 writeln!(out, "{pad}for (unsigned int _e = {sid}; _e < {}u; _e += {ssize}) {ptr_name}[{off} + {dst}] = ({ty})(_CTC_{nm}[{base} + _e]);", m * n).ok();
             }
@@ -1084,22 +1085,6 @@ fn coop_scope(simd: bool) -> (&'static str, &'static str, &'static str) {
 /// Base offset into a per-scope shared tile of `tile` elements.
 fn coop_base(simd: bool, tile: u32) -> String {
     if simd { format!("simd_group * {tile}u") } else { "0u".to_string() }
-}
-
-/// Decide whether a CoopTile operand load/store is transposed, from the
-/// source-view stride `eo`. The view is row-major with leading dim eo, so
-/// eo matches the *minor* dim of the source: `eo == non_t` → the natural
-/// (non-transposed) operand layout; `eo == t` → the transposed view. When
-/// both dims are equal (square tile) the stride is ambiguous, so fall back
-/// to the descriptor's explicit transpose `flag`.
-fn coop_transpose(eo: u32, non_t: u32, t: u32, flag: bool) -> bool {
-    if eo == t && eo != non_t {
-        true
-    } else if eo == non_t && eo != t {
-        false
-    } else {
-        flag
-    }
 }
 
 /// Does the kernel use any simdgroup-matrix op (drives the lane-coord

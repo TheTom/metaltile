@@ -54,14 +54,10 @@ const KNOWN_HARD: &[(&str, &str)] = &[
     ("fishspeech_conv1d", "fp8 conv1d: subtle decode/accumulate mismatch under investigation"),
     ("hadamard_m", "Hadamard transform: warp-shuffle xor pattern mismatch (active-mask / partial-warp semantics)"),
     ("gated_delta_prep_chunk", "GDN chunk prep: subtle simd/shared accumulation mismatch under investigation"),
-    // CoopTile NAX (Metal-4 neural-accelerator) cooperative ops: a distinct
-    // hardware tensor path, not the mpp::matmul2d our emulation replicates.
-    ("_nax", "NAX (Metal-4 neural-accelerator) cooperative op — distinct from mpp::matmul2d; needs its own lowering (Phase 5)"),
-    ("qmm_mma_mpp", "MPP CoopTile qmm: staging-layout discrepancy vs the (passing) simdgroup path — numerical debug needed (Phase 5)"),
-    ("_bm8_mpp", "MPP bm8 CoopTile qmm — staging-layout discrepancy (Phase 5)"),
-    ("_bm16_mpp", "MPP bm16 CoopTile qmm — staging-layout discrepancy (Phase 5)"),
-    // Specific MPP-blocked qmm variants mismatch while the plain qmm_mma and
-    // bm64 MPP path pass — a block-tiling-specific CoopTile detail.
+    // NAX SDPA-prefill at head_dim 128/256 only (d64 + all other NAX qmm now
+    // pass via the ei-stride CoopTile fix); a head-dim-specific tiling detail.
+    ("sdpa_prefill_nax_d128", "NAX SDPA prefill head_dim=128 — head-dim tiling detail"),
+    ("sdpa_prefill_nax_d256", "NAX SDPA prefill head_dim=256 — head-dim tiling detail"),
 ];
 
 fn known_hard(name: &str) -> bool {
