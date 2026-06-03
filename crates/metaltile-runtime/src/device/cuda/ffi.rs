@@ -31,6 +31,9 @@ pub const NVRTC_SUCCESS: nvrtcResult = 0;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
 
+// Function attribute: opt-in max dynamic shared memory (bytes) for >48KB.
+pub const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: c_int = 8;
+
 // CUDA 13 ships the driver symbols under their `_v2` (and similar) names;
 // the un-suffixed identifiers in cuda.h are preprocessor aliases. We bind
 // the actual exported symbols directly.
@@ -49,6 +52,7 @@ unsafe extern "C" {
         module: CUmodule,
         name: *const c_char,
     ) -> CUresult;
+    pub fn cuFuncSetAttribute(func: CUfunction, attrib: c_int, value: c_int) -> CUresult;
     pub fn cuMemAlloc_v2(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult;
     pub fn cuMemFree_v2(dptr: CUdeviceptr) -> CUresult;
     pub fn cuMemcpyHtoD_v2(dst: CUdeviceptr, src: *const c_void, byte_count: usize) -> CUresult;

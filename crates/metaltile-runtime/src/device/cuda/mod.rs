@@ -18,7 +18,7 @@ mod ffi;
 
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_void};
+use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 
 use metaltile_codegen::{CodegenBackend, CudaGenerator};
@@ -274,24 +274,38 @@ impl CudaDevice {
         block_threads: u32,
         args: &mut [*mut c_void],
     ) -> Result<(), MetalTileError> {
-        self.launch(func, [grid_blocks, 1, 1], [block_threads, 1, 1], args)
+        self.launch(func, [grid_blocks, 1, 1], [block_threads, 1, 1], 0, args)
     }
 
-    /// Launch `func` over a 3-D grid (blocks × threads-per-block).
+    /// Launch `func` over a 3-D grid (blocks × threads-per-block) with
+    /// `shared_bytes` of dynamic shared memory. For >48KB the function must
+    /// opt in via `cuFuncSetAttribute` first (GB10 allows up to ~99KB/block).
     pub fn launch(
         &self,
         func: CudaFunction,
         grid: [u32; 3],
         block: [u32; 3],
+        shared_bytes: u32,
         args: &mut [*mut c_void],
     ) -> Result<(), MetalTileError> {
+        if shared_bytes > 0 {
+            // Opt into the requested dynamic shared size (no-op effect if it
+            // is below the default cap; required above 48KB).
+            unsafe {
+                cuFuncSetAttribute(
+                    func.func,
+                    CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    shared_bytes as c_int,
+                )
+            };
+        }
         cu_check(
             unsafe {
                 cuLaunchKernel(
                     func.func,
                     grid[0], grid[1], grid[2],
                     block[0], block[1], block[2],
-                    0,
+                    shared_bytes,
                     ptr::null_mut(),
                     args.as_mut_ptr(),
                     ptr::null_mut(),
@@ -317,11 +331,12 @@ impl CudaDevice {
         block: [u32; 3],
     ) -> Result<BTreeMap<String, Vec<u8>>, MetalTileError> {
         // 1. IR → CUDA C++ → module.
-        let src = CudaGenerator::new()
-            .generate(kernel)
-            .map_err(|e| MetalTileError::Codegen(e))?;
+        let cg = CudaGenerator::new();
+        let src = cg.generate(kernel).map_err(|e| MetalTileError::Codegen(e))?;
         let module = self.compile(&src, &format!("{}.cu", kernel.name))?;
         let func = module.function(&kernel.name)?;
+        // Dynamic shared-memory size for this launch geometry.
+        let shared_bytes = cg.shared_bytes(kernel, block[0]) as u32;
 
         // 2. Allocate + upload each param buffer (in kernel.params order).
         //    Strided params are not yet supported by the emitter (it errors
@@ -373,8 +388,8 @@ impl CudaDevice {
             args.push(s.as_ptr() as *mut c_void);
         }
 
-        // 5. Launch.
-        self.launch(func, grid, block, &mut args)?;
+        // 5. Launch (with dynamic shared memory).
+        self.launch(func, grid, block, shared_bytes, &mut args)?;
 
         // 6. Read back outputs.
         let mut out = BTreeMap::new();

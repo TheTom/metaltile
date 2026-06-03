@@ -36,8 +36,8 @@ use std::fmt::Write as _;
 use metaltile_core::{
     dtype::DType,
     ir::{
-        ActKind, AtomicKind, BinOpKind, Block, IndexExpr, Kernel, KernelMode, Op, Param, ParamKind,
-        ReduceKind, UnaryOpKind, ValueId,
+        ActKind, AtomicKind, BinOpKind, Block, CoopTileAccMode, CoopTileScope, IndexExpr, Kernel,
+        KernelMode, Op, Param, ParamKind, ReduceKind, UnaryOpKind, ValueId,
     },
 };
 
@@ -278,26 +278,74 @@ impl CudaGenerator {
     /// Emit `__shared__` (ThreadgroupAlloc) and per-thread array (StackAlloc)
     /// declarations from every block, at function scope.
     fn emit_allocs(&self, kernel: &Kernel, out: &mut String) {
+        // Per-thread local arrays (registers/local mem), not shared.
+        for blk in std::iter::once(&kernel.body).chain(kernel.blocks.values()) {
+            for op in &blk.ops {
+                if let Op::StackAlloc { dtype, size, name } = op {
+                    writeln!(out, "    {} {name}[{size}];", cuda_type_name(*dtype)).ok();
+                }
+            }
+        }
+        // Shared arrays go in DYNAMIC shared memory, sized at runtime to the
+        // actual warp count (`_nw`) — avoids the 48KB static cap and the
+        // 32-warp over-allocation. Per-warp arrays (simdgroup tiles) are
+        // packed `_nw × per_warp`; threadgroup-scope arrays are sized once.
+        // The runtime sets cuFuncAttributeMaxDynamicSharedSize + passes the
+        // matching byte count (see `shared_bytes`).
+        let arrays = self.shared_arrays(kernel);
+        if arrays.is_empty() {
+            return;
+        }
+        writeln!(out, "    extern __shared__ unsigned char _smem[];").ok();
+        writeln!(out, "    const unsigned int _nw = (blockDim.x + 31u) / 32u;").ok();
+        writeln!(out, "    unsigned int _so = 0u;").ok();
+        for (name, ctype, count, per_warp, _bytes) in &arrays {
+            let wf = if *per_warp { "_nw" } else { "1u" };
+            writeln!(out, "    {ctype}* {name} = ({ctype}*)(_smem + _so);").ok();
+            writeln!(out, "    _so += {wf} * {count}u * sizeof({ctype});").ok();
+        }
+        writeln!(out, "    (void)_so;").ok();
+    }
+
+    /// The ordered shared-memory layout: (name, C type, element count,
+    /// per-warp?, element bytes). Drives both `emit_allocs` (pointer setup)
+    /// and `shared_bytes` (runtime size). Order MUST match between the two.
+    fn shared_arrays(&self, kernel: &Kernel) -> Vec<(String, &'static str, u32, bool, usize)> {
+        let mut v = Vec::new();
         for blk in std::iter::once(&kernel.body).chain(kernel.blocks.values()) {
             for (i, op) in blk.ops.iter().enumerate() {
                 match op {
                     Op::ThreadgroupAlloc { dtype, size, name } => {
-                        writeln!(out, "    __shared__ {} {name}[{size}];", cuda_type_name(*dtype)).ok();
+                        v.push((name.clone(), cuda_type_name(*dtype), *size, false, dtype.size_bytes()));
                     }
-                    Op::StackAlloc { dtype, size, name } => {
-                        writeln!(out, "    {} {name}[{size}];", cuda_type_name(*dtype)).ok();
-                    }
-                    // simdgroup_matrix<f32,8,8>: one 8×8 (=64) f32 tile per
-                    // warp, in shared memory (32 warps max per block).
                     Op::SimdgroupAlloc { .. } => {
-                        if let Some(Some(v)) = blk.results.get(i) {
-                            writeln!(out, "    __shared__ float {}[{}];", sgm_name(*v), 32 * 64).ok();
+                        if let Some(Some(vid)) = blk.results.get(i) {
+                            v.push((sgm_name(*vid), "float", 64, true, 4));
                         }
+                    }
+                    Op::CoopTileSetup { name, m, n, k, exec_scope, .. } => {
+                        let pw = matches!(exec_scope, CoopTileScope::SimdGroup);
+                        let nm = ct_ident(name);
+                        v.push((format!("_CTA_{nm}"), "float", m * k, pw, 4));
+                        v.push((format!("_CTB_{nm}"), "float", k * n, pw, 4));
+                        v.push((format!("_CTC_{nm}"), "float", m * n, pw, 4));
                     }
                     _ => {}
                 }
             }
         }
+        v
+    }
+
+    /// Total dynamic shared-memory bytes for a launch at `block_x` threads.
+    pub fn shared_bytes(&self, kernel: &Kernel, block_x: u32) -> usize {
+        let nw = block_x.div_ceil(32).max(1) as usize;
+        self.shared_arrays(kernel)
+            .iter()
+            .map(|(_, _, count, per_warp, bytes)| {
+                (if *per_warp { nw } else { 1 }) * (*count as usize) * *bytes
+            })
+            .sum()
     }
 
     /// Walk a block's ops, emitting each. `ov` carries name overrides from
@@ -677,6 +725,81 @@ impl CudaGenerator {
                 writeln!(out, "{pad}    {mc}[_bs + _sg_fm * 8u + _sg_fn1] = _acc1;").ok();
                 writeln!(out, "{pad}}}").ok();
             }
+            // ── CoopTile cooperative GEMM (MPP/NAX → software emulation) ──
+            // Opaque tiles (Load→Run→Store, no element access) → staged in
+            // shared memory with a self-consistent row-major layout. C
+            // persists across K-block Run calls (accumulate mode).
+            Op::CoopTileSetup { .. } => {} // tiles declared in emit_allocs
+            Op::CoopTileZero { name } => {
+                let (m, n, _, _, _, _, _, simd) = self.coop_cfg(kernel, name)
+                    .ok_or_else(|| Error::UnsupportedOp(format!("cuda: CoopTile `{name}` no Setup")))?;
+                let nm = ct_ident(name);
+                let (sid, ssize, _) = coop_scope(simd);
+                let base = coop_base(simd, m * n);
+                writeln!(out, "{pad}for (unsigned int _e = {sid}; _e < {}u; _e += {ssize}) _CTC_{nm}[{base} + _e] = 0.0f;", m * n).ok();
+            }
+            Op::CoopTileLoadA { name, ptr_name, ptr_offset, dtype: _, eo, .. } => {
+                let (m, _, k, ta, _, _, _, simd) = self.coop_cfg(kernel, name)
+                    .ok_or_else(|| Error::UnsupportedOp(format!("cuda: CoopTile `{name}` no Setup")))?;
+                let nm = ct_ident(name);
+                let (sid, ssize, sync) = coop_scope(simd);
+                let base = coop_base(simd, m * k);
+                let off = ptr_offset.map(|o| self.vname(Some(o), block, ov)).unwrap_or_else(|| "0".into());
+                let src = if ta {
+                    format!("(_e % {k}u) * {eo}u + (_e / {k}u)")
+                } else {
+                    format!("(_e / {k}u) * {eo}u + (_e % {k}u)")
+                };
+                writeln!(out, "{pad}{sync}").ok();
+                writeln!(out, "{pad}for (unsigned int _e = {sid}; _e < {}u; _e += {ssize}) _CTA_{nm}[{base} + _e] = (float)({ptr_name}[{off} + {src}]);", m * k).ok();
+            }
+            Op::CoopTileLoadB { name, ptr_name, ptr_offset, dtype: _, eo, .. } => {
+                let (_, n, k, _, tb, _, _, simd) = self.coop_cfg(kernel, name)
+                    .ok_or_else(|| Error::UnsupportedOp(format!("cuda: CoopTile `{name}` no Setup")))?;
+                let nm = ct_ident(name);
+                let (sid, ssize, _) = coop_scope(simd);
+                let base = coop_base(simd, k * n);
+                let off = ptr_offset.map(|o| self.vname(Some(o), block, ov)).unwrap_or_else(|| "0".into());
+                let src = if tb {
+                    format!("(_e % {n}u) * {eo}u + (_e / {n}u)")
+                } else {
+                    format!("(_e / {n}u) * {eo}u + (_e % {n}u)")
+                };
+                writeln!(out, "{pad}for (unsigned int _e = {sid}; _e < {}u; _e += {ssize}) _CTB_{nm}[{base} + _e] = (float)({ptr_name}[{off} + {src}]);", k * n).ok();
+            }
+            Op::CoopTileRun { name, .. } => {
+                let (m, n, k, _, _, _, accum, simd) = self.coop_cfg(kernel, name)
+                    .ok_or_else(|| Error::UnsupportedOp(format!("cuda: CoopTile `{name}` no Setup")))?;
+                let nm = ct_ident(name);
+                let (sid, ssize, sync) = coop_scope(simd);
+                let (ba, bb, bc) =
+                    (coop_base(simd, m * k), coop_base(simd, k * n), coop_base(simd, m * n));
+                writeln!(out, "{pad}{sync}").ok();
+                writeln!(out, "{pad}for (unsigned int _e = {sid}; _e < {}u; _e += {ssize}) {{", m * n).ok();
+                writeln!(out, "{pad}    unsigned int _i = _e / {n}u, _j = _e % {n}u;").ok();
+                let init = if accum { format!("_CTC_{nm}[{bc} + _e]") } else { "0.0f".into() };
+                writeln!(out, "{pad}    float _acc = {init};").ok();
+                writeln!(out, "{pad}    for (unsigned int _l = 0u; _l < {k}u; _l++) _acc += _CTA_{nm}[{ba} + _i * {k}u + _l] * _CTB_{nm}[{bb} + _l * {n}u + _j];").ok();
+                writeln!(out, "{pad}    _CTC_{nm}[{bc} + _e] = _acc;").ok();
+                writeln!(out, "{pad}}}").ok();
+                writeln!(out, "{pad}{sync}").ok();
+            }
+            Op::CoopTileStoreC { name, ptr_name, ptr_offset, dtype, eo, .. } => {
+                let (m, n, _, _, _, tc, _, simd) = self.coop_cfg(kernel, name)
+                    .ok_or_else(|| Error::UnsupportedOp(format!("cuda: CoopTile `{name}` no Setup")))?;
+                let nm = ct_ident(name);
+                let (sid, ssize, sync) = coop_scope(simd);
+                let base = coop_base(simd, m * n);
+                let off = ptr_offset.map(|o| self.vname(Some(o), block, ov)).unwrap_or_else(|| "0".into());
+                let ty = cuda_type_name(*dtype);
+                let dst = if tc {
+                    format!("(_e % {n}u) * {eo}u + (_e / {n}u)")
+                } else {
+                    format!("(_e / {n}u) * {eo}u + (_e % {n}u)")
+                };
+                writeln!(out, "{pad}{sync}").ok();
+                writeln!(out, "{pad}for (unsigned int _e = {sid}; _e < {}u; _e += {ssize}) {ptr_name}[{off} + {dst}] = ({ty})(_CTC_{nm}[{base} + _e]);", m * n).ok();
+            }
             // ── Control flow (nested-block recursion) ──────────────────
             Op::Loop { var, start, end, step, body } => {
                 let s = self.vname(Some(*start), block, ov);
@@ -760,6 +883,33 @@ impl CudaGenerator {
             writeln!(out, "{pad}    {result} = {buf}[0];").ok();
         }
         writeln!(out, "{pad}}}").ok();
+    }
+
+    /// Find the `CoopTileSetup` config for a named GEMM op:
+    /// (m, n, k, ta, tb, tc, accumulate, simdgroup_scope).
+    #[allow(clippy::type_complexity)]
+    fn coop_cfg(
+        &self,
+        kernel: &Kernel,
+        name: &str,
+    ) -> Option<(u32, u32, u32, bool, bool, bool, bool, bool)> {
+        for blk in std::iter::once(&kernel.body).chain(kernel.blocks.values()) {
+            for op in &blk.ops {
+                if let Op::CoopTileSetup {
+                    name: nm, m, n, k, ta, tb, tc, acc_mode, exec_scope, ..
+                } = op
+                {
+                    if nm == name {
+                        return Some((
+                            *m, *n, *k, *ta, *tb, *tc,
+                            matches!(acc_mode, CoopTileAccMode::MultiplyAccumulate),
+                            matches!(exec_scope, CoopTileScope::SimdGroup),
+                        ));
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn cuda_unary(&self, op: UnaryOpKind, arg: &str) -> String {
@@ -880,6 +1030,21 @@ fn reduce_combine(kind: ReduceKind, a: &str, b: &str) -> String {
 
 /// Per-warp shared-tile name for a simdgroup_matrix value.
 fn sgm_name(v: ValueId) -> String { format!("_SGM_{}", v.as_u32()) }
+
+/// Sanitize a CoopTile name into a valid C identifier suffix.
+fn ct_ident(name: &str) -> String {
+    name.chars().map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' }).collect()
+}
+
+/// Cooperative-scope iteration vars: (thread-id, scope-size, barrier).
+fn coop_scope(simd: bool) -> (&'static str, &'static str, &'static str) {
+    if simd { ("simd_lane", "32u", "__syncwarp();") } else { ("tid", "lsize", "__syncthreads();") }
+}
+
+/// Base offset into a per-scope shared tile of `tile` elements.
+fn coop_base(simd: bool, tile: u32) -> String {
+    if simd { format!("simd_group * {tile}u") } else { "0u".to_string() }
+}
 
 /// Does the kernel use any simdgroup-matrix op (drives the lane-coord
 /// preamble + shared tile allocation)?
