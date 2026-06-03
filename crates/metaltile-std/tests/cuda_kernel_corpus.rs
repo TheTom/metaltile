@@ -62,6 +62,7 @@ fn run_corpus_on_cuda() {
     let (mut pass, mut mismatch, mut unsupported, mut error) = (0u32, 0u32, 0u32, 0u32);
     let mut hard_failures: Vec<String> = Vec::new();
     let mut pass_names: Vec<String> = Vec::new();
+    let mut unsup_reasons: BTreeMap<String, u32> = BTreeMap::new();
 
     for entry in metaltile_std::all_tests() {
         let t = entry.test();
@@ -73,6 +74,7 @@ fn run_corpus_on_cuda() {
             // GPU-vs-GPU reference setups need two dispatches; skip for now.
             if setup.ref_setup().is_some() {
                 unsupported += 1;
+                *unsup_reasons.entry("ref_setup (GPU-vs-GPU)".into()).or_default() += 1;
                 continue;
             }
 
@@ -113,6 +115,17 @@ fn run_corpus_on_cuda() {
                     let msg = e.to_string();
                     if is_unsupported(&msg) {
                         unsupported += 1;
+                        // Bucket by the short reason (first line / key phrase).
+                        let reason = msg
+                            .lines()
+                            .next()
+                            .unwrap_or("?")
+                            .split(';')
+                            .next()
+                            .unwrap_or("?")
+                            .trim()
+                            .to_string();
+                        *unsup_reasons.entry(reason).or_default() += 1;
                     } else {
                         error += 1;
                         hard_failures.push(format!("ERROR {label}: {msg}"));
@@ -124,6 +137,12 @@ fn run_corpus_on_cuda() {
 
     eprintln!("\n=== CUDA corpus result ===");
     eprintln!("PASS={pass}  MISMATCH={mismatch}  UNSUPPORTED={unsupported}  ERROR={error}");
+    eprintln!("--- unsupported reasons (top buckets) ---");
+    let mut reasons: Vec<_> = unsup_reasons.iter().collect();
+    reasons.sort_by(|a, b| b.1.cmp(a.1));
+    for (reason, n) in reasons.iter().take(25) {
+        eprintln!("  {n:>5}  {reason}");
+    }
     eprintln!("--- passing kernels ---");
     for n in &pass_names {
         eprintln!("  ✓ {n}");
