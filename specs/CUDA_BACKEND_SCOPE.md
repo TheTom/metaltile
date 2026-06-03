@@ -29,6 +29,32 @@ not just theoretical. NOTE: Spark not yet in `~/.ssh/config`/hosts on this Mac �
 
 ---
 
+## 0b. Status snapshot (latest)
+
+**CUDA backend runs the real registered `#[test_kernel]` corpus on GX10 (sm_121):
+`PASS=3127, MISMATCH=0, ERROR=0`** — every non-cooperative-matrix kernel passes
+bit-accurately against the same CPU oracle the Metal harness uses (`tests/
+cuda_kernel_corpus.rs`). ~76% of the full corpus. Covered:
+- Modes: Elementwise, Reduction, Grid3D
+- Ops: const/binop/unary/cast/fma/select; load/store/gather/scatter; program-id;
+  reduce + stride-reduce (incl. **transform chain + secondary_src = gemv/qgemv**);
+  control flow (**Loop/If** with nested-block recursion); mutable **locals**;
+  **activations** (silu/gelu/relu/sigmoid/tanh); **quant decode** (e2m1/e4m3/e5m2/
+  int8 — all block-scaled incl. NVFP4); threadgroup/stack **shared memory** +
+  warp shuffles (broadcast/xor) + barriers; **atomics**; cross-kernel **inlining**.
+- Runtime: `CudaDevice` (NVRTC + Driver API), generic `run_kernel` dispatch,
+  `cuda` feature, `build.rs`.
+
+**Remaining ~990 unsupported = the cooperative-matrix MMA path** (`CoopTile*`,
+`Simdgroup*`-matrix, `SimdGroup2D` mode, MPP/NAX). This is spec **Phase 3 (wmma
+re-tiling)** + **Phase 5 (CUTLASS for MPP/NAX)** — the hardware-cooperative
+matmul subsystem, explicitly scoped as multi-week work needing bit-accurate
+fragment layouts. Not yet implemented. Tiny tail: SimdScan (6), Strided params
+(3), `KNOWN_HARD=45` (documented mismatches: mhc-sinkhorn SSA-shadow, col/seg-
+reduce axis lowering, hadamard warp-xor, nax cooperative, fishspeech conv1d).
+
+---
+
 ## 1. The two seams (grounded in current code)
 
 Today there is **no backend abstraction** — both layers are concrete Metal:
