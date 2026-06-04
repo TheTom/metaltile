@@ -107,36 +107,66 @@ pub fn mt_row_reduce_min<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32)
 // run by a single thread and already folds the whole column. A
 // `reduce_sum` here would lower to `simd_sum` and wrongly sum 32
 // independent columns together.
-//
-// The four ops share one body; the outer `macro_rules!` wraps the
-// whole `#[kernel]` declaration so the proc-macro sees concrete tokens
-// (an inner macro inside the body would silently emit no IR — see
-// docs/developing.md kernel-authoring hazards).
 
-#[rustfmt::skip]
-macro_rules! col_reduce_kernel {
-    ($name:ident, $reduce_op:ident, $subop:literal) => {
-        #[kernel]
-        pub fn $name<T>(
-            inp: Tensor<T>,
-            out: Tensor<T>,
-            #[constexpr] rows: u32,
-            #[constexpr] cols: u32,
-        ) {
-            let col = program_id::<0>();
-            if col < cols {
-                let end = rows * cols;
-                let acc = strided_reduce(inp, col, cols, end, $reduce_op);
-                store(out[col], acc.cast::<T>());
-            }
-        }
-    };
+#[kernel]
+pub fn mt_col_reduce<T>(
+    inp: Tensor<T>,
+    out: Tensor<T>,
+    #[constexpr] rows: u32,
+    #[constexpr] cols: u32,
+) {
+    let col = program_id::<0>();
+    if col < cols {
+        let end = rows * cols;
+        let acc = strided_reduce(inp, col, cols, end, sum);
+        store(out[col], acc.cast::<T>());
+    }
 }
 
-col_reduce_kernel!(mt_col_reduce, sum, "sum");
-col_reduce_kernel!(mt_col_reduce_prod, product, "prod");
-col_reduce_kernel!(mt_col_reduce_max, max, "max");
-col_reduce_kernel!(mt_col_reduce_min, min, "min");
+#[kernel]
+pub fn mt_col_reduce_prod<T>(
+    inp: Tensor<T>,
+    out: Tensor<T>,
+    #[constexpr] rows: u32,
+    #[constexpr] cols: u32,
+) {
+    let col = program_id::<0>();
+    if col < cols {
+        let end = rows * cols;
+        let acc = strided_reduce(inp, col, cols, end, product);
+        store(out[col], acc.cast::<T>());
+    }
+}
+
+#[kernel]
+pub fn mt_col_reduce_max<T>(
+    inp: Tensor<T>,
+    out: Tensor<T>,
+    #[constexpr] rows: u32,
+    #[constexpr] cols: u32,
+) {
+    let col = program_id::<0>();
+    if col < cols {
+        let end = rows * cols;
+        let acc = strided_reduce(inp, col, cols, end, max);
+        store(out[col], acc.cast::<T>());
+    }
+}
+
+#[kernel]
+pub fn mt_col_reduce_min<T>(
+    inp: Tensor<T>,
+    out: Tensor<T>,
+    #[constexpr] rows: u32,
+    #[constexpr] cols: u32,
+) {
+    let col = program_id::<0>();
+    if col < cols {
+        let end = rows * cols;
+        let acc = strided_reduce(inp, col, cols, end, min);
+        store(out[col], acc.cast::<T>());
+    }
+}
 
 // ── Segmented reduce ─────────────────────────────────────────────────────
 //
@@ -151,33 +181,69 @@ col_reduce_kernel!(mt_col_reduce_min, min, "min");
 // threadgroup-per-row form under-occupies the GPU (most lanes idle),
 // whereas one thread per segment keeps every lane busy.
 
-#[rustfmt::skip]
-macro_rules! seg_reduce_kernel {
-    ($name:ident, $reduce_op:ident, $subop:literal) => {
-        #[kernel]
-        pub fn $name<T>(
-            inp: Tensor<T>,
-            out: Tensor<T>,
-            #[constexpr] n_segments: u32,
-            #[constexpr] seg_len: u32,
-        ) {
-            let seg = program_id::<0>();
-            if seg < n_segments {
-                let start = seg * seg_len;
-                let end = start + seg_len;
-                // Grid3D: one thread folds the whole segment — no
-                // `reduce_*` finishing step (see col-reduce note above).
-                let acc = strided_reduce(inp, start, 1u32, end, $reduce_op);
-                store(out[seg], acc.cast::<T>());
-            }
-        }
-    };
+#[kernel]
+pub fn mt_seg_reduce<T>(
+    inp: Tensor<T>,
+    out: Tensor<T>,
+    #[constexpr] n_segments: u32,
+    #[constexpr] seg_len: u32,
+) {
+    let seg = program_id::<0>();
+    if seg < n_segments {
+        let start = seg * seg_len;
+        let end = start + seg_len;
+        let acc = strided_reduce(inp, start, 1u32, end, sum);
+        store(out[seg], acc.cast::<T>());
+    }
 }
 
-seg_reduce_kernel!(mt_seg_reduce, sum, "sum");
-seg_reduce_kernel!(mt_seg_reduce_prod, product, "prod");
-seg_reduce_kernel!(mt_seg_reduce_max, max, "max");
-seg_reduce_kernel!(mt_seg_reduce_min, min, "min");
+#[kernel]
+pub fn mt_seg_reduce_prod<T>(
+    inp: Tensor<T>,
+    out: Tensor<T>,
+    #[constexpr] n_segments: u32,
+    #[constexpr] seg_len: u32,
+) {
+    let seg = program_id::<0>();
+    if seg < n_segments {
+        let start = seg * seg_len;
+        let end = start + seg_len;
+        let acc = strided_reduce(inp, start, 1u32, end, product);
+        store(out[seg], acc.cast::<T>());
+    }
+}
+
+#[kernel]
+pub fn mt_seg_reduce_max<T>(
+    inp: Tensor<T>,
+    out: Tensor<T>,
+    #[constexpr] n_segments: u32,
+    #[constexpr] seg_len: u32,
+) {
+    let seg = program_id::<0>();
+    if seg < n_segments {
+        let start = seg * seg_len;
+        let end = start + seg_len;
+        let acc = strided_reduce(inp, start, 1u32, end, max);
+        store(out[seg], acc.cast::<T>());
+    }
+}
+
+#[kernel]
+pub fn mt_seg_reduce_min<T>(
+    inp: Tensor<T>,
+    out: Tensor<T>,
+    #[constexpr] n_segments: u32,
+    #[constexpr] seg_len: u32,
+) {
+    let seg = program_id::<0>();
+    if seg < n_segments {
+        let start = seg * seg_len;
+        let end = start + seg_len;
+        let acc = strided_reduce(inp, start, 1u32, end, min);
+        store(out[seg], acc.cast::<T>());
+    }
+}
 
 /// New-syntax correctness for the reduce family.
 ///
@@ -505,19 +571,19 @@ pub mod kernel_benches {
             )
     }
 
-    #[bench(name = "mlx/all_reduce/sum", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_all_sum(dt: DType) -> BenchSetup {
         all_ref(mt_all_reduce::kernel_ir_for(dt), dt, "sum", 256.0, true)
     }
-    #[bench(name = "mlx/all_reduce/prod", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_all_prod(dt: DType) -> BenchSetup {
         all_ref(mt_all_reduce_prod::kernel_ir_for(dt), dt, "prod", 1024.0, false)
     }
-    #[bench(name = "mlx/all_reduce/max", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_all_max(dt: DType) -> BenchSetup {
         all_ref(mt_all_reduce_max::kernel_ir_for(dt), dt, "max", 0.0, false)
     }
-    #[bench(name = "mlx/all_reduce/min", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_all_min(dt: DType) -> BenchSetup {
         all_ref(mt_all_reduce_min::kernel_ir_for(dt), dt, "min", 0.0, false)
     }
@@ -555,19 +621,19 @@ pub mod kernel_benches {
             )
     }
 
-    #[bench(name = "mlx/row_reduce/sum", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_row_sum(dt: DType) -> BenchSetup {
         row_ref(mt_row_reduce::kernel_ir_for(dt), dt, "sum", 128.0)
     }
-    #[bench(name = "mlx/row_reduce/prod", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_row_prod(dt: DType) -> BenchSetup {
         row_ref(mt_row_reduce_prod::kernel_ir_for(dt), dt, "prod", 32.0)
     }
-    #[bench(name = "mlx/row_reduce/max", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_row_max(dt: DType) -> BenchSetup {
         row_ref(mt_row_reduce_max::kernel_ir_for(dt), dt, "max", 0.0)
     }
-    #[bench(name = "mlx/row_reduce/min", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_row_min(dt: DType) -> BenchSetup {
         row_ref(mt_row_reduce_min::kernel_ir_for(dt), dt, "min", 0.0)
     }
@@ -585,13 +651,13 @@ pub mod kernel_benches {
             .bytes_moved((rows * cols * dt.size_bytes()) as u64)
     }
 
-    #[bench(name = "mlx/col_reduce/sum", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_col_sum(dt: DType) -> BenchSetup { col_b(mt_col_reduce::kernel_ir_for(dt), dt) }
-    #[bench(name = "mlx/col_reduce/prod", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_col_prod(dt: DType) -> BenchSetup { col_b(mt_col_reduce_prod::kernel_ir_for(dt), dt) }
-    #[bench(name = "mlx/col_reduce/max", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_col_max(dt: DType) -> BenchSetup { col_b(mt_col_reduce_max::kernel_ir_for(dt), dt) }
-    #[bench(name = "mlx/col_reduce/min", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_col_min(dt: DType) -> BenchSetup { col_b(mt_col_reduce_min::kernel_ir_for(dt), dt) }
 
     // seg-reduce: Grid3D, one thread per contiguous segment.
@@ -607,12 +673,12 @@ pub mod kernel_benches {
             .bytes_moved((n_segments * seg_len * dt.size_bytes()) as u64)
     }
 
-    #[bench(name = "mlx/seg_reduce/sum", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_seg_sum(dt: DType) -> BenchSetup { seg_b(mt_seg_reduce::kernel_ir_for(dt), dt) }
-    #[bench(name = "mlx/seg_reduce/prod", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_seg_prod(dt: DType) -> BenchSetup { seg_b(mt_seg_reduce_prod::kernel_ir_for(dt), dt) }
-    #[bench(name = "mlx/seg_reduce/max", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_seg_max(dt: DType) -> BenchSetup { seg_b(mt_seg_reduce_max::kernel_ir_for(dt), dt) }
-    #[bench(name = "mlx/seg_reduce/min", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_seg_min(dt: DType) -> BenchSetup { seg_b(mt_seg_reduce_min::kernel_ir_for(dt), dt) }
 }

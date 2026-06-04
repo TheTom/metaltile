@@ -516,7 +516,7 @@ pub mod kernel_benches {
     fn n_freq() -> usize { N_FFT / 2 + 1 }
     fn n_samples() -> usize { (N_FRAMES - 1) * HOP + N_FFT }
 
-    #[bench(name = "ffai/mel_spectrogram/mel_spectrogram", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mel_spectrogram(dt: DType) -> BenchSetup {
         let n_out = N_FRAMES * N_MELS;
         BenchSetup::new(mel_spectrogram::kernel_ir_for(dt))
@@ -540,7 +540,7 @@ pub mod kernel_benches {
             .flops((n_out as u64) * (n_freq() as u64) * (N_FFT as u64) * 4)
     }
 
-    #[bench(name = "ffai/mel_spectrogram/stft_window", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mel_stft_window(dt: DType) -> BenchSetup {
         let n = N_FRAMES * N_FFT;
         BenchSetup::new(mel_stft_window::kernel_ir_for(dt))
@@ -556,7 +556,7 @@ pub mod kernel_benches {
             .bytes_moved((2 * n * dt.size_bytes()) as u64)
     }
 
-    #[bench(name = "ffai/mel_spectrogram/filterbank", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mel_filterbank(dt: DType) -> BenchSetup {
         let n_out = N_FRAMES * N_MELS;
         BenchSetup::new(mel_filterbank::kernel_ir_for(dt))
@@ -574,7 +574,7 @@ pub mod kernel_benches {
             .bytes_moved((n_out * dt.size_bytes()) as u64)
     }
 
-    #[bench(name = "ffai/mel_spectrogram/mel_spectrogram_magnitude", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mel_spectrogram_magnitude(dt: DType) -> BenchSetup {
         let (n_fft, n_mels, hop_length, n_frames) = (400usize, 80usize, 160usize, 100usize);
         let n_freq = n_fft / 2 + 1;
