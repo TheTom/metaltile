@@ -51,8 +51,6 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 const KNOWN_HARD: &[(&str, &str)] = &[
     // f32-only, ~3× over a tight 2e-2 tol; error grows with head_dim
     // (flash-attention accumulation over K=head_dim). d64 + all f16/bf16 pass.
-    ("sdpa_prefill_nax_d128", "NAX flash-attn d128 [f32]: accumulation drift over head_dim K-tiles"),
-    ("sdpa_prefill_nax_d256", "NAX flash-attn d256 [f32]: accumulation drift over head_dim K-tiles"),
 ];
 
 fn known_hard(name: &str) -> bool {

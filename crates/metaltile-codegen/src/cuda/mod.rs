@@ -372,6 +372,7 @@ impl CudaGenerator {
     /// and `shared_bytes` (runtime size). Order MUST match between the two.
     fn shared_arrays(&self, kernel: &Kernel) -> Vec<(String, &'static str, u32, bool, usize)> {
         let mut v = Vec::new();
+        let mut seen_c: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for blk in std::iter::once(&kernel.body).chain(kernel.blocks.values()) {
             for (i, op) in blk.ops.iter().enumerate() {
                 match op {
@@ -388,7 +389,14 @@ impl CudaGenerator {
                         let nm = ct_ident(name);
                         v.push((format!("_CTA_{nm}"), "float", m * k, pw, 4));
                         v.push((format!("_CTB_{nm}"), "float", k * n, pw, 4));
-                        v.push((format!("_CTC_{nm}"), "float", m * n, pw, 4));
+                        // C is the persistent accumulator: an `*_acc`
+                        // (multiply-accumulate) setup SHARES its C with the
+                        // base setup (e.g. qk_acc accumulates onto qk's C),
+                        // so the C tile is declared once per c-group.
+                        let cnm = ct_ident(&coop_c_name(name));
+                        if seen_c.insert(cnm.clone()) {
+                            v.push((format!("_CTC_{cnm}"), "float", m * n, pw, 4));
+                        }
                     }
                     _ => {}
                 }
@@ -828,10 +836,10 @@ impl CudaGenerator {
             Op::CoopTileZero { name } => {
                 let (m, n, _, _, _, _, _, simd) = self.coop_cfg(kernel, name)
                     .ok_or_else(|| Error::UnsupportedOp(format!("cuda: CoopTile `{name}` no Setup")))?;
-                let nm = ct_ident(name);
+                let cnm = ct_ident(&coop_c_name(name));
                 let (sid, ssize, _) = coop_scope(simd);
                 let base = coop_base(simd, m * n);
-                writeln!(out, "{pad}for (unsigned int _e = {sid}; _e < {}u; _e += {ssize}) _CTC_{nm}[{base} + _e] = 0.0f;", m * n).ok();
+                writeln!(out, "{pad}for (unsigned int _e = {sid}; _e < {}u; _e += {ssize}) _CTC_{cnm}[{base} + _e] = 0.0f;", m * n).ok();
             }
             // Per Apple MPP headers: metal::extents<int, EI, EO> is {inner,
             // outer}; with tensor_inline the leading-dim stride ld == EI (the
@@ -874,23 +882,24 @@ impl CudaGenerator {
                 let (m, n, k, _, _, _, accum, simd) = self.coop_cfg(kernel, name)
                     .ok_or_else(|| Error::UnsupportedOp(format!("cuda: CoopTile `{name}` no Setup")))?;
                 let nm = ct_ident(name);
+                let cnm = ct_ident(&coop_c_name(name)); // shared C accumulator
                 let (sid, ssize, _) = coop_scope(simd);
                 let (ba, bb, bc) =
                     (coop_base(simd, m * k), coop_base(simd, k * n), coop_base(simd, m * n));
                 writeln!(out, "{pad}__syncthreads();").ok();
                 writeln!(out, "{pad}for (unsigned int _e = {sid}; _e < {}u; _e += {ssize}) {{", m * n).ok();
                 writeln!(out, "{pad}    unsigned int _i = _e / {n}u, _j = _e % {n}u;").ok();
-                let init = if accum { format!("_CTC_{nm}[{bc} + _e]") } else { "0.0f".into() };
+                let init = if accum { format!("_CTC_{cnm}[{bc} + _e]") } else { "0.0f".into() };
                 writeln!(out, "{pad}    float _acc = {init};").ok();
                 writeln!(out, "{pad}    for (unsigned int _l = 0u; _l < {k}u; _l++) _acc += _CTA_{nm}[{ba} + _i * {k}u + _l] * _CTB_{nm}[{bb} + _l * {n}u + _j];").ok();
-                writeln!(out, "{pad}    _CTC_{nm}[{bc} + _e] = _acc;").ok();
+                writeln!(out, "{pad}    _CTC_{cnm}[{bc} + _e] = _acc;").ok();
                 writeln!(out, "{pad}}}").ok();
                 writeln!(out, "{pad}__syncthreads();").ok();
             }
             Op::CoopTileStoreC { name, ptr_name, ptr_offset, dtype, ei, .. } => {
                 let (m, n, _, _, _, _, _, simd) = self.coop_cfg(kernel, name)
                     .ok_or_else(|| Error::UnsupportedOp(format!("cuda: CoopTile `{name}` no Setup")))?;
-                let nm = ct_ident(name);
+                let cnm = ct_ident(&coop_c_name(name));
                 let (sid, ssize, _) = coop_scope(simd);
                 let base = coop_base(simd, m * n);
                 let off = ptr_offset.map(|o| self.vname(Some(o), block, ov)).unwrap_or_else(|| "0".into());
@@ -899,7 +908,7 @@ impl CudaGenerator {
                 let dst = format!("(_e / {n}u) * {ei}u + (_e % {n}u)");
                 let _ = m;
                 writeln!(out, "{pad}__syncthreads();").ok();
-                writeln!(out, "{pad}for (unsigned int _e = {sid}; _e < {}u; _e += {ssize}) {ptr_name}[{off} + {dst}] = ({ty})(_CTC_{nm}[{base} + _e]);", m * n).ok();
+                writeln!(out, "{pad}for (unsigned int _e = {sid}; _e < {}u; _e += {ssize}) {ptr_name}[{off} + {dst}] = ({ty})(_CTC_{cnm}[{base} + _e]);", m * n).ok();
             }
             // ── Control flow (nested-block recursion) ──────────────────
             Op::Loop { var, start, end, step, body } => {
@@ -1139,6 +1148,13 @@ fn kernel_has_reduce(kernel: &Kernel) -> bool {
 
 /// Per-warp shared-tile name for a simdgroup_matrix value.
 fn sgm_name(v: ValueId) -> String { format!("_SGM_{}", v.as_u32()) }
+
+/// The C-accumulator group name for a CoopTile setup: a `*_acc`
+/// (multiply-accumulate) setup shares its C tile with the base setup
+/// (e.g. `qk_acc` accumulates onto `qk`'s C across head_dim chunks).
+fn coop_c_name(name: &str) -> String {
+    name.strip_suffix("_acc").unwrap_or(name).to_string()
+}
 
 /// Sanitize a CoopTile name into a valid C identifier suffix.
 fn ct_ident(name: &str) -> String {
