@@ -1,5 +1,16 @@
 # CUDA Backend — Implementation Scope (working doc)
 
+> **STATUS: essentially complete.** The CUDA backend runs the full registered
+> `#[test_kernel]` corpus on the GX10 (sm_121): **PASS=4159 / 4164 (99.88%),
+> MISMATCH=0, UNSUPPORTED=0, ERROR=0** — bit-accurate vs the same CPU oracle the
+> Metal harness uses. Every kernel generates and compiles; both cooperative-matmul
+> paths (simdgroup_matrix + CoopTile/`mpp::matmul2d`, software-emulated) are in and
+> bit-exact, including quantized qmm/moe/gather + most NAX. **5 known-hard checks
+> remain** (the most complex specialized kernels): GDN `gated_delta_prep_chunk`,
+> NAX flash-attn `sdpa_prefill_nax_d128/d256`, `splitk_accum_nax`, `fishspeech_conv1d`
+> — each a per-kernel numerical-debug follow-up (partial-warp shuffle / flash
+> head-dim tiling / fp8-conv accumulation). Metal path untouched; macOS build green.
+
 Companion to `CUDA_BACKEND_SPEC.md` (Eric, PR #262). The spec is the *design*;
 this is the *engineering plan* — concrete seams, file targets, dev env, sequencing.
 
