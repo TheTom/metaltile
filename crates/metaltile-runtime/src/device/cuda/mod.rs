@@ -171,8 +171,12 @@ pub struct CudaDevice {
 
 // The context is current on this struct's lifetime; we keep it single-
 // device, single-context (Phase 1). Send is sound because we never share
-// the raw pointers across threads concurrently in the smoke path.
+// the raw pointers across threads concurrently in the smoke path. Sync is
+// sound for serialized submission (a higher layer holds the device in an
+// `Arc` to keep its context alive for persistent buffers; GPU work is
+// submitted from one logical owner at a time).
 unsafe impl Send for CudaDevice {}
+unsafe impl Sync for CudaDevice {}
 
 impl CudaDevice {
     /// Initialize CUDA, grab device 0, create a context. Returns `Ok(None)`
@@ -317,6 +321,52 @@ impl CudaDevice {
         }
         cu_check(
             unsafe { cuMemcpyDtoH_v2(out.as_mut_ptr() as *mut c_void, buf.ptr, n) },
+            "cuMemcpyDtoH",
+        )
+    }
+
+    /// Allocate `len` bytes, returning the raw device pointer. The caller
+    /// owns the allocation and must free it via [`free_raw`]. Unlike
+    /// [`alloc`], this returns a plain pointer with no borrow of the device,
+    /// so a higher layer (e.g. the ffai engine) can build persistent device
+    /// tensors that outlive any single call — it just has to keep the
+    /// `CudaDevice` (hence its context) alive while the pointers are live.
+    ///
+    /// [`free_raw`]: CudaDevice::free_raw
+    pub fn alloc_raw(&self, len: usize) -> Result<CUdeviceptr, MetalTileError> {
+        if len == 0 {
+            return Ok(0);
+        }
+        let mut ptr: CUdeviceptr = 0;
+        cu_check(unsafe { cuMemAlloc_v2(&mut ptr, len) }, "cuMemAlloc")?;
+        Ok(ptr)
+    }
+
+    /// Free a pointer returned by [`alloc_raw`]. No-op on a null pointer.
+    pub fn free_raw(&self, ptr: CUdeviceptr) {
+        if ptr != 0 {
+            unsafe { cuMemFree_v2(ptr) };
+        }
+    }
+
+    /// Copy host bytes into an existing device allocation (host→device).
+    pub fn htod(&self, ptr: CUdeviceptr, bytes: &[u8]) -> Result<(), MetalTileError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        cu_check(
+            unsafe { cuMemcpyHtoD_v2(ptr, bytes.as_ptr() as *const c_void, bytes.len()) },
+            "cuMemcpyHtoD",
+        )
+    }
+
+    /// Copy device memory back to a host slice (device→host).
+    pub fn dtoh(&self, ptr: CUdeviceptr, out: &mut [u8]) -> Result<(), MetalTileError> {
+        if out.is_empty() {
+            return Ok(());
+        }
+        cu_check(
+            unsafe { cuMemcpyDtoH_v2(out.as_mut_ptr() as *mut c_void, ptr, out.len()) },
             "cuMemcpyDtoH",
         )
     }
