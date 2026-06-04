@@ -49,13 +49,10 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 /// remaining pure-DSL gaps (distinct from the cooperative/MMA backlog).
 /// A failure NOT matching one of these is a regression and fails the test.
 const KNOWN_HARD: &[(&str, &str)] = &[
-    ("splitk_accum_nax", "NAX (Metal-4 neural-accelerator) cooperative path — Phase 5 (CUTLASS)"),
-    ("fishspeech_conv1d", "fp8 conv1d: subtle decode/accumulate mismatch under investigation"),
-    ("gated_delta_prep_chunk", "GDN chunk prep: subtle simd/shared accumulation mismatch under investigation"),
-    // NAX SDPA-prefill at head_dim 128/256 only (d64 + all other NAX qmm now
-    // pass via the ei-stride CoopTile fix); a head-dim-specific tiling detail.
-    ("sdpa_prefill_nax_d128", "NAX SDPA prefill head_dim=128 — head-dim tiling detail"),
-    ("sdpa_prefill_nax_d256", "NAX SDPA prefill head_dim=256 — head-dim tiling detail"),
+    // f32-only, ~3× over a tight 2e-2 tol; error grows with head_dim
+    // (flash-attention accumulation over K=head_dim). d64 + all f16/bf16 pass.
+    ("sdpa_prefill_nax_d128", "NAX flash-attn d128 [f32]: accumulation drift over head_dim K-tiles"),
+    ("sdpa_prefill_nax_d256", "NAX flash-attn d256 [f32]: accumulation drift over head_dim K-tiles"),
 ];
 
 fn known_hard(name: &str) -> bool {

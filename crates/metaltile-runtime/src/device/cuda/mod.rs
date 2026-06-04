@@ -208,7 +208,12 @@ impl CudaDevice {
             .or_else(|_| std::env::var("CUDA_HOME"))
             .unwrap_or_else(|_| "/usr/local/cuda".to_string());
         let inc = CString::new(format!("--include-path={cuda_root}/include")).unwrap();
-        let opts: [*const c_char; 2] = [arch.as_ptr(), inc.as_ptr()];
+        // Disable contraction of `a*b+c` into FMA: the CPU oracle uses
+        // non-fused IEEE arithmetic, so default FMA fusion drifts in
+        // accumulation-heavy kernels (conv, attention, recurrence). Matching
+        // the oracle's rounding tightens bit-accuracy.
+        let fmad = CString::new("--fmad=false").unwrap();
+        let opts: [*const c_char; 3] = [arch.as_ptr(), inc.as_ptr(), fmad.as_ptr()];
         let compile_res = unsafe { nvrtcCompileProgram(prog, opts.len() as _, opts.as_ptr()) };
 
         // Always fetch the log — it carries the actual compiler diagnostics.

@@ -156,15 +156,18 @@ impl TargetProfile {
                 Erf => "erf", ErfInv => "erfinv",
                 DecodeE2m1 | DecodeE4m3 | DecodeE5m2 | DecodeInt8 => "/*decode-helper*/",
             },
-            // CUDA fast-math device intrinsics (single-precision `f` suffix).
-            // bf16/half consumers cast to f32 around these (spec §6 arch gating).
+            // CUDA *precise* device math (single-precision `f` suffix) — NOT
+            // the `__`-prefixed fast-math intrinsics: the CPU oracle is IEEE,
+            // and fast-math's multi-ULP error compounds in accumulation-heavy
+            // / gain-sensitive kernels (recurrences, softplus). Precision over
+            // speed for bit-accuracy (perf retune is a later pass).
             Target::Cuda => match op {
-                Exp => "__expf", Exp2 => "exp2f", Expm1 => "expm1f",
-                Log => "__logf", Log2 => "log2f", Log10 => "log10f",
+                Exp => "expf", Exp2 => "exp2f", Expm1 => "expm1f",
+                Log => "logf", Log2 => "log2f", Log10 => "log10f",
                 Sqrt => "sqrtf", Rsqrt => "rsqrtf", Recip => "__frcp_rn",
                 Abs => "fabsf", Neg => "-", Ceil => "ceilf", Floor => "floorf",
                 Round => "roundf", Trunc => "truncf", Sign => "copysignf",
-                Sin => "__sinf", Cos => "__cosf", Tan => "tanf",
+                Sin => "sinf", Cos => "cosf", Tan => "tanf",
                 Asin => "asinf", Acos => "acosf", Atan => "atanf",
                 Sinh => "sinhf", Cosh => "coshf",
                 Asinh => "asinhf", Acosh => "acoshf", Atanh => "atanhf",

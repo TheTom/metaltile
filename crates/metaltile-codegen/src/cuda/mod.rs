@@ -91,9 +91,9 @@ __device__ __forceinline__ float mt_decode_int8(unsigned int bits) {
 }
 
 // Neural activations (ported from msl/preamble.rs).
-__device__ __forceinline__ float mt_silu(float x) { return x / (1.0f + __expf(-x)); }
+__device__ __forceinline__ float mt_silu(float x) { return x / (1.0f + expf(-x)); }
 __device__ __forceinline__ float mt_relu(float x) { return fmaxf(0.0f, x); }
-__device__ __forceinline__ float mt_sigmoid(float x) { return 1.0f / (1.0f + __expf(-x)); }
+__device__ __forceinline__ float mt_sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 __device__ __forceinline__ float mt_gelu(float x) {
     const float k = 0.7978845608f;
     float arg = k * (x + 0.044715f * x*x*x);
