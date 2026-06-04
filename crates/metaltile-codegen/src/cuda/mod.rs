@@ -283,7 +283,14 @@ impl CudaGenerator {
                 writeln!(out, "    const unsigned int tid = _gtid;").ok();
                 self.emit_simd_aliases(out);
             }
-            KernelMode::Reduction => self.emit_reduction_preamble(out),
+            KernelMode::Reduction => {
+                // The `n_simd==0 → return` freeze guard is only for the
+                // threadgroup-reduce tree (needs ≥32 threads). Kernels that
+                // don't `Reduce` (e.g. hadamard_m, tpg=12/20/28) must NOT
+                // return — gate the guard on Op::Reduce presence.
+                let needs_guard = kernel_has_reduce(kernel);
+                self.emit_reduction_preamble(out, needs_guard);
+            }
             KernelMode::Grid3D => {
                 // 3-axis global thread id; ProgramId(axis) → gid_{x,y,z}.
                 // Same launch geometry as Metal's dispatchThreadgroups, so
@@ -440,21 +447,21 @@ impl CudaGenerator {
     /// CUDA. Block-per-output-row; warp = 32-lane (the lucky match). The
     /// `n_simd == 0` guard mirrors the Metal freeze-hazard guard (harmless
     /// on CUDA, kept for parity).
-    fn emit_reduction_preamble(&self, out: &mut String) {
+    fn emit_reduction_preamble(&self, out: &mut String, needs_guard: bool) {
         let lw = self.profile.lane_width;
-        for line in [
-            "    const unsigned int tid       = threadIdx.x;".to_string(),
-            "    const unsigned int tgid_x    = blockIdx.x;".to_string(),
-            "    const unsigned int tgid_y    = blockIdx.y;".to_string(),
-            "    const unsigned int tgid_z    = blockIdx.z;".to_string(),
-            "    const unsigned int lsize     = blockDim.x;".to_string(),
-            format!("    const unsigned int n_simd    = lsize / {lw}u;"),
-            "    if (n_simd == 0u) return;".to_string(),
-            format!("    const unsigned int simd_lane  = threadIdx.x % {lw}u;"),
-            format!("    const unsigned int simd_group = threadIdx.x / {lw}u;"),
-        ] {
-            writeln!(out, "{line}").ok();
+        writeln!(out, "    const unsigned int tid       = threadIdx.x;").ok();
+        writeln!(out, "    const unsigned int tgid_x    = blockIdx.x;").ok();
+        writeln!(out, "    const unsigned int tgid_y    = blockIdx.y;").ok();
+        writeln!(out, "    const unsigned int tgid_z    = blockIdx.z;").ok();
+        writeln!(out, "    const unsigned int lsize     = blockDim.x;").ok();
+        writeln!(out, "    const unsigned int n_simd    = lsize / {lw}u;").ok();
+        if needs_guard {
+            // Only the threadgroup-reduce tree needs ≥32 threads; sub-warp
+            // kernels without a Reduce (hadamard_m) must keep running.
+            writeln!(out, "    if (n_simd == 0u) return;").ok();
         }
+        writeln!(out, "    const unsigned int simd_lane  = threadIdx.x % {lw}u;").ok();
+        writeln!(out, "    const unsigned int simd_group = threadIdx.x / {lw}u;").ok();
     }
 
     fn emit_op(
@@ -1120,6 +1127,14 @@ fn reduce_combine(kind: ReduceKind, a: &str, b: &str) -> String {
         ReduceKind::Min => format!("fminf({a}, {b})"),
         ReduceKind::Product => format!("{a} * {b}"),
     }
+}
+
+/// Does the kernel contain a threadgroup-scope `Op::Reduce` (the only op
+/// that needs the `n_simd≥1` freeze guard)?
+fn kernel_has_reduce(kernel: &Kernel) -> bool {
+    std::iter::once(&kernel.body)
+        .chain(kernel.blocks.values())
+        .any(|b| b.ops.iter().any(|op| matches!(op, Op::Reduce { .. })))
 }
 
 /// Per-warp shared-tile name for a simdgroup_matrix value.

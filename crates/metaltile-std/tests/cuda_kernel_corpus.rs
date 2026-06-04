@@ -52,7 +52,6 @@ const KNOWN_HARD: &[(&str, &str)] = &[
     ("splitk_accum_nax", "NAX (Metal-4 neural-accelerator) cooperative path — Phase 5 (CUTLASS)"),
     ("strided_copy", "non-row-major strided view: needs the test's actual {name}_strides (our synth assumes row-major)"),
     ("fishspeech_conv1d", "fp8 conv1d: subtle decode/accumulate mismatch under investigation"),
-    ("hadamard_m", "Hadamard transform: warp-shuffle xor pattern mismatch (active-mask / partial-warp semantics)"),
     ("gated_delta_prep_chunk", "GDN chunk prep: subtle simd/shared accumulation mismatch under investigation"),
     // NAX SDPA-prefill at head_dim 128/256 only (d64 + all other NAX qmm now
     // pass via the ei-stride CoopTile fix); a head-dim-specific tiling detail.
