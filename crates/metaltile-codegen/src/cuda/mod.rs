@@ -157,16 +157,59 @@ impl CudaGenerator {
         }
     }
 
-    // ── Flat index expression for Load/Store (Phase-1: single index) ───
-    fn emit_idx(&self, indices: &[IndexExpr], block: &Block, ov: &Names) -> Result<String> {
+    // ── Flat index expression for Load/Store ──────────────────────────
+    // Multi-dim indices flatten to a single offset: Strided params use
+    // their runtime `{src}_strides[d]`; plain tensors use compile-time
+    // row-major strides from the param's static shape.
+    fn emit_idx(
+        &self,
+        indices: &[IndexExpr],
+        block: &Block,
+        ov: &Names,
+        kernel: &Kernel,
+        src: &str,
+    ) -> Result<String> {
         match indices {
             [] => Ok(String::new()),
             [one] => Ok(self.idx_term(one, block, ov)),
-            // Multi-dim row-major flatten is a Phase-2 concern (needs the
-            // shape-stride model the MSL path has). Smoke kernels are 1-D.
-            _ => Err(Error::UnsupportedOp(
-                "cuda Phase 1: multi-dimensional index (use 1-D elementwise)".into(),
-            )),
+            many => {
+                let param = kernel.params.iter().find(|p| p.name == src);
+                let strided = matches!(param.map(|p| &p.kind), Some(ParamKind::Strided));
+                if strided {
+                    let terms: Vec<String> = many
+                        .iter()
+                        .enumerate()
+                        .map(|(d, ix)| format!("({}) * {src}_strides[{d}]", self.idx_term(ix, block, ov)))
+                        .collect();
+                    return Ok(terms.join(" + "));
+                }
+                // Row-major: stride[d] = product of static dims after d.
+                let shape = param.map(|p| &p.shape).ok_or_else(|| {
+                    Error::UnsupportedOp(format!("cuda: multi-dim index on unknown param `{src}`"))
+                })?;
+                let rank = shape.rank();
+                if rank < many.len() {
+                    return Err(Error::UnsupportedOp(format!(
+                        "cuda: multi-dim index rank mismatch on `{src}`"
+                    )));
+                }
+                let mut terms = Vec::new();
+                for (d, ix) in many.iter().enumerate() {
+                    let mut stride: u64 = 1;
+                    for s in (d + 1)..rank {
+                        match shape.dim(s) {
+                            Some(metaltile_core::shape::Dim::Known(n)) => stride *= *n as u64,
+                            _ => {
+                                return Err(Error::UnsupportedOp(format!(
+                                    "cuda: multi-dim index needs static dims on `{src}`"
+                                )));
+                            }
+                        }
+                    }
+                    terms.push(format!("({}) * {stride}u", self.idx_term(ix, block, ov)));
+                }
+                Ok(terms.join(" + "))
+            }
         }
     }
 
@@ -211,9 +254,16 @@ impl CudaGenerator {
                 })
             }
             ParamKind::Scalar => Ok(format!("    {} {}", cuda_type_name(p.dtype), p.name)),
-            ParamKind::Strided => Err(Error::UnsupportedOp(
-                "cuda Phase 1: Strided params (Phase 2 — shape/stride buffers)".into(),
-            )),
+            // Strided tensor: data ptr + companion shape/strides buffers
+            // (referenced in the IR via Load{src:"{name}_shape"/"_strides"}).
+            ParamKind::Strided => {
+                let ty = cuda_type_name(p.dtype);
+                let q = if p.is_output { "" } else { "const " };
+                Ok(format!(
+                    "    {q}{ty}* {0},\n    const unsigned int* {0}_shape,\n    const unsigned int* {0}_strides",
+                    p.name
+                ))
+            }
         }
     }
 
@@ -454,13 +504,13 @@ impl CudaGenerator {
                 if indices.is_empty() {
                     writeln!(out, "{pad}auto {v} = {src};").ok();
                 } else {
-                    let idx = self.emit_idx(indices, block, ov)?;
+                    let idx = self.emit_idx(indices, block, ov, kernel, src)?;
                     writeln!(out, "{pad}auto {v} = {src}[{idx}];").ok();
                 }
             }
             Op::Store { dst, indices, value, .. } => {
                 let val = self.vname(Some(*value), block, ov);
-                let idx = self.emit_idx(indices, block, ov)?;
+                let idx = self.emit_idx(indices, block, ov, kernel, dst)?;
                 writeln!(out, "{pad}{dst}[{idx}] = {val};").ok();
             }
             Op::BinOp { op: bop, lhs, rhs } => {

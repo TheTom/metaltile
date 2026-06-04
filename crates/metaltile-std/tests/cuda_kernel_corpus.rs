@@ -50,6 +50,7 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 /// A failure NOT matching one of these is a regression and fails the test.
 const KNOWN_HARD: &[(&str, &str)] = &[
     ("splitk_accum_nax", "NAX (Metal-4 neural-accelerator) cooperative path — Phase 5 (CUTLASS)"),
+    ("strided_copy", "non-row-major strided view: needs the test's actual {name}_strides (our synth assumes row-major)"),
     ("fishspeech_conv1d", "fp8 conv1d: subtle decode/accumulate mismatch under investigation"),
     ("hadamard_m", "Hadamard transform: warp-shuffle xor pattern mismatch (active-mask / partial-warp semantics)"),
     ("gated_delta_prep_chunk", "GDN chunk prep: subtle simd/shared accumulation mismatch under investigation"),

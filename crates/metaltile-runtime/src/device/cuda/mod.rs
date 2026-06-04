@@ -28,6 +28,28 @@ use crate::error::MetalTileError;
 
 use ffi::*;
 
+/// Synthesize a Strided param's `_shape` or `_strides` (row-major) buffer
+/// from the static shape, as little-endian u32s. Unknown dims default to 1.
+fn synth_strided_meta(shape: &metaltile_core::shape::Shape, strides: bool) -> Vec<u8> {
+    use metaltile_core::shape::Dim;
+    let dims: Vec<u32> = (0..shape.rank())
+        .map(|i| match shape.dim(i) {
+            Some(Dim::Known(n)) => *n as u32,
+            _ => 1,
+        })
+        .collect();
+    let vals: Vec<u32> = if strides {
+        let mut s = vec![1u32; dims.len()];
+        for i in (0..dims.len().saturating_sub(1)).rev() {
+            s[i] = s[i + 1] * dims[i + 1];
+        }
+        s
+    } else {
+        dims
+    };
+    vals.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
 fn cu_check(res: CUresult, what: &str) -> Result<(), MetalTileError> {
     if res == CUDA_SUCCESS {
         return Ok(());
@@ -352,6 +374,23 @@ impl CudaDevice {
             dev_ptrs.push(buf.device_ptr());
             out_lens.push(if p.is_output { Some(bytes.len()) } else { None });
             dev_bufs.push(buf);
+
+            // Strided params carry two companion buffers (shape, strides) in
+            // signature order. The harness provides them by name; if absent,
+            // synthesize a row-major layout from the static shape.
+            if p.kind == metaltile_core::ir::ParamKind::Strided {
+                for suffix in ["_shape", "_strides"] {
+                    let key = format!("{}{}", p.name, suffix);
+                    let meta = match buffers.get(&key) {
+                        Some(b) => b.clone(),
+                        None => synth_strided_meta(&p.shape, suffix == "_strides"),
+                    };
+                    let mb = self.upload(&meta)?;
+                    dev_ptrs.push(mb.device_ptr());
+                    out_lens.push(None);
+                    dev_bufs.push(mb);
+                }
+            }
         }
 
         // 3. Scalar arg storage: constexprs (signature order) then the
