@@ -145,8 +145,11 @@ impl CudaGenerator {
                 if let Some(n) = ov.get(&v) {
                     return n.clone();
                 }
+                // Include the ValueId so distinct SSA values that share a
+                // name hint (e.g. a running-max fold reusing `m0`) get
+                // UNIQUE C identifiers — otherwise they'd redeclare/self-init.
                 match block.names.get(&v) {
-                    Some(hint) => format!("v_{hint}"),
+                    Some(hint) => format!("v_{hint}_{}", v.as_u32()),
                     None => format!("v{}", v.as_u32()),
                 }
             }
@@ -364,7 +367,7 @@ impl CudaGenerator {
     /// inside the child.
     fn child_ov(&self, parent: &Block, ov: &Names) -> Names {
         let mut child: Names =
-            parent.names.iter().map(|(&k, v)| (k, format!("v_{v}"))).collect();
+            parent.names.iter().map(|(&k, v)| (k, format!("v_{v}_{}", k.as_u32()))).collect();
         for (&k, v) in ov {
             child.insert(k, v.clone());
         }
@@ -1168,11 +1171,11 @@ mod tests {
         // Body: global tid + guard + the add.
         assert!(src.contains("blockIdx.x * blockDim.x + threadIdx.x"));
         assert!(src.contains(&format!("if (_gtid >= {N_ELEMS_PARAM}) return;")));
-        assert!(src.contains("unsigned int v_idx = _gtid;"));
-        assert!(src.contains("auto v_x = a[v_idx];"));
-        assert!(src.contains("auto v_y = b[v_idx];"));
-        assert!(src.contains("auto v_sum = v_x + v_y;"));
-        assert!(src.contains("c[v_idx] = v_sum;"));
+        assert!(src.contains("unsigned int v_idx_0 = _gtid;"));
+        assert!(src.contains("auto v_x_1 = a[v_idx_0];"));
+        assert!(src.contains("auto v_y_2 = b[v_idx_0];"));
+        assert!(src.contains("auto v_sum_3 = v_x_1 + v_y_2;"));
+        assert!(src.contains("c[v_idx_0] = v_sum_3;"));
     }
 
     fn row_reduce_ir() -> Kernel {
@@ -1232,12 +1235,12 @@ mod tests {
         assert!(src.contains("const unsigned int n_simd    = lsize / 32u;"));
         assert!(src.contains("const unsigned int simd_lane  = threadIdx.x % 32u;"));
         // Per-thread grid-stride accumulation.
-        assert!(src.contains("for (unsigned int _i = v_rs + tid; _i < v_re; _i += lsize)"));
+        assert!(src.contains("for (unsigned int _i = v_rs_2 + tid; _i < v_re_3; _i += lsize)"));
         // Two-level tree: warp shuffle + shared mem + barriers.
         assert!(src.contains("__shfl_down_sync(0xffffffffu"));
-        assert!(src.contains("__shared__ float v_result_sg[32];"));
+        assert!(src.contains("__shared__ float v_result_5_sg[32];"));
         assert!(src.contains("__syncthreads();"));
-        assert!(src.contains("out[v_row] = v_result;"));
+        assert!(src.contains("out[v_row_0] = v_result_5;"));
     }
 
     #[test]

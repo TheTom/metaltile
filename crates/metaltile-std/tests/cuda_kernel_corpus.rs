@@ -49,7 +49,6 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 /// remaining pure-DSL gaps (distinct from the cooperative/MMA backlog).
 /// A failure NOT matching one of these is a regression and fails the test.
 const KNOWN_HARD: &[(&str, &str)] = &[
-    ("mhc_sinkhorn_split", "DSv4 MHC sinkhorn: SSA name collision across nested If scopes (auto self-init) — vname shadowing fix needed"),
     ("splitk_accum_nax", "NAX (Metal-4 neural-accelerator) cooperative path — Phase 5 (CUTLASS)"),
     ("fishspeech_conv1d", "fp8 conv1d: subtle decode/accumulate mismatch under investigation"),
     ("hadamard_m", "Hadamard transform: warp-shuffle xor pattern mismatch (active-mask / partial-warp semantics)"),
