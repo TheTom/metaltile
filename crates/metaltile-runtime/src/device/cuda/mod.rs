@@ -363,16 +363,20 @@ impl CudaDevice {
         // 2. Allocate + upload each param buffer (in kernel.params order).
         //    Strided params are not yet supported by the emitter (it errors
         //    in generate() above), so every param here is Tensor/Scalar.
-        let mut dev_bufs: Vec<DeviceBuffer> = Vec::with_capacity(kernel.params.len());
-        let mut dev_ptrs: Vec<CUdeviceptr> = Vec::with_capacity(kernel.params.len());
-        let mut out_lens: Vec<Option<usize>> = Vec::with_capacity(kernel.params.len());
+        // dev_bufs / dev_ptrs / out_meta are kept index-aligned. Strided
+        // params add 2 extra companion buffers, so an output's buffer is NOT
+        // at its kernel.params index — out_meta carries the (name,len) for
+        // read-back so the alignment is by buffer, not by param.
+        let mut dev_bufs: Vec<DeviceBuffer> = Vec::new();
+        let mut dev_ptrs: Vec<CUdeviceptr> = Vec::new();
+        let mut out_meta: Vec<Option<(String, usize)>> = Vec::new();
         for p in &kernel.params {
             let bytes = buffers.get(&p.name).ok_or_else(|| {
                 MetalTileError::Dispatch(format!("missing buffer for param '{}'", p.name))
             })?;
             let buf = self.upload(bytes)?;
             dev_ptrs.push(buf.device_ptr());
-            out_lens.push(if p.is_output { Some(bytes.len()) } else { None });
+            out_meta.push(if p.is_output { Some((p.name.clone(), bytes.len())) } else { None });
             dev_bufs.push(buf);
 
             // Strided params carry two companion buffers (shape, strides) in
@@ -387,7 +391,7 @@ impl CudaDevice {
                     };
                     let mb = self.upload(&meta)?;
                     dev_ptrs.push(mb.device_ptr());
-                    out_lens.push(None);
+                    out_meta.push(None);
                     dev_bufs.push(mb);
                 }
             }
@@ -430,13 +434,13 @@ impl CudaDevice {
         // 5. Launch (with dynamic shared memory).
         self.launch(func, grid, block, shared_bytes, &mut args)?;
 
-        // 6. Read back outputs.
+        // 6. Read back outputs (aligned to dev_bufs, not kernel.params).
         let mut out = BTreeMap::new();
-        for (i, p) in kernel.params.iter().enumerate() {
-            if let Some(len) = out_lens[i] {
-                let mut host = vec![0u8; len];
-                self.download(&dev_bufs[i], &mut host)?;
-                out.insert(p.name.clone(), host);
+        for (buf, meta) in dev_bufs.iter().zip(&out_meta) {
+            if let Some((name, len)) = meta {
+                let mut host = vec![0u8; *len];
+                self.download(buf, &mut host)?;
+                out.insert(name.clone(), host);
             }
         }
         Ok(out)
