@@ -133,6 +133,35 @@ pub struct CudaFunction {
     func: CUfunction,
 }
 
+/// A compiled + resident kernel ready to launch repeatedly. See
+/// [`CudaDevice::prepare`]. Holds its device resources alive; `args()`
+/// hands out raw kernel-param pointers into `dev_ptrs`/`scalars`, so those
+/// vecs must not be mutated after the first `args()` call.
+struct Prepared<'d> {
+    _module: CudaModule,
+    func: CudaFunction,
+    dev_bufs: Vec<DeviceBuffer<'d>>,
+    dev_ptrs: Vec<CUdeviceptr>,
+    scalars: Vec<Vec<u8>>,
+    out_meta: Vec<Option<(String, usize)>>,
+    shared_bytes: u32,
+}
+
+impl Prepared<'_> {
+    /// Build the `cuLaunchKernel` param array: param device-ptrs first, then
+    /// scalar values, each a raw pointer into our stable `dev_ptrs`/`scalars`.
+    fn args(&self) -> Vec<*mut c_void> {
+        let mut args: Vec<*mut c_void> = Vec::with_capacity(self.dev_ptrs.len() + self.scalars.len());
+        for p in &self.dev_ptrs {
+            args.push(p as *const CUdeviceptr as *mut c_void);
+        }
+        for s in &self.scalars {
+            args.push(s.as_ptr() as *mut c_void);
+        }
+        args
+    }
+}
+
 /// CUDA device + context. NVIDIA analog of `MetalDevice`.
 pub struct CudaDevice {
     ctx: CUcontext,
@@ -343,20 +372,21 @@ impl CudaDevice {
         self.synchronize()
     }
 
-    /// End-to-end generic dispatch: generate CUDA for `kernel`, compile,
-    /// allocate + upload every param (by name from `buffers`), pack kernel
-    /// args in signature order, launch over (`grid`×`block`), and read back
-    /// the output params. The CUDA analog of `Context::dispatch_with_grid`
-    /// + `SingleDispatch`, used to run the registered kernel-test corpus on
-    /// CUDA. `buffers` must contain every param's bytes (inputs AND
-    /// pre-sized outputs) plus each constexpr's name→LE-bytes.
-    pub fn run_kernel(
-        &self,
+    /// A compiled+resident kernel: module, function, device buffers, and the
+    /// marshalled scalar/pointer args, ready to launch repeatedly without
+    /// re-compiling or re-uploading. Produced by [`CudaDevice::prepare`] and
+    /// consumed by both [`CudaDevice::run_kernel`] (one launch + read-back)
+    /// and [`CudaDevice::bench_kernel`] (timed launch loop).
+    ///
+    /// `dev_bufs` and the module own their device resources (freed on drop);
+    /// `dev_ptrs` and `scalars` back the raw arg pointers, so neither vec is
+    /// reallocated after [`Prepared::args`] hands out pointers into them.
+    fn prepare<'d>(
+        &'d self,
         kernel: &Kernel,
         buffers: &BTreeMap<String, Vec<u8>>,
-        grid: [u32; 3],
         block: [u32; 3],
-    ) -> Result<BTreeMap<String, Vec<u8>>, MetalTileError> {
+    ) -> Result<Prepared<'d>, MetalTileError> {
         // 1. IR → CUDA C++ → module.
         let cg = CudaGenerator::new();
         let src = cg.generate(kernel).map_err(|e| MetalTileError::Codegen(e))?;
@@ -426,22 +456,41 @@ impl CudaDevice {
             scalars.push(n_elems.to_le_bytes().to_vec());
         }
 
-        // 4. Build kernelParams: param device-ptrs, then scalar values.
-        //    Pointers are taken after both vecs are fully built (no realloc).
-        let mut args: Vec<*mut c_void> = Vec::with_capacity(dev_ptrs.len() + scalars.len());
-        for p in &dev_ptrs {
-            args.push(p as *const CUdeviceptr as *mut c_void);
-        }
-        for s in &scalars {
-            args.push(s.as_ptr() as *mut c_void);
-        }
+        Ok(Prepared {
+            _module: module,
+            func,
+            dev_bufs,
+            dev_ptrs,
+            scalars,
+            out_meta,
+            shared_bytes,
+        })
+    }
 
-        // 5. Launch (with dynamic shared memory).
-        self.launch(func, grid, block, shared_bytes, &mut args)?;
+    /// End-to-end generic dispatch: generate CUDA for `kernel`, compile,
+    /// allocate + upload every param (by name from `buffers`), pack kernel
+    /// args in signature order, launch over (`grid`×`block`), and read back
+    /// the output params. The CUDA analog of `Context::dispatch_with_grid`
+    /// + `SingleDispatch`, used to run the registered kernel-test corpus on
+    /// CUDA. `buffers` must contain every param's bytes (inputs AND
+    /// pre-sized outputs) plus each constexpr's name→LE-bytes.
+    pub fn run_kernel(
+        &self,
+        kernel: &Kernel,
+        buffers: &BTreeMap<String, Vec<u8>>,
+        grid: [u32; 3],
+        block: [u32; 3],
+    ) -> Result<BTreeMap<String, Vec<u8>>, MetalTileError> {
+        let prep = self.prepare(kernel, buffers, block)?;
 
-        // 6. Read back outputs (aligned to dev_bufs, not kernel.params).
+        // Launch (with dynamic shared memory).
+        let mut args = prep.args();
+        self.launch(prep.func, grid, block, prep.shared_bytes, &mut args)?;
+        drop(args);
+
+        // Read back outputs (aligned to dev_bufs, not kernel.params).
         let mut out = BTreeMap::new();
-        for (buf, meta) in dev_bufs.iter().zip(&out_meta) {
+        for (buf, meta) in prep.dev_bufs.iter().zip(&prep.out_meta) {
             if let Some((name, len)) = meta {
                 let mut host = vec![0u8; *len];
                 self.download(buf, &mut host)?;
@@ -449,6 +498,88 @@ impl CudaDevice {
             }
         }
         Ok(out)
+    }
+
+    /// Time `kernel` on the GPU: compile + upload once, run `warmup`
+    /// untimed launches (NVRTC/JIT, caches, clocks settle), then `iters`
+    /// launches each bracketed by CUDA events. Returns the per-iter GPU
+    /// elapsed times in **microseconds** — feed to `BenchStats::from_samples`
+    /// for min/median/p95. Event timing measures device wall-clock only, so
+    /// host scheduling jitter does not pollute the samples.
+    ///
+    /// No read-back: throughput is data-independent, and skipping the DtoH
+    /// copy keeps the timed region pure kernel execution. Outputs stay
+    /// resident (overwritten each iter — fine, we only time).
+    pub fn bench_kernel(
+        &self,
+        kernel: &Kernel,
+        buffers: &BTreeMap<String, Vec<u8>>,
+        grid: [u32; 3],
+        block: [u32; 3],
+        warmup: u32,
+        iters: u32,
+    ) -> Result<Vec<f64>, MetalTileError> {
+        let prep = self.prepare(kernel, buffers, block)?;
+        let mut args = prep.args();
+
+        // Warmup — first launch pays JIT/cache/clock-ramp costs.
+        for _ in 0..warmup {
+            self.launch(prep.func, grid, block, prep.shared_bytes, &mut args)?;
+        }
+
+        // Two events bracket each timed launch.
+        let (mut start, mut stop): (CUevent, CUevent) = (ptr::null_mut(), ptr::null_mut());
+        cu_check(unsafe { cuEventCreate(&mut start, CU_EVENT_DEFAULT) }, "cuEventCreate(start)")?;
+        cu_check(unsafe { cuEventCreate(&mut stop, CU_EVENT_DEFAULT) }, "cuEventCreate(stop)")?;
+
+        // Closure owns its sample vec (returned on success) so no outer
+        // borrow outlives it — lets us unconditionally destroy events after.
+        let mut timed = || -> Result<Vec<f64>, MetalTileError> {
+            let mut samples = Vec::with_capacity(iters as usize);
+            for _ in 0..iters {
+                if prep.shared_bytes > 0 {
+                    unsafe {
+                        cuFuncSetAttribute(
+                            prep.func.func,
+                            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            prep.shared_bytes as c_int,
+                        )
+                    };
+                }
+                cu_check(unsafe { cuEventRecord(start, ptr::null_mut()) }, "cuEventRecord(start)")?;
+                cu_check(
+                    unsafe {
+                        cuLaunchKernel(
+                            prep.func.func,
+                            grid[0], grid[1], grid[2],
+                            block[0], block[1], block[2],
+                            prep.shared_bytes,
+                            ptr::null_mut(),
+                            args.as_mut_ptr(),
+                            ptr::null_mut(),
+                        )
+                    },
+                    "cuLaunchKernel",
+                )?;
+                cu_check(unsafe { cuEventRecord(stop, ptr::null_mut()) }, "cuEventRecord(stop)")?;
+                cu_check(unsafe { cuEventSynchronize(stop) }, "cuEventSynchronize")?;
+                let mut ms: f32 = 0.0;
+                cu_check(
+                    unsafe { cuEventElapsedTime(&mut ms, start, stop) },
+                    "cuEventElapsedTime",
+                )?;
+                samples.push(ms as f64 * 1000.0); // ms → µs
+            }
+            Ok(samples)
+        };
+        let res = timed();
+
+        // Always destroy events, even on error.
+        unsafe {
+            cuEventDestroy_v2(start);
+            cuEventDestroy_v2(stop);
+        }
+        res
     }
 
     pub fn synchronize(&self) -> Result<(), MetalTileError> {

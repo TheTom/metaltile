@@ -18,6 +18,7 @@ pub type CUcontext = *mut c_void;
 pub type CUmodule = *mut c_void;
 pub type CUfunction = *mut c_void;
 pub type CUstream = *mut c_void;
+pub type CUevent = *mut c_void;
 /// `CUdeviceptr` is `unsigned long long` on 64-bit platforms.
 pub type CUdeviceptr = u64;
 
@@ -72,7 +73,21 @@ unsafe extern "C" {
         extra: *mut *mut c_void,
     ) -> CUresult;
     pub fn cuGetErrorString(error: CUresult, p_str: *mut *const c_char) -> CUresult;
+    // Event-based device timing (GPU-side wall clock, independent of host
+    // scheduling jitter). `cuEventElapsedTime` returns milliseconds as f32.
+    pub fn cuEventCreate(phEvent: *mut CUevent, flags: c_uint) -> CUresult;
+    pub fn cuEventRecord(hEvent: CUevent, hStream: CUstream) -> CUresult;
+    pub fn cuEventSynchronize(hEvent: CUevent) -> CUresult;
+    pub fn cuEventElapsedTime(
+        pMilliseconds: *mut f32,
+        hStart: CUevent,
+        hEnd: CUevent,
+    ) -> CUresult;
+    pub fn cuEventDestroy_v2(hEvent: CUevent) -> CUresult;
 }
+
+/// Default event flag (`CU_EVENT_DEFAULT`) — blocking-sync timing event.
+pub const CU_EVENT_DEFAULT: c_uint = 0;
 
 #[link(name = "nvrtc")]
 unsafe extern "C" {
