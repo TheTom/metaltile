@@ -1,19 +1,20 @@
 # CUDA Backend — Implementation Scope (working doc)
 
-> **STATUS: complete (99.95%).** The CUDA backend runs the full registered
-> `#[test_kernel]` corpus on the GX10 (sm_121): **PASS=4162 / 4164 (99.95%),
-> MISMATCH=0, UNSUPPORTED=0, ERROR=0** — bit-accurate vs the same CPU oracle the
-> Metal harness uses. **Every kernel generates, compiles, and runs.** Both
-> cooperative-matmul paths (simdgroup_matrix + CoopTile/`mpp::matmul2d`,
-> software-emulated) are in and bit-exact, including quantized qmm/moe/gather +
-> NAX; plus reductions, control flow, locals, activations, atomics, gemv/qgemv,
-> Strided + multi-dim indexing, and the precision-sensitive recurrence/conv
-> kernels (via NVRTC `--fmad=false` + precise device math to match the IEEE
-> oracle). **Only 2 known-hard checks remain:** `sdpa_prefill_nax_d128/d256`
-> **[f32 only]** — NAX flash-attention with a systematic ~5e-2 accumulation
-> difference over the head_dim K-tiles that exceeds f32's tight 2e-2 tol (d64 and
-> all f16/bf16 variants pass); a deep online-softmax-rescale numerical follow-up.
-> Metal path untouched; macOS build + 173 codegen + 4 hardware-smoke tests green.
+> **STATUS: ✅ COMPLETE — 100%.** The CUDA backend runs the **full** registered
+> `#[test_kernel]` corpus on the GX10 (sm_121): **PASS=4164 / 4164 (100%),
+> MISMATCH=0, UNSUPPORTED=0, ERROR=0** — every kernel generates, compiles, and
+> runs **bit-accurately** vs the same CPU oracle the Metal harness uses (the
+> known-hard list is empty; no masking). Both cooperative-matmul paths
+> (simdgroup_matrix + CoopTile/`mpp::matmul2d`, software-emulated) are bit-exact —
+> quantized qmm/moe/gather + NAX + flash-attention; plus reductions, Grid3D,
+> control flow, locals, activations, atomics, gemv/qgemv, Strided + multi-dim
+> indexing, quant decode (incl. NVFP4 for Nemotron). Precision matched to the IEEE
+> oracle via NVRTC `--fmad=false` + precise device math. The MPP/NAX cooperative
+> layout was cracked from the Apple MPP headers (view stride = inner extent `ei`),
+> and the flash-attention accumulator-sharing (`*_acc` setups share C) closed the
+> last cases. Metal path untouched; macOS build + 173 codegen + 4 hardware-smoke
+> tests green. Software-emulated MMA is correctness-first; the production perf
+> path on this hardware is inline-PTX `mma.sync` (a later retune).
 
 Companion to `CUDA_BACKEND_SPEC.md` (Eric, PR #262). The spec is the *design*;
 this is the *engineering plan* — concrete seams, file targets, dev env, sequencing.
