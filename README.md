@@ -128,6 +128,10 @@ The CUDA runtime (`crates/metaltile-runtime/src/device/cuda/`) adds NVRTC runtim
 
 > Today `tile bench` / `tile test` dispatch through the in-process `GpuRunner` on the Metal path; moving the runner into a dedicated subprocess (for isolation and parallelism) and wiring the CLI harness across all backends (Phase 6) is planned.
 
+## Scope & naming
+
+metaltile began as a Metal-only (MSL) kernel/code generator. It now emits MSL, CUDA, HIP, and Vulkan (SPIR-V) from a single `#[kernel]` DSL, so the "metal" in the name understates the current scope. A rename is under discussion to better reflect the multi-backend reality — a candidate is **TileForge**, but this is not final and is open for discussion. The current name (`metaltile`) still applies everywhere until any rename is decided.
+
 ## CLI reference
 
 | Command | What it does |
