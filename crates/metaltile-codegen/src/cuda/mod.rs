@@ -90,6 +90,43 @@ __device__ __forceinline__ float mt_decode_int8(unsigned int bits) {
     return (float)((int)(bits << 24u) >> 24);
 }
 
+// Precise float divide via Markstein refinement. Plain `a / b` on AMDGPU
+// hipRTC compiles to `V_RCP_F32 + V_MUL_F32` which can be 1 ULP off the
+// correctly-rounded result. One Newton-Raphson step on top of the
+// hardware reciprocal gives a correctly-rounded f32 quotient (relies on
+// `V_FMAC_F32` being correctly rounded — AMDGPU guarantees this). Used
+// when `TargetProfile::precise_simd_sum` (the precision-bundle flag) is
+// on (HIP profile turns it on; CUDA leaves it off and stays on `a / b`).
+//
+// The general template falls through to `a / b` so integer / mixed-type
+// divides (`auto v = mt_fdiv(int, int)` for SSA index math, `mt_fdiv(uint,
+// int)` after C++ promotion) preserve their natural type — only the
+// explicit `float, float` specialisation engages the Markstein step.
+template <typename A, typename B>
+__device__ __forceinline__ auto mt_fdiv(A a, B b) -> decltype(a / b) { return a / b; }
+template <>
+__device__ __forceinline__ float mt_fdiv<float, float>(float a, float b) {
+    float r = 1.0f / b;
+    float q = a * r;
+    float err = __fmaf_rn(-b, q, a);
+    return __fmaf_rn(err, r, q);
+}
+// Refined reciprocal square root. AMD's `V_RSQ_F32` is ~1.4 ULP; one
+// Newton-Raphson step tightens it to ≤1 ULP. Same flag as `mt_fdiv`.
+__device__ __forceinline__ float mt_rsqrt(float x) {
+    float r = rsqrtf(x);
+    return r * __fmaf_rn(-0.5f * x * r, r, 1.5f);
+}
+// f32 exp/log that match Vulkan's `exp`/`log` rounding on AMD. The GLSL
+// `exp(x)` on AMD compiles to `exp2(x * log2(e))`; OCML's `expf(x)` uses
+// a different range reduction + polynomial. Matching the two-step exp2/
+// log2 form keeps the GPU result on the same rounding trajectory as the
+// Vulkan backend (and, empirically, the Rust f32::exp on Windows). Used
+// only when `TargetProfile::precise_simd_sum` is on — HIP enables, CUDA
+// stays on the native `expf` / `logf`.
+__device__ __forceinline__ float mt_expf(float x) { return exp2f(x * 1.4426950408889634f); }
+__device__ __forceinline__ float mt_logf(float x) { return log2f(x) * 0.6931471805599453f; }
+
 // Neural activations (ported from msl/preamble.rs).
 __device__ __forceinline__ float mt_silu(float x) { return x / (1.0f + expf(-x)); }
 __device__ __forceinline__ float mt_relu(float x) { return fmaxf(0.0f, x); }
@@ -346,6 +383,28 @@ impl CudaGenerator {
                 }
             }
         }
+        // SoftwareLocalC: each unique SimdGroup-scope CoopTile C-group
+        // gets a lane-local VGPR array of size `m*n / lane_width`. Each
+        // lane holds its own slice; the cooperative iteration that used
+        // to walk `simd_lane, simd_lane+32, …` of a shared array now
+        // walks a plain 0..m*n/lane_width loop over this private array.
+        if matches!(self.profile.mma, crate::backend::MmaStrategy::SoftwareLocalC) {
+            let lw = self.profile.lane_width;
+            let mut seen_c: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for blk in std::iter::once(&kernel.body).chain(kernel.blocks.values()) {
+                for op in &blk.ops {
+                    if let Op::CoopTileSetup { name, m, n, exec_scope, .. } = op
+                        && matches!(exec_scope, CoopTileScope::SimdGroup)
+                    {
+                        let cnm = ct_ident(&coop_c_name(name));
+                        if seen_c.insert(cnm.clone()) {
+                            let per_lane = (m * n).div_ceil(lw).max(1);
+                            writeln!(out, "    float _CTC_lane_{cnm}[{per_lane}];").ok();
+                        }
+                    }
+                }
+            }
+        }
         // Shared arrays go in DYNAMIC shared memory, sized at runtime to the
         // actual warp count (`_nw`) — avoids the 48KB static cap and the
         // 32-warp over-allocation. Per-warp arrays (simdgroup tiles) are
@@ -370,9 +429,16 @@ impl CudaGenerator {
     /// The ordered shared-memory layout: (name, C type, element count,
     /// per-warp?, element bytes). Drives both `emit_allocs` (pointer setup)
     /// and `shared_bytes` (runtime size). Order MUST match between the two.
+    ///
+    /// With `MmaStrategy::SoftwareLocalC` (HIP wave32 / wave64), the per-
+    /// warp CoopTile **C** accumulator is omitted here — it moves to a
+    /// lane-local VGPR array declared in `emit_allocs`. Saves
+    /// `nw * m*n * 4` bytes of shared LDS, which is exactly the headroom
+    /// MPP `bm64` kernels need to fit under RDNA 4's 64 KB cap.
     fn shared_arrays(&self, kernel: &Kernel) -> Vec<(String, &'static str, u32, bool, usize)> {
         let mut v = Vec::new();
         let mut seen_c: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let local_c = matches!(self.profile.mma, crate::backend::MmaStrategy::SoftwareLocalC);
         for blk in std::iter::once(&kernel.body).chain(kernel.blocks.values()) {
             for (i, op) in blk.ops.iter().enumerate() {
                 match op {
@@ -395,7 +461,13 @@ impl CudaGenerator {
                         // so the C tile is declared once per c-group.
                         let cnm = ct_ident(&coop_c_name(name));
                         if seen_c.insert(cnm.clone()) {
-                            v.push((format!("_CTC_{cnm}"), "float", m * n, pw, 4));
+                            // SoftwareLocalC: SimdGroup-scope C lives in
+                            // VGPRs (see emit_allocs); skip the shared
+                            // entry. Threadgroup-scope C still uses shared.
+                            let skip = local_c && pw;
+                            if !skip {
+                                v.push((format!("_CTC_{cnm}"), "float", m * n, pw, 4));
+                            }
                         }
                     }
                     _ => {}
@@ -532,7 +604,17 @@ impl CudaGenerator {
                 let v = self.vname(vid, block, ov);
                 let l = self.vname(Some(*lhs), block, ov);
                 let r = self.vname(Some(*rhs), block, ov);
-                writeln!(out, "{pad}auto {v} = {};", cuda_binop(*bop, &l, &r)).ok();
+                // Route divide through Markstein-refined helper when the
+                // profile asks for it (HIP — closes the gated-DeltaNet
+                // KNOWN_HARD; CUDA default stays on `a / b`). Integer
+                // overloads of `mt_fdiv` pass through to `/`, so the
+                // emit must NOT cast operands to float — that would lose
+                // `int / int = int` index math.
+                if matches!(bop, BinOpKind::Div) && self.profile.precise_simd_sum {
+                    writeln!(out, "{pad}auto {v} = mt_fdiv({l}, {r});").ok();
+                } else {
+                    writeln!(out, "{pad}auto {v} = {};", cuda_binop(*bop, &l, &r)).ok();
+                }
             }
             Op::Fma { a, b, c } => {
                 let v = self.vname(vid, block, ov);
@@ -584,23 +666,52 @@ impl CudaGenerator {
             }
             // Single-warp SIMD reduction → xor butterfly so ALL lanes get
             // the result (matches Metal `simd_*` broadcast semantics).
+            //
+            // When the profile sets `precise_simd_sum`, f32 Sum/Mean drop
+            // the butterfly tree (5 ops on wave32, 6 on wave64) for a
+            // linear-order shuffle accumulator (lane_width ops) so the
+            // GPU result rounds the same way Rust's `iter().sum()` does
+            // left-to-right. HIP turns this on to close the gated-DeltaNet
+            // KNOWN_HARD; CUDA keeps the fast butterfly path.
             Op::SimdReduce { value, op: rk } => {
                 let v = self.vname(vid, block, ov);
                 let rv = self.vname(Some(*value), block, ov);
-                let half = self.profile.lane_width / 2;
-                writeln!(out, "{pad}float {v};").ok();
-                writeln!(out, "{pad}{{").ok();
-                writeln!(out, "{pad}    float _s = (float)({rv});").ok();
-                writeln!(out, "{pad}    for (int _o = {half}; _o > 0; _o >>= 1) {{").ok();
-                writeln!(out, "{pad}        float _x = __shfl_xor_sync(0xffffffffu, _s, _o);").ok();
-                writeln!(out, "{pad}        _s = {};", reduce_combine(*rk, "_s", "_x")).ok();
-                writeln!(out, "{pad}    }}").ok();
-                if *rk == ReduceKind::Mean {
-                    writeln!(out, "{pad}    {v} = _s / {}.0f;", self.profile.lane_width).ok();
+                let lw = self.profile.lane_width;
+                let is_sum = matches!(rk, ReduceKind::Sum | ReduceKind::Mean);
+                if self.profile.precise_simd_sum && is_sum {
+                    writeln!(out, "{pad}float {v};").ok();
+                    writeln!(out, "{pad}{{").ok();
+                    writeln!(out, "{pad}    float _src = (float)({rv});").ok();
+                    // `volatile` forces left-to-right materialization —
+                    // without it the AMDGPU optimizer can reassociate the
+                    // 32-step accumulator into a balanced tree (a
+                    // different rounding path than the CPU oracle uses).
+                    writeln!(out, "{pad}    volatile float _s = 0.0f;").ok();
+                    writeln!(out, "{pad}    for (int _i = 0; _i < {lw}; _i++) {{").ok();
+                    writeln!(out, "{pad}        _s = _s + __shfl_sync(0xffffffffu, _src, _i);").ok();
+                    writeln!(out, "{pad}    }}").ok();
+                    if *rk == ReduceKind::Mean {
+                        writeln!(out, "{pad}    {v} = _s / {lw}.0f;").ok();
+                    } else {
+                        writeln!(out, "{pad}    {v} = _s;").ok();
+                    }
+                    writeln!(out, "{pad}}}").ok();
                 } else {
-                    writeln!(out, "{pad}    {v} = _s;").ok();
+                    let half = lw / 2;
+                    writeln!(out, "{pad}float {v};").ok();
+                    writeln!(out, "{pad}{{").ok();
+                    writeln!(out, "{pad}    float _s = (float)({rv});").ok();
+                    writeln!(out, "{pad}    for (int _o = {half}; _o > 0; _o >>= 1) {{").ok();
+                    writeln!(out, "{pad}        float _x = __shfl_xor_sync(0xffffffffu, _s, _o);").ok();
+                    writeln!(out, "{pad}        _s = {};", reduce_combine(*rk, "_s", "_x")).ok();
+                    writeln!(out, "{pad}    }}").ok();
+                    if *rk == ReduceKind::Mean {
+                        writeln!(out, "{pad}    {v} = _s / {lw}.0f;").ok();
+                    } else {
+                        writeln!(out, "{pad}    {v} = _s;").ok();
+                    }
+                    writeln!(out, "{pad}}}").ok();
                 }
-                writeln!(out, "{pad}}}").ok();
             }
             // Warp prefix scan (Hillis-Steele via __shfl_up_sync), matching
             // Metal's simd_prefix_{inclusive,exclusive}_*.
@@ -837,9 +948,24 @@ impl CudaGenerator {
                 let (m, n, _, _, _, _, _, simd) = self.coop_cfg(kernel, name)
                     .ok_or_else(|| Error::UnsupportedOp(format!("cuda: CoopTile `{name}` no Setup")))?;
                 let cnm = ct_ident(&coop_c_name(name));
-                let (sid, ssize, _) = coop_scope(simd);
-                let base = coop_base(simd, m * n);
-                writeln!(out, "{pad}for (unsigned int _e = {sid}; _e < {}u; _e += {ssize}) _CTC_{cnm}[{base} + _e] = 0.0f;", m * n).ok();
+                let local_c = matches!(
+                    self.profile.mma,
+                    crate::backend::MmaStrategy::SoftwareLocalC
+                );
+                if local_c && simd {
+                    // Lane-local C: each lane zeros its own slots.
+                    let lw = self.profile.lane_width;
+                    let per_lane = (m * n).div_ceil(lw).max(1);
+                    writeln!(
+                        out,
+                        "{pad}for (unsigned int _i = 0u; _i < {per_lane}u; _i++) _CTC_lane_{cnm}[_i] = 0.0f;"
+                    )
+                    .ok();
+                } else {
+                    let (sid, ssize, _) = coop_scope(simd);
+                    let base = coop_base(simd, m * n);
+                    writeln!(out, "{pad}for (unsigned int _e = {sid}; _e < {}u; _e += {ssize}) _CTC_{cnm}[{base} + _e] = 0.0f;", m * n).ok();
+                }
             }
             // Per Apple MPP headers: metal::extents<int, EI, EO> is {inner,
             // outer}; with tensor_inline the leading-dim stride ld == EI (the
@@ -882,33 +1008,77 @@ impl CudaGenerator {
                 let (m, n, k, _, _, _, accum, simd) = self.coop_cfg(kernel, name)
                     .ok_or_else(|| Error::UnsupportedOp(format!("cuda: CoopTile `{name}` no Setup")))?;
                 let nm = ct_ident(name);
-                let cnm = ct_ident(&coop_c_name(name)); // shared C accumulator
-                let (sid, ssize, _) = coop_scope(simd);
-                let (ba, bb, bc) =
-                    (coop_base(simd, m * k), coop_base(simd, k * n), coop_base(simd, m * n));
-                writeln!(out, "{pad}__syncthreads();").ok();
-                writeln!(out, "{pad}for (unsigned int _e = {sid}; _e < {}u; _e += {ssize}) {{", m * n).ok();
-                writeln!(out, "{pad}    unsigned int _i = _e / {n}u, _j = _e % {n}u;").ok();
-                let init = if accum { format!("_CTC_{cnm}[{bc} + _e]") } else { "0.0f".into() };
-                writeln!(out, "{pad}    float _acc = {init};").ok();
-                writeln!(out, "{pad}    for (unsigned int _l = 0u; _l < {k}u; _l++) _acc += _CTA_{nm}[{ba} + _i * {k}u + _l] * _CTB_{nm}[{bb} + _l * {n}u + _j];").ok();
-                writeln!(out, "{pad}    _CTC_{cnm}[{bc} + _e] = _acc;").ok();
-                writeln!(out, "{pad}}}").ok();
-                writeln!(out, "{pad}__syncthreads();").ok();
+                let cnm = ct_ident(&coop_c_name(name));
+                let local_c = matches!(
+                    self.profile.mma,
+                    crate::backend::MmaStrategy::SoftwareLocalC
+                );
+                if local_c && simd {
+                    // SoftwareLocalC: per-warp lane-local C. Each lane
+                    // walks its own `m*n/lw` slots, computing the same
+                    // _e = simd_lane + _i*lw as the original cooperative
+                    // form. A and B remain shared per-warp.
+                    let lw = self.profile.lane_width;
+                    let per_lane = (m * n).div_ceil(lw).max(1);
+                    let ba = coop_base(true, m * k);
+                    let bb = coop_base(true, k * n);
+                    writeln!(out, "{pad}__syncthreads();").ok();
+                    writeln!(out, "{pad}for (unsigned int _li = 0u; _li < {per_lane}u; _li++) {{").ok();
+                    writeln!(out, "{pad}    unsigned int _e = simd_lane + _li * {lw}u;").ok();
+                    writeln!(out, "{pad}    if (_e >= {}u) break;", m * n).ok();
+                    writeln!(out, "{pad}    unsigned int _i = _e / {n}u, _j = _e % {n}u;").ok();
+                    let init = if accum {
+                        format!("_CTC_lane_{cnm}[_li]")
+                    } else {
+                        "0.0f".to_string()
+                    };
+                    writeln!(out, "{pad}    float _acc = {init};").ok();
+                    writeln!(out, "{pad}    for (unsigned int _l = 0u; _l < {k}u; _l++) _acc += _CTA_{nm}[{ba} + _i * {k}u + _l] * _CTB_{nm}[{bb} + _l * {n}u + _j];").ok();
+                    writeln!(out, "{pad}    _CTC_lane_{cnm}[_li] = _acc;").ok();
+                    writeln!(out, "{pad}}}").ok();
+                    writeln!(out, "{pad}__syncthreads();").ok();
+                } else {
+                    let (sid, ssize, _) = coop_scope(simd);
+                    let (ba, bb, bc) =
+                        (coop_base(simd, m * k), coop_base(simd, k * n), coop_base(simd, m * n));
+                    writeln!(out, "{pad}__syncthreads();").ok();
+                    writeln!(out, "{pad}for (unsigned int _e = {sid}; _e < {}u; _e += {ssize}) {{", m * n).ok();
+                    writeln!(out, "{pad}    unsigned int _i = _e / {n}u, _j = _e % {n}u;").ok();
+                    let init = if accum { format!("_CTC_{cnm}[{bc} + _e]") } else { "0.0f".into() };
+                    writeln!(out, "{pad}    float _acc = {init};").ok();
+                    writeln!(out, "{pad}    for (unsigned int _l = 0u; _l < {k}u; _l++) _acc += _CTA_{nm}[{ba} + _i * {k}u + _l] * _CTB_{nm}[{bb} + _l * {n}u + _j];").ok();
+                    writeln!(out, "{pad}    _CTC_{cnm}[{bc} + _e] = _acc;").ok();
+                    writeln!(out, "{pad}}}").ok();
+                    writeln!(out, "{pad}__syncthreads();").ok();
+                }
             }
             Op::CoopTileStoreC { name, ptr_name, ptr_offset, dtype, ei, .. } => {
                 let (m, n, _, _, _, _, _, simd) = self.coop_cfg(kernel, name)
                     .ok_or_else(|| Error::UnsupportedOp(format!("cuda: CoopTile `{name}` no Setup")))?;
                 let cnm = ct_ident(&coop_c_name(name));
-                let (sid, ssize, _) = coop_scope(simd);
-                let base = coop_base(simd, m * n);
                 let off = ptr_offset.map(|o| self.vname(Some(o), block, ov)).unwrap_or_else(|| "0".into());
                 let ty = cuda_type_name(*dtype);
-                // C is m×n, leading dim ei. No transpose_c in matmul2d.
                 let dst = format!("(_e / {n}u) * {ei}u + (_e % {n}u)");
-                let _ = m;
-                writeln!(out, "{pad}__syncthreads();").ok();
-                writeln!(out, "{pad}for (unsigned int _e = {sid}; _e < {}u; _e += {ssize}) {ptr_name}[{off} + {dst}] = ({ty})(_CTC_{cnm}[{base} + _e]);", m * n).ok();
+                let local_c = matches!(
+                    self.profile.mma,
+                    crate::backend::MmaStrategy::SoftwareLocalC
+                );
+                if local_c && simd {
+                    let lw = self.profile.lane_width;
+                    let per_lane = (m * n).div_ceil(lw).max(1);
+                    writeln!(out, "{pad}__syncthreads();").ok();
+                    writeln!(out, "{pad}for (unsigned int _li = 0u; _li < {per_lane}u; _li++) {{").ok();
+                    writeln!(out, "{pad}    unsigned int _e = simd_lane + _li * {lw}u;").ok();
+                    writeln!(out, "{pad}    if (_e >= {}u) break;", m * n).ok();
+                    writeln!(out, "{pad}    {ptr_name}[{off} + {dst}] = ({ty})(_CTC_lane_{cnm}[_li]);").ok();
+                    writeln!(out, "{pad}}}").ok();
+                } else {
+                    let (sid, ssize, _) = coop_scope(simd);
+                    let base = coop_base(simd, m * n);
+                    let _ = m;
+                    writeln!(out, "{pad}__syncthreads();").ok();
+                    writeln!(out, "{pad}for (unsigned int _e = {sid}; _e < {}u; _e += {ssize}) {ptr_name}[{off} + {dst}] = ({ty})(_CTC_{cnm}[{base} + _e]);", m * n).ok();
+                }
             }
             // ── Control flow (nested-block recursion) ──────────────────
             Op::Loop { var, start, end, step, body } => {
@@ -1024,6 +1194,20 @@ impl CudaGenerator {
 
     fn cuda_unary(&self, op: UnaryOpKind, arg: &str) -> String {
         use UnaryOpKind::*;
+        // Precise-math overrides (HIP enables these via
+        // `TargetProfile::precise_simd_sum`; CUDA defaults skip them).
+        // Recip/Rsqrt always have a float result so the explicit
+        // `(float)` cast on the arg is safe (Recip's 1.0f literal also
+        // pins overload resolution to the float overload).
+        if self.profile.precise_simd_sum {
+            match op {
+                Recip => return format!("mt_fdiv(1.0f, (float)({arg}))"),
+                Rsqrt => return format!("mt_rsqrt((float)({arg}))"),
+                Exp => return format!("mt_expf((float)({arg}))"),
+                Log => return format!("mt_logf((float)({arg}))"),
+                _ => {}
+            }
+        }
         match op {
             Neg => format!("(-{arg})"),
             Recip => format!("(1.0f / {arg})"),
