@@ -26,11 +26,22 @@ use crate::Result;
 
 /// Which GPU backend to lower the IR to. Default stays `Metal` — the
 /// zero-config macOS path. `cuda` is opt-in via `--target cuda`.
+///
+/// **Hip** (AMD ROCm) — see `specs/AMD_BACKEND_SPEC.md`. Reuses the CUDA
+/// emitter via a HIP-flavored `TargetProfile`; structurally identical to
+/// CUDA at the kernel level (same `__global__` / `__shared__` / shuffle
+/// API), with the dialect deltas (headers, bf16 type) handled in `hip/`.
+///
+/// **Spirv** (Vulkan compute) — see `specs/VULKAN_BACKEND_SPEC.md`. The
+/// portable/breadth backend; lowers IR to GLSL compute (shaderc → SPIR-V)
+/// or direct SPIR-V. Reaches AMD, NVIDIA, Intel, Adreno, Mali, MoltenVK.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Target {
     #[default]
     Metal,
     Cuda,
+    Hip,
+    Spirv,
 }
 
 impl Target {
@@ -38,14 +49,22 @@ impl Target {
         match self {
             Target::Metal => "metal",
             Target::Cuda => "cuda",
+            Target::Hip => "hip",
+            Target::Spirv => "spirv",
         }
     }
 
     /// File extension for emitted source (`emit.rs` writes `<name>.<ext>`).
+    /// HIP source compiles to AMDGPU code-objects via hipRTC; the `.hip`
+    /// suffix is a hipcc convention and is fine for hipRTC too.
+    /// SPIR-V uses GLSL compute as the textual surface (`.comp`), compiled
+    /// to SPIR-V binary by shaderc at runtime.
     pub fn source_ext(self) -> &'static str {
         match self {
             Target::Metal => "metal",
             Target::Cuda => "cu",
+            Target::Hip => "hip",
+            Target::Spirv => "comp",
         }
     }
 }
@@ -67,7 +86,9 @@ pub trait CodegenBackend {
 
 /// MMA lowering strategy for cooperative matmul ops
 /// (`SimdgroupMatMul`, `CoopTile*`). Metal uses fixed 8×8 simdgroup
-/// matrices; CUDA has several escalating options (spec §4.2 / §6).
+/// matrices; CUDA has several escalating options (spec §4.2 / §6);
+/// AMD has MFMA (CDNA) and WMMA (RDNA3+); Vulkan has the optional
+/// `VK_KHR_cooperative_matrix` runtime-queried path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MmaStrategy {
     /// Metal `simdgroup_matrix` 8×8 (today).
@@ -78,6 +99,27 @@ pub enum MmaStrategy {
     Cutlass,
     /// Blackwell `tcgen05` scaled tensor-core MMA, sm_100+. Phase 4.
     Tcgen05,
+    /// AMD RDNA3+ WMMA (`__builtin_amdgcn_wmma_*`). RDNA4 adds FP8.
+    /// `AMD_BACKEND_SPEC.md §4.2`.
+    AmdWmma,
+    /// AMD CDNA MFMA (`__builtin_amdgcn_mfma_*`). MI300 FP8, MI350 MXFP.
+    AmdMfma,
+    /// Software-emulated MMA over shared memory — universal baseline.
+    /// Phase 1 for both HIP (wave32 RDNA) and Vulkan; matches the CUDA
+    /// software path. Bit-accurate but slow.
+    Software,
+    /// Software-emulated MMA with the per-warp **C accumulator moved to
+    /// lane-local VGPRs** (each lane holds `m*n/32` floats). Saves
+    /// `nw * m*n * 4` bytes of shared LDS — the difference that makes
+    /// MPP `bm64` kernels fit on RDNA 4 (80KB → 64KB at the cap). A is
+    /// still shared per-warp; B is still shared per-warp; only C moves.
+    /// Used by HIP wave32 by default; equivalent to `Software` for
+    /// kernels without SimdGroup-scope CoopTile (no behavior change).
+    SoftwareLocalC,
+    /// `VK_KHR_cooperative_matrix` runtime-queried fragment shapes.
+    /// `VULKAN_BACKEND_SPEC.md §4.2`. Fragment shape decided at pipeline
+    /// creation from `vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR`.
+    VkCooperativeMatrix,
 }
 
 /// The leaf textual/structural differences between backends. Everything
@@ -86,18 +128,32 @@ pub enum MmaStrategy {
 #[derive(Debug, Clone)]
 pub struct TargetProfile {
     pub target: Target,
-    /// SIMD/warp lane width. **32 on both Metal simdgroup and CUDA warp** —
-    /// the structural match that lets reduction/shuffle kernels port.
+    /// SIMD/warp lane width. **32 on Metal simdgroup, CUDA warp, RDNA
+    /// wave32**; **64 on CDNA wave64**; **variable on Vulkan subgroup**
+    /// (queried at runtime via `VK_EXT_subgroup_size_control`). The
+    /// reduction/shuffle lowering reads this; 32 is the lucky structural
+    /// match that lets MetalTile's existing kernels port.
     pub lane_width: u32,
     /// Threadgroup/shared-memory address-space keyword.
-    /// Metal: `threadgroup`; CUDA: `__shared__`.
+    /// Metal: `threadgroup`; CUDA/HIP: `__shared__`; GLSL: `shared`.
     pub shared_mem_kw: &'static str,
     /// Barrier intrinsic across the block/threadgroup.
-    /// Metal: `threadgroup_barrier(mem_flags::mem_threadgroup)`; CUDA: `__syncthreads()`.
+    /// Metal: `threadgroup_barrier(mem_flags::mem_threadgroup)`;
+    /// CUDA/HIP: `__syncthreads()`; GLSL: `barrier()`.
     pub block_barrier: &'static str,
-    /// Warp/simd barrier. Metal: `simdgroup_barrier(...)`; CUDA: `__syncwarp()`.
+    /// Warp/simd barrier. Metal: `simdgroup_barrier(...)`;
+    /// CUDA/HIP: `__syncwarp()`; GLSL: `subgroupBarrier()`.
     pub warp_barrier: &'static str,
     pub mma: MmaStrategy,
+    /// Lower f32 subgroup-sum (`SimdReduce::Sum`/`Mean`) to a linear-order
+    /// `__shfl_sync(_, v, i)` loop over `i = 0..lane_width` so the result
+    /// matches a left-to-right CPU `iter().sum()` rounding bit-exactly.
+    /// Default `false` (fast butterfly path, ~5 ops on wave32). HIP sets
+    /// `true` to match the GPU output to the CPU oracle on recurrence-
+    /// sensitive kernels (gated DeltaNet over 4 tokens with state-magnitude
+    /// amplification). CUDA stays `false` — its bitwise-identical baseline
+    /// is the butterfly. `AMD_BACKEND_SPEC.md §4.3`.
+    pub precise_simd_sum: bool,
 }
 
 impl TargetProfile {
@@ -109,6 +165,7 @@ impl TargetProfile {
             block_barrier: "threadgroup_barrier(mem_flags::mem_threadgroup)",
             warp_barrier: "simdgroup_barrier(mem_flags::mem_threadgroup)",
             mma: MmaStrategy::Simdgroup8x8,
+            precise_simd_sum: false,
         }
     }
 
@@ -122,17 +179,102 @@ impl TargetProfile {
             block_barrier: "__syncthreads()",
             warp_barrier: "__syncwarp()",
             mma: MmaStrategy::Wmma16x16x16,
+            precise_simd_sum: false,
+        }
+    }
+
+    /// Default HIP profile — assumes RDNA wave32 (the most common AMD
+    /// consumer / Windows configuration: RX 7000/9000 series). Wave64
+    /// (CDNA / Instinct) uses [`TargetProfile::hip_wave64`]; the emitter
+    /// reads `lane_width` so reductions/shuffles size correctly.
+    ///
+    /// The kernel-source dialect is HIP C++ (hipRTC-compatible), which
+    /// shares the entire CUDA kernel surface (`__global__`, `__shared__`,
+    /// `__shfl_*_sync`, atomics) — only headers + bf16 type name differ.
+    /// `AMD_BACKEND_SPEC.md §3`.
+    pub fn hip() -> Self {
+        TargetProfile {
+            target: Target::Hip,
+            lane_width: 32,
+            shared_mem_kw: "__shared__",
+            block_barrier: "__syncthreads()",
+            warp_barrier: "__syncwarp()",
+            // Phase-2 default: SoftwareLocalC keeps per-warp C in VGPRs
+            // so the MPP `bm64` family fits under RDNA 4's 64KB LDS cap.
+            // Equivalent to plain `Software` for kernels without
+            // SimdGroup-scope CoopTile, so no other kernel changes shape.
+            mma: MmaStrategy::SoftwareLocalC,
+            // Match the CPU oracle's left-to-right `iter().sum()` rounding
+            // on f32 subgroup sums. Closes the gated-DeltaNet KNOWN_HARD
+            // (same fix Vulkan uses) at the cost of a 32-step shuffle loop
+            // instead of the 5-step butterfly. Pure correctness trade.
+            precise_simd_sum: true,
+        }
+    }
+
+    /// HIP profile for wave64 architectures (CDNA: gfx9xx / MI200 / MI300 /
+    /// MI350). Doubles the shuffle/reduction lane mask; the existing emitter's
+    /// `0xffffffffu` 32-lane masks must be replaced with `0xffffffffffffffffull`
+    /// (this becomes a `Phase 2` hazard per `AMD_BACKEND_SPEC.md §4.1`).
+    pub fn hip_wave64() -> Self {
+        TargetProfile {
+            target: Target::Hip,
+            lane_width: 64,
+            shared_mem_kw: "__shared__",
+            block_barrier: "__syncthreads()",
+            warp_barrier: "__syncwarp()",
+            // Wave64 (CDNA): same LocalC strategy. The math works out
+            // identically — per-warp C tile of `m*n` elements is split
+            // across `lane_width` lanes, so each lane holds `m*n/64`
+            // floats instead of `m*n/32`.
+            mma: MmaStrategy::SoftwareLocalC,
+            // Linear-order subgroup sum across 64 lanes — same rationale
+            // as wave32 HIP.
+            precise_simd_sum: true,
+        }
+    }
+
+    /// Default Vulkan / GLSL profile. Subgroup size is **runtime-queried**
+    /// (`VK_EXT_subgroup_size_control`); 32 is the most common modern desktop
+    /// width (NVIDIA, AMD RDNA, Intel Xe-HPG). Reductions lower to the
+    /// portable workgroup-shared baseline regardless of subgroup width
+    /// (`VULKAN_BACKEND_SPEC.md §4.1`), so the Phase-1 kernel set runs
+    /// correctly on any subgroup size. The fast subgroup-op path queries
+    /// `VkSubgroupFeatureFlagBits` at pipeline creation.
+    pub fn vulkan() -> Self {
+        TargetProfile {
+            target: Target::Spirv,
+            lane_width: 32,
+            shared_mem_kw: "shared",
+            block_barrier: "barrier()",
+            warp_barrier: "subgroupBarrier()",
+            // SoftwareLocalC mirrors the HIP path: per-warp CoopTile C
+            // accumulator moves to lane-local private arrays so the
+            // bm64 / MPP family fits under desktop Vulkan's shared-mem
+            // cap (32-48 KB typical, vs 80 KB the per-warp shared layout
+            // needs).
+            mma: MmaStrategy::SoftwareLocalC,
+            // The Vulkan path already uses linear-order `mt_subgroup_add`
+            // unconditionally for f32 subgroup sums (see `spirv/mod.rs`).
+            // This flag is here for completeness; the SPIR-V emitter
+            // doesn't currently branch on it.
+            precise_simd_sum: true,
         }
     }
 
     /// `program_id(axis)` source for this target.
-    /// Metal: threadgroup-position-in-grid; CUDA: `blockIdx.{x,y,z}`.
+    /// Metal: threadgroup-position-in-grid;
+    /// CUDA / HIP: `blockIdx.{x,y,z}` (HIP shares the CUDA built-in);
+    /// Vulkan/SPIR-V: `gl_WorkGroupID.{x,y,z}` (GLSL compute).
     pub fn block_idx(&self, axis: u32) -> String {
         let comp = ["x", "y", "z"].get(axis as usize).copied().unwrap_or("x");
         match self.target {
             // Metal injects tgid via attributes; the codegen references `tgid_<c>`.
             Target::Metal => format!("tgid_{comp}"),
-            Target::Cuda => format!("blockIdx.{comp}"),
+            // HIP exposes the same `blockIdx`/`threadIdx`/`blockDim` built-ins
+            // as CUDA (verbatim from `hip_runtime.h`), so the source share.
+            Target::Cuda | Target::Hip => format!("blockIdx.{comp}"),
+            Target::Spirv => format!("gl_WorkGroupID.{comp}"),
         }
     }
 
@@ -161,7 +303,13 @@ impl TargetProfile {
             // and fast-math's multi-ULP error compounds in accumulation-heavy
             // / gain-sensitive kernels (recurrences, softplus). Precision over
             // speed for bit-accuracy (perf retune is a later pass).
-            Target::Cuda => match op {
+            //
+            // HIP shares the **identical** single-precision device-math name
+            // table — `expf`/`exp2f`/`rsqrtf`/etc. are exposed via HIP's
+            // CUDA-compat headers; `__frcp_rn` is provided by hipRTC built-ins.
+            // Reusing the CUDA mapping verbatim is the whole point of HIP being
+            // a CUDA-portable C++ dialect (`AMD_BACKEND_SPEC.md §3`).
+            Target::Cuda | Target::Hip => match op {
                 Exp => "expf", Exp2 => "exp2f", Expm1 => "expm1f",
                 Log => "logf", Log2 => "log2f", Log10 => "log10f",
                 Sqrt => "sqrtf", Rsqrt => "rsqrtf", Recip => "__frcp_rn",
@@ -172,6 +320,25 @@ impl TargetProfile {
                 Sinh => "sinhf", Cosh => "coshf",
                 Asinh => "asinhf", Acosh => "acoshf", Atanh => "atanhf",
                 Erf => "erff", ErfInv => "erfinvf",
+                DecodeE2m1 | DecodeE4m3 | DecodeE5m2 | DecodeInt8 => "/*decode-helper*/",
+            },
+            // GLSL.std.450 names (the SPIR-V extended-instruction set used
+            // by Vulkan compute). `shaderc` lowers these via the standard
+            // GLSL compute shader; `inversesqrt` is the GLSL spelling of
+            // rsqrt. `erf`/`erfinv` aren't in GLSL.std.450 — kernels using
+            // them fall back to a software approximation in the preamble.
+            Target::Spirv => match op {
+                Exp => "exp", Exp2 => "exp2", Expm1 => "mt_expm1",
+                Log => "log", Log2 => "log2", Log10 => "mt_log10",
+                Sqrt => "sqrt", Rsqrt => "inversesqrt", Recip => "1.0/",
+                Abs => "abs", Neg => "-", Ceil => "ceil", Floor => "floor",
+                Round => "roundEven", Trunc => "trunc", Sign => "sign",
+                Sin => "sin", Cos => "cos", Tan => "tan",
+                Asin => "asin", Acos => "acos", Atan => "atan",
+                Sinh => "sinh", Cosh => "cosh",
+                Asinh => "asinh", Acosh => "acosh", Atanh => "atanh",
+                // Software approximations live in the GLSL preamble.
+                Erf => "mt_erf", ErfInv => "mt_erfinv",
                 DecodeE2m1 | DecodeE4m3 | DecodeE5m2 | DecodeInt8 => "/*decode-helper*/",
             },
         }
