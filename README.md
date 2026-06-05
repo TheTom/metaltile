@@ -151,33 +151,7 @@ cargo run --release -p metaltile-bench --bin bench_suite -- --filter softmax
 
 One `#[kernel]` DSL, four GPU backends. Your kernel lowers to a shared IR; the codegen passes optimise it once; then each backend emitter turns that IR into the target's native shader source. Two **peer hosts** consume the same kernels with no FFI between them — a Swift host (`MetalTileSwift`, Metal/Apple, ships to the App Store) and the Rust host (`metaltile-runtime` + downstream engine crates).
 
-```mermaid
-flowchart TD
-    K["#[kernel] DSL<br/>fn mt_exp&lt;T&gt;(..) — Rust proc-macro"]
-    K --> IR["MetalTile IR<br/>(Op variants — metaltile-core)"]
-    IR --> Passes["codegen passes<br/>vectorize · unroll · CSE · DCE · ..."]
-
-    Passes --> MSL["MSL emit<br/>.metal"]
-    Passes --> CUDA["CUDA emit<br/>CUDA C++ → NVRTC → PTX"]
-    Passes --> HIP["HIP emit<br/>HIP C++ → hipRTC → AMDGPU"]
-    Passes --> SPV["SPIR-V emit<br/>GLSL/SPIR-V → shaderc"]
-
-    MSL --> Apple["Apple GPUs<br/>(Metal)"]
-    CUDA --> NVIDIA["NVIDIA GPUs<br/>(sm_90 / 120 / 121)"]
-    HIP --> AMD["AMD GPUs<br/>(ROCm gfx*)"]
-    SPV --> AnyGPU["Any Vulkan-class GPU"]
-
-    subgraph Hosts["Peer hosts (no FFI between them)"]
-        Swift["Swift host<br/>MetalTileSwift · App Store"]
-        RustHost["Rust host<br/>metaltile-runtime + engine crates"]
-    end
-
-    Apple --- Swift
-    Apple --- RustHost
-    NVIDIA --- RustHost
-    AMD --- RustHost
-    AnyGPU --- RustHost
-```
+![metaltile architecture](docs/architecture.png)
 
 ### Backends
 
