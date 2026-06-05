@@ -1,6 +1,8 @@
 # MetalTile
 
-A Rust-embedded DSL for writing Apple Metal GPU kernels. Write tile-level algorithms in Rust, get optimized Metal Shading Language out.
+A Rust-embedded DSL for writing GPU kernels once and running them everywhere. Write tile-level algorithms in Rust with `#[kernel]`, and the same kernel source lowers to **four GPU backends** — Apple Metal (MSL), NVIDIA (CUDA), AMD (HIP/ROCm), and any Vulkan-class GPU (SPIR-V).
+
+metaltile is the kernel layer beneath an LLM inference engine that runs a 30B-parameter hybrid model (Mamba2 SSM + 128-expert MoE + GQA attention) resident-decode on a single Grace-Blackwell (GB10) box; the same kernels also run on Apple GPUs — no per-backend rewrite.
 
 ```rust
 #[kernel]
@@ -42,7 +44,7 @@ This generates ~104% of MLX's hand-tuned `rms` kernel throughput on M4 Max acros
 
 ## Why MetalTile
 
-- **Write once in Rust, run fast on Apple Silicon.** No raw MSL, no thread-position arithmetic.
+- **Write once in Rust, run on Apple, NVIDIA, AMD, and Vulkan-class GPUs.** No raw MSL/CUDA/HIP, no thread-position arithmetic — one kernel source, four backends.
 - **Tile-level, not thread-level.** `strided_reduce`, `reduce_sum`, `dot` — express what to compute, the compiler handles thread mapping, vectorization, and SIMD-group reductions.
 - **Verified against MLX.** Every kernel is benchmarked and numerically compared against the corresponding MLX Metal kernel. 139/139 ops correct, avg 110% of MLX throughput on M4 Max.
 - **All three float dtypes.** `f32`, `f16`, and `bfloat16` work identically — native `bfloat` emitted on Metal 3.1+.
@@ -147,17 +149,46 @@ cargo run --release -p metaltile-bench --bin bench_suite -- --filter softmax
 
 ## Architecture
 
+One `#[kernel]` DSL, four GPU backends. Your kernel lowers to a shared IR; the codegen passes optimise it once; then each backend emitter turns that IR into the target's native shader source. Two **peer hosts** consume the same kernels with no FFI between them — a Swift host (`MetalTileSwift`, Metal/Apple, ships to the App Store) and the Rust host (`metaltile-runtime` + downstream engine crates).
+
+```mermaid
+flowchart TD
+    K["#[kernel] DSL<br/>fn mt_exp&lt;T&gt;(..) — Rust proc-macro"]
+    K --> IR["MetalTile IR<br/>(Op variants — metaltile-core)"]
+    IR --> Passes["codegen passes<br/>vectorize · unroll · CSE · DCE · ..."]
+
+    Passes --> MSL["MSL emit<br/>.metal"]
+    Passes --> CUDA["CUDA emit<br/>CUDA C++ → NVRTC → PTX"]
+    Passes --> HIP["HIP emit<br/>HIP C++ → hipRTC → AMDGPU"]
+    Passes --> SPV["SPIR-V emit<br/>GLSL/SPIR-V → shaderc"]
+
+    MSL --> Apple["Apple GPUs<br/>(Metal)"]
+    CUDA --> NVIDIA["NVIDIA GPUs<br/>(sm_90 / 120 / 121)"]
+    HIP --> AMD["AMD GPUs<br/>(ROCm gfx*)"]
+    SPV --> AnyGPU["Any Vulkan-class GPU"]
+
+    subgraph Hosts["Peer hosts (no FFI between them)"]
+        Swift["Swift host<br/>MetalTileSwift · App Store"]
+        RustHost["Rust host<br/>metaltile-runtime + engine crates"]
+    end
+
+    Apple --- Swift
+    Apple --- RustHost
+    NVIDIA --- RustHost
+    AMD --- RustHost
+    AnyGPU --- RustHost
 ```
-#[kernel] fn  →  metaltile-macros (proc macro)
-                          │
-                    MetalTile IR  (metaltile-core)
-                          │
-               metaltile-codegen (6 opt passes → MSL)
-                 ┌─────────────────────────┐
-                 │                         │
-         metaltile-runtime          metaltile-interp
-         (Metal GPU dispatch)       (CPU reference)
-```
+
+### Backends
+
+| Backend | Target GPU | Compile path | Status |
+|---|---|---|---|
+| **MSL** | Apple (Metal) | `.metal` → `metallib` (`xcrun metal`) | Stable — default, zero-config on macOS |
+| **CUDA** | NVIDIA (sm_90 / 120 / 121, e.g. GB10) | CUDA C++ → NVRTC → PTX, runtime compile | Stable — `--features cuda` |
+| **HIP** | AMD (ROCm, `gfx*`) | HIP C++ → hipRTC → AMDGPU code object | Preview (Phase 1: elementwise smoke path) — `--features hip` |
+| **Vulkan** | Any Vulkan-class GPU | SPIR-V via shaderc → Vulkan compute | Preview (Phase 1: elementwise smoke path) — `--features vulkan` |
+
+The non-Metal backends are opt-in Cargo features so the macOS Metal path stays zero-config and dependency-light; each needs its toolchain/driver at link/run time (CUDA toolkit, ROCm, or the Vulkan SDK). The CUDA runtime additionally provides NVRTC runtime compile, a capturable non-blocking stream, CUDA-graph capture hooks (`begin_capture` / `end_capture` / `graph_launch`), a buffer pool, pinned async host-to-device copies, and an optional `--fmad` codegen gate (`MT_FMAD=1`). See `specs/{CUDA,AMD,VULKAN}_BACKEND_SPEC.md`.
 
 Optimization passes: TypeCheck → ConstFold → TileLowering → Fusion → Schedule → Vectorize.
 
