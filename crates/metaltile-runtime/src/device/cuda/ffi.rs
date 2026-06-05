@@ -58,6 +58,12 @@ unsafe extern "C" {
     pub fn cuMemFree_v2(dptr: CUdeviceptr) -> CUresult;
     pub fn cuMemcpyHtoD_v2(dst: CUdeviceptr, src: *const c_void, byte_count: usize) -> CUresult;
     pub fn cuMemcpyDtoH_v2(dst: *mut c_void, src: CUdeviceptr, byte_count: usize) -> CUresult;
+    // Pinned host memory + async H2D copy — lets per-token activation uploads
+    // enqueue on the stream without a host-blocking GPU drain (pageable
+    // cuMemcpyHtoD is always synchronous; pinned + Async is not).
+    pub fn cuMemAllocHost_v2(pp: *mut *mut c_void, bytesize: usize) -> CUresult;
+    pub fn cuMemFreeHost(p: *mut c_void) -> CUresult;
+    pub fn cuMemcpyHtoDAsync_v2(dst: CUdeviceptr, src: *const c_void, byte_count: usize, stream: CUstream) -> CUresult;
     #[allow(clippy::too_many_arguments)]
     pub fn cuLaunchKernel(
         f: CUfunction,
@@ -84,7 +90,29 @@ unsafe extern "C" {
         hEnd: CUevent,
     ) -> CUresult;
     pub fn cuEventDestroy_v2(hEvent: CUevent) -> CUresult;
+    // ── Stream + CUDA-graph capture (replay a whole decode token as ONE graph
+    // launch, eliminating the ~390 per-kernel launch/host-orchestration costs). ──
+    pub fn cuStreamCreate(phStream: *mut CUstream, flags: c_uint) -> CUresult;
+    pub fn cuStreamDestroy_v2(hStream: CUstream) -> CUresult;
+    pub fn cuStreamSynchronize(hStream: CUstream) -> CUresult;
+    pub fn cuStreamBeginCapture_v2(hStream: CUstream, mode: c_int) -> CUresult;
+    pub fn cuStreamEndCapture(hStream: CUstream, phGraph: *mut CUgraph) -> CUresult;
+    pub fn cuGraphInstantiateWithFlags(
+        phGraphExec: *mut CUgraphExec,
+        hGraph: CUgraph,
+        flags: u64,
+    ) -> CUresult;
+    pub fn cuGraphLaunch(hGraphExec: CUgraphExec, hStream: CUstream) -> CUresult;
+    pub fn cuGraphExecDestroy(hGraphExec: CUgraphExec) -> CUresult;
+    pub fn cuGraphDestroy(hGraph: CUgraph) -> CUresult;
 }
+
+pub type CUgraph = *mut c_void;
+pub type CUgraphExec = *mut c_void;
+/// `CU_STREAM_CAPTURE_MODE_THREAD_LOCAL` — capture scoped to this thread.
+pub const CU_STREAM_CAPTURE_MODE_THREAD_LOCAL: c_int = 1;
+/// `CU_STREAM_NON_BLOCKING` — stream does not implicitly sync with the null stream.
+pub const CU_STREAM_NON_BLOCKING: c_uint = 1;
 
 /// Default event flag (`CU_EVENT_DEFAULT`) — blocking-sync timing event.
 pub const CU_EVENT_DEFAULT: c_uint = 0;

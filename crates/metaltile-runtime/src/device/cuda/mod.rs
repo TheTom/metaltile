@@ -16,10 +16,11 @@
 
 mod ffi;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
+use std::sync::Mutex;
 
 use metaltile_codegen::{CodegenBackend, CudaGenerator};
 use metaltile_core::ir::Kernel;
@@ -167,6 +168,27 @@ pub struct CudaDevice {
     ctx: CUcontext,
     cc_major: i32,
     cc_minor: i32,
+    /// Size-bucketed free-list of device allocations. `cuMemAlloc`/`cuMemFree`
+    /// are synchronous (each blocks the device), so churning ~1000 of them per
+    /// decode token dominated step time. All GPU work is on one (default) stream
+    /// here, so reusing a freed buffer for a later op is safe — stream order
+    /// guarantees the prior kernel finished. Decode reuses the same shapes each
+    /// token ⇒ near-zero alloc cost after warm-up.
+    pool: Mutex<HashMap<usize, Vec<CUdeviceptr>>>,
+    /// Pinned host-staging buffers for async H2D: free-list by size, plus the
+    /// in-flight list whose copies haven't been synced yet (reclaimed on the next
+    /// `synchronize`/`download`). `usize` holds the host pointer.
+    pinned_free: Mutex<HashMap<usize, Vec<usize>>>,
+    pinned_inflight: Mutex<Vec<(usize, usize)>>,
+    /// Dedicated non-blocking stream that ALL kernel launches + async H2D ride on.
+    /// Replacing the null stream is what makes a whole decode token CUDA-graph
+    /// CAPTURABLE (phase-1 of the megakernel: replay ~390 launches as one graph,
+    /// eliminating per-launch host enqueue + inter-kernel bubbles → higher
+    /// sustained bandwidth). `synchronize`/`dtoh` sync THIS stream.
+    stream: CUstream,
+    /// When true, launches/copies are being recorded into a CUDA graph (no real
+    /// execution yet) — `dtoh`/`synchronize` must NOT be called mid-capture.
+    capturing: std::sync::atomic::AtomicBool,
 }
 
 // The context is current on this struct's lifetime; we keep it single-
@@ -202,7 +224,9 @@ impl CudaDevice {
             )?;
             let mut ctx: CUcontext = ptr::null_mut();
             cu_check(cuCtxCreate_v2(&mut ctx, 0, dev), "cuCtxCreate")?;
-            Ok(Some(CudaDevice { ctx, cc_major: major, cc_minor: minor }))
+            let mut stream: CUstream = ptr::null_mut();
+            cu_check(cuStreamCreate(&mut stream, CU_STREAM_NON_BLOCKING), "cuStreamCreate")?;
+            Ok(Some(CudaDevice { ctx, cc_major: major, cc_minor: minor, pool: Mutex::new(HashMap::new()), pinned_free: Mutex::new(HashMap::new()), pinned_inflight: Mutex::new(Vec::new()), stream, capturing: std::sync::atomic::AtomicBool::new(false) }))
         }
     }
 
@@ -241,11 +265,15 @@ impl CudaDevice {
             .or_else(|_| std::env::var("CUDA_HOME"))
             .unwrap_or_else(|_| "/usr/local/cuda".to_string());
         let inc = CString::new(format!("--include-path={cuda_root}/include")).unwrap();
-        // Disable contraction of `a*b+c` into FMA: the CPU oracle uses
-        // non-fused IEEE arithmetic, so default FMA fusion drifts in
+        // Disable contraction of `a*b+c` into FMA by default: the CPU oracle
+        // uses non-fused IEEE arithmetic, so default FMA fusion drifts in
         // accumulation-heavy kernels (conv, attention, recurrence). Matching
-        // the oracle's rounding tightens bit-accuracy.
-        let fmad = CString::new("--fmad=false").unwrap();
+        // the oracle's rounding tightens bit-accuracy for the correctness
+        // suite. For inference/perf runs FMA is strictly better (one fused op
+        // per mul-add ⇒ half the FP issue + shorter dep chain in the hot GEMV/
+        // gather/sdpa loops); opt in with `MT_FMAD=1`.
+        let fmad_on = std::env::var("MT_FMAD").map(|v| v == "1" || v == "true").unwrap_or(false);
+        let fmad = CString::new(if fmad_on { "--fmad=true" } else { "--fmad=false" }).unwrap();
         let opts: [*const c_char; 3] = [arch.as_ptr(), inc.as_ptr(), fmad.as_ptr()];
         let compile_res = unsafe { nvrtcCompileProgram(prog, opts.len() as _, opts.as_ptr()) };
 
@@ -319,10 +347,13 @@ impl CudaDevice {
         if n == 0 {
             return Ok(());
         }
+        cu_check(unsafe { cuStreamSynchronize(self.stream) }, "cuStreamSynchronize(download)")?;
         cu_check(
             unsafe { cuMemcpyDtoH_v2(out.as_mut_ptr() as *mut c_void, buf.ptr, n) },
             "cuMemcpyDtoH",
-        )
+        )?;
+        self.reclaim_pinned();
+        Ok(())
     }
 
     /// Allocate `len` bytes, returning the raw device pointer. The caller
@@ -337,27 +368,80 @@ impl CudaDevice {
         if len == 0 {
             return Ok(0);
         }
+        // Reuse a same-size buffer from the pool if one is free.
+        if let Some(ptr) = self.pool.lock().unwrap().get_mut(&len).and_then(|v| v.pop()) {
+            return Ok(ptr);
+        }
         let mut ptr: CUdeviceptr = 0;
         cu_check(unsafe { cuMemAlloc_v2(&mut ptr, len) }, "cuMemAlloc")?;
         Ok(ptr)
     }
 
     /// Free a pointer returned by [`alloc_raw`]. No-op on a null pointer.
+    /// Eagerly releases to the driver (use [`free_raw_pooled`] on the hot path).
     pub fn free_raw(&self, ptr: CUdeviceptr) {
         if ptr != 0 {
             unsafe { cuMemFree_v2(ptr) };
         }
     }
 
-    /// Copy host bytes into an existing device allocation (host→device).
+    /// Return a `len`-byte allocation to the size-bucketed pool for reuse
+    /// instead of releasing it to the driver — avoids a synchronous
+    /// `cuMemFree`/`cuMemAlloc` round-trip on the next same-size request.
+    pub fn free_raw_pooled(&self, ptr: CUdeviceptr, len: usize) {
+        if ptr != 0 {
+            self.pool.lock().unwrap().entry(len).or_default().push(ptr);
+        }
+    }
+
+    /// Copy host bytes into an existing device allocation (host→device), ASYNC
+    /// via a pinned staging buffer — enqueues on the (ordered) default stream
+    /// without a host-blocking GPU drain. The pinned buffer is reclaimed on the
+    /// next `synchronize`/`download` (by then the copy has completed).
     pub fn htod(&self, ptr: CUdeviceptr, bytes: &[u8]) -> Result<(), MetalTileError> {
         if bytes.is_empty() {
             return Ok(());
         }
+        let len = bytes.len();
+        // Large (one-time weight) uploads stay synchronous — pinning them would
+        // balloon host pinned memory. Only small per-token activations go async.
+        if len > 262_144 {
+            return cu_check(
+                unsafe { cuMemcpyHtoD_v2(ptr, bytes.as_ptr() as *const c_void, len) },
+                "cuMemcpyHtoD",
+            );
+        }
+        let pinned = self
+            .pinned_free
+            .lock()
+            .unwrap()
+            .get_mut(&len)
+            .and_then(|v| v.pop())
+            .unwrap_or_else(|| {
+                let mut p: *mut c_void = ptr::null_mut();
+                unsafe { cuMemAllocHost_v2(&mut p, len) };
+                p as usize
+            });
+        unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), pinned as *mut u8, len) };
         cu_check(
-            unsafe { cuMemcpyHtoD_v2(ptr, bytes.as_ptr() as *const c_void, bytes.len()) },
-            "cuMemcpyHtoD",
-        )
+            unsafe { cuMemcpyHtoDAsync_v2(ptr, pinned as *const c_void, len, self.stream) },
+            "cuMemcpyHtoDAsync",
+        )?;
+        self.pinned_inflight.lock().unwrap().push((pinned, len));
+        Ok(())
+    }
+
+    /// Reclaim in-flight pinned staging buffers after a sync point (their copies
+    /// have completed) back to the free-list for reuse.
+    fn reclaim_pinned(&self) {
+        let mut inflight = self.pinned_inflight.lock().unwrap();
+        if inflight.is_empty() {
+            return;
+        }
+        let mut free = self.pinned_free.lock().unwrap();
+        for (p, len) in inflight.drain(..) {
+            free.entry(len).or_default().push(p);
+        }
     }
 
     /// Copy device memory back to a host slice (device→host).
@@ -365,10 +449,15 @@ impl CudaDevice {
         if out.is_empty() {
             return Ok(());
         }
+        // All kernels run on `self.stream` (non-blocking); a default-stream sync
+        // copy would NOT order against it, so drain the stream first.
+        cu_check(unsafe { cuStreamSynchronize(self.stream) }, "cuStreamSynchronize(dtoh)")?;
         cu_check(
             unsafe { cuMemcpyDtoH_v2(out.as_mut_ptr() as *mut c_void, ptr, out.len()) },
             "cuMemcpyDtoH",
-        )
+        )?;
+        self.reclaim_pinned();
+        Ok(())
     }
 
     /// Launch `func` over a 1-D grid. `args` are raw pointers to each
@@ -412,13 +501,73 @@ impl CudaDevice {
                     grid[0], grid[1], grid[2],
                     block[0], block[1], block[2],
                     shared_bytes,
-                    ptr::null_mut(),
+                    self.stream,
                     args.as_mut_ptr(),
                     ptr::null_mut(),
                 )
             },
             "cuLaunchKernel",
         )?;
+        self.synchronize()
+    }
+
+    /// Like [`launch`] but does NOT synchronize after the launch — the kernel is
+    /// enqueued async on the (ordered) default stream and the caller syncs only
+    /// when it actually reads results back (`dtoh`/`synchronize`). The per-launch
+    /// `cuCtxSynchronize` in `launch` serialized ~390 dispatches/decode-token and
+    /// was the dominant decode overhead (~4ms/token of GPU-idle host stalls).
+    pub fn launch_async(
+        &self,
+        func: CudaFunction,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_bytes: u32,
+        args: &mut [*mut c_void],
+    ) -> Result<(), MetalTileError> {
+        if shared_bytes > 0 {
+            unsafe {
+                cuFuncSetAttribute(func.func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shared_bytes as c_int)
+            };
+        }
+        cu_check(
+            unsafe {
+                cuLaunchKernel(
+                    func.func,
+                    grid[0], grid[1], grid[2],
+                    block[0], block[1], block[2],
+                    shared_bytes,
+                    self.stream,
+                    args.as_mut_ptr(),
+                    ptr::null_mut(),
+                )
+            },
+            "cuLaunchKernel",
+        )
+    }
+
+    /// Begin recording all subsequent stream work into a CUDA graph (phase-1
+    /// megakernel). Caller must run a NO-host-sync (all-device) sequence, then
+    /// `end_capture`. THREAD_LOCAL mode scopes capture to this thread's stream.
+    pub fn begin_capture(&self) -> Result<(), MetalTileError> {
+        self.capturing.store(true, std::sync::atomic::Ordering::SeqCst);
+        cu_check(unsafe { cuStreamBeginCapture_v2(self.stream, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL) }, "cuStreamBeginCapture")
+    }
+
+    /// Finish capture → instantiate an executable graph. Replay with `graph_launch`.
+    pub fn end_capture(&self) -> Result<CUgraphExec, MetalTileError> {
+        let mut graph: CUgraph = ptr::null_mut();
+        cu_check(unsafe { cuStreamEndCapture(self.stream, &mut graph) }, "cuStreamEndCapture")?;
+        self.capturing.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut exec: CUgraphExec = ptr::null_mut();
+        cu_check(unsafe { cuGraphInstantiateWithFlags(&mut exec, graph, 0) }, "cuGraphInstantiate")?;
+        unsafe { cuGraphDestroy(graph) };
+        Ok(exec)
+    }
+
+    /// Replay a captured decode token: ONE host launch replaces ~390 — no
+    /// per-kernel enqueue, no inter-kernel host bubbles. Syncs the stream after.
+    pub fn graph_launch(&self, exec: CUgraphExec) -> Result<(), MetalTileError> {
+        cu_check(unsafe { cuGraphLaunch(exec, self.stream) }, "cuGraphLaunch")?;
         self.synchronize()
     }
 
@@ -633,12 +782,21 @@ impl CudaDevice {
     }
 
     pub fn synchronize(&self) -> Result<(), MetalTileError> {
-        cu_check(unsafe { cuCtxSynchronize() }, "cuCtxSynchronize")
+        cu_check(unsafe { cuStreamSynchronize(self.stream) }, "cuStreamSynchronize")?;
+        self.reclaim_pinned();
+        Ok(())
     }
 }
 
 impl Drop for CudaDevice {
     fn drop(&mut self) {
+        if let Ok(mut pool) = self.pool.lock() {
+            for (_, ptrs) in pool.drain() {
+                for p in ptrs {
+                    unsafe { cuMemFree_v2(p) };
+                }
+            }
+        }
         if !self.ctx.is_null() {
             unsafe { cuCtxDestroy_v2(self.ctx) };
         }
