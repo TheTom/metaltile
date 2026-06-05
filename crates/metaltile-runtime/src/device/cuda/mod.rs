@@ -272,10 +272,23 @@ impl CudaDevice {
         // suite. For inference/perf runs FMA is strictly better (one fused op
         // per mul-add ⇒ half the FP issue + shorter dep chain in the hot GEMV/
         // gather/sdpa loops); opt in with `MT_FMAD=1`.
-        let fmad_on = std::env::var("MT_FMAD").map(|v| v == "1" || v == "true").unwrap_or(false);
+        // FMAD: default ON for inference (FMA fusion halves mul+add latency in
+        // GEMV/SDPA dot-products). Opt out with MT_FMAD=0 for exact CPU-oracle
+        // comparison. The correctness test (argmax 1234) passes with FMAD=true.
+        let fmad_on = std::env::var("MT_FMAD").map(|v| v != "0" && v != "false").unwrap_or(true);
         let fmad = CString::new(if fmad_on { "--fmad=true" } else { "--fmad=false" }).unwrap();
-        let opts: [*const c_char; 3] = [arch.as_ptr(), inc.as_ptr(), fmad.as_ptr()];
-        let compile_res = unsafe { nvrtcCompileProgram(prog, opts.len() as _, opts.as_ptr()) };
+        // MT_FAST_MATH=1: enable --use_fast_math (implies --fmad=true + fast
+        // intrinsics: __expf, __sinf, etc.). Trades ~1-2 ULP precision for
+        // ~2-4x faster transcendentals. Safe for inference softmax.
+        let fast_math_on = std::env::var("MT_FAST_MATH").map(|v| v == "1" || v == "true").unwrap_or(false);
+        let compile_res = if fast_math_on {
+            let fast = CString::new("--use_fast_math").unwrap();
+            let opts: [*const c_char; 3] = [arch.as_ptr(), inc.as_ptr(), fast.as_ptr()];
+            unsafe { nvrtcCompileProgram(prog, opts.len() as _, opts.as_ptr()) }
+        } else {
+            let opts: [*const c_char; 3] = [arch.as_ptr(), inc.as_ptr(), fmad.as_ptr()];
+            unsafe { nvrtcCompileProgram(prog, opts.len() as _, opts.as_ptr()) }
+        };
 
         // Always fetch the log — it carries the actual compiler diagnostics.
         let log = unsafe {
@@ -571,6 +584,20 @@ impl CudaDevice {
         self.synchronize()
     }
 
+    /// Issue `n` sequential graph launches WITHOUT syncing between them, then
+    /// sync once at the end. The GPU stream is FIFO-ordered so graphs execute
+    /// sequentially despite the async enqueues — no data race on intermediate
+    /// buffers. This eliminates the per-token host-GPU handoff overhead that
+    /// `graph_launch` (sync-per-token) incurs, giving the maximum throughput
+    /// for the captured graph. Use only for throughput benchmarking — state
+    /// (KV cache, SSM state) is overwritten sequentially and not meaningful.
+    pub fn graph_launch_batch(&self, exec: CUgraphExec, n: usize) -> Result<(), MetalTileError> {
+        for _ in 0..n {
+            cu_check(unsafe { cuGraphLaunch(exec, self.stream) }, "cuGraphLaunch(batch)")?;
+        }
+        self.synchronize()
+    }
+
     /// A compiled+resident kernel: module, function, device buffers, and the
     /// marshalled scalar/pointer args, ready to launch repeatedly without
     /// re-compiling or re-uploading. Produced by [`CudaDevice::prepare`] and
@@ -589,6 +616,11 @@ impl CudaDevice {
         // 1. IR → CUDA C++ → module.
         let cg = CudaGenerator::new();
         let src = cg.generate(kernel).map_err(|e| MetalTileError::Codegen(e))?;
+        // MT_DUMP_CUDA_SRC=<path>: write generated CUDA C++ for every kernel.
+        if let Ok(dir) = std::env::var("MT_DUMP_CUDA_SRC") {
+            let path = format!("{}/{}.cu", dir, kernel.name);
+            let _ = std::fs::write(&path, &src);
+        }
         let module = self.compile(&src, &format!("{}.cu", kernel.name))?;
         let func = module.function(&kernel.name)?;
         // Dynamic shared-memory size for this launch geometry.

@@ -284,10 +284,14 @@ impl CudaGenerator {
         match p.kind {
             ParamKind::Tensor => {
                 let ty = cuda_type_name(p.dtype);
+                // __restrict__: input tensors don't alias each other or the outputs,
+                // enabling the compiler to issue LDG.128 (L1 read-only cache) and
+                // schedule loads more aggressively. Output tensors are also
+                // __restrict__ since we never alias an output with an input.
                 Ok(if p.is_output {
-                    format!("    {ty}* {}", p.name)
+                    format!("    {ty}* __restrict__ {}", p.name)
                 } else {
-                    format!("    const {ty}* {}", p.name)
+                    format!("    const {ty}* __restrict__ {}", p.name)
                 })
             }
             ParamKind::Scalar => Ok(format!("    {} {}", cuda_type_name(p.dtype), p.name)),
@@ -297,7 +301,7 @@ impl CudaGenerator {
                 let ty = cuda_type_name(p.dtype);
                 let q = if p.is_output { "" } else { "const " };
                 Ok(format!(
-                    "    {q}{ty}* {0},\n    const unsigned int* {0}_shape,\n    const unsigned int* {0}_strides",
+                    "    {q}{ty}* __restrict__ {0},\n    const unsigned int* __restrict__ {0}_shape,\n    const unsigned int* __restrict__ {0}_strides",
                     p.name
                 ))
             }
@@ -592,7 +596,20 @@ impl CudaGenerator {
                     writeln!(out, "{pad}auto {v} = {src};").ok();
                 } else {
                     let idx = self.emit_idx(indices, block, ov, kernel, src)?;
-                    writeln!(out, "{pad}auto {v} = {src}[{idx}];").ok();
+                    // Use __ldg() for read-only tensor loads: routes through the
+                    // L1 read-only (texture) cache, bypasses L1 unified cache,
+                    // and enables the compiler to issue LDG.128 / LDG.64 for
+                    // coalesced accesses. Requires __restrict__ on the parameter
+                    // (added in emit_param). Only apply to Tensor params (not
+                    // builtins like simd_id, tid_x, …).
+                    let is_ro_tensor = kernel.params.iter().any(|p| {
+                        p.name == *src && p.kind == ParamKind::Tensor && !p.is_output
+                    });
+                    if is_ro_tensor {
+                        writeln!(out, "{pad}auto {v} = __ldg(&{src}[{idx}]);").ok();
+                    } else {
+                        writeln!(out, "{pad}auto {v} = {src}[{idx}];").ok();
+                    }
                 }
             }
             Op::Store { dst, indices, value, .. } => {
@@ -1429,16 +1446,16 @@ mod tests {
         let src = g.generate(&vector_add_ir()).unwrap();
         // Signature: pointers + synthetic bounds param.
         assert!(src.contains("extern \"C\" __global__ void vector_add("));
-        assert!(src.contains("const float* a"));
-        assert!(src.contains("const float* b"));
-        assert!(src.contains("float* c"));
+        assert!(src.contains("const float* __restrict__ a"));
+        assert!(src.contains("const float* __restrict__ b"));
+        assert!(src.contains("float* __restrict__ c"));
         assert!(src.contains(&format!("unsigned int {N_ELEMS_PARAM}")));
         // Body: global tid + guard + the add.
         assert!(src.contains("blockIdx.x * blockDim.x + threadIdx.x"));
         assert!(src.contains(&format!("if (_gtid >= {N_ELEMS_PARAM}) return;")));
         assert!(src.contains("unsigned int v_idx_0 = _gtid;"));
-        assert!(src.contains("auto v_x_1 = a[v_idx_0];"));
-        assert!(src.contains("auto v_y_2 = b[v_idx_0];"));
+        assert!(src.contains("auto v_x_1 = __ldg(&a[v_idx_0]);"));
+        assert!(src.contains("auto v_y_2 = __ldg(&b[v_idx_0]);"));
         assert!(src.contains("auto v_sum_3 = v_x_1 + v_y_2;"));
         assert!(src.contains("c[v_idx_0] = v_sum_3;"));
     }

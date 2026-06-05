@@ -309,7 +309,23 @@ impl TargetProfile {
             // CUDA-compat headers; `__frcp_rn` is provided by hipRTC built-ins.
             // Reusing the CUDA mapping verbatim is the whole point of HIP being
             // a CUDA-portable C++ dialect (`AMD_BACKEND_SPEC.md §3`).
-            Target::Cuda | Target::Hip => match op {
+            // `__expf` (CUDA fast exp intrinsic) is ~2x faster than `expf`
+            // with ~2 ULP error vs ~1 ULP. Safe for attention softmax.
+            // HIP: keep `expf` (hipRTC may not have `__expf`).
+            Target::Cuda => match op {
+                Exp => "__expf", Exp2 => "exp2f", Expm1 => "expm1f",
+                Log => "logf", Log2 => "log2f", Log10 => "log10f",
+                Sqrt => "sqrtf", Rsqrt => "rsqrtf", Recip => "__frcp_rn",
+                Abs => "fabsf", Neg => "-", Ceil => "ceilf", Floor => "floorf",
+                Round => "roundf", Trunc => "truncf", Sign => "copysignf",
+                Sin => "sinf", Cos => "cosf", Tan => "tanf",
+                Asin => "asinf", Acos => "acosf", Atan => "atanf",
+                Sinh => "sinhf", Cosh => "coshf",
+                Asinh => "asinhf", Acosh => "acoshf", Atanh => "atanhf",
+                Erf => "erff", ErfInv => "erfinvf",
+                DecodeE2m1 | DecodeE4m3 | DecodeE5m2 | DecodeInt8 => "/*decode-helper*/",
+            },
+            Target::Hip => match op {
                 Exp => "expf", Exp2 => "exp2f", Expm1 => "expm1f",
                 Log => "logf", Log2 => "log2f", Log10 => "log10f",
                 Sqrt => "sqrtf", Rsqrt => "rsqrtf", Recip => "__frcp_rn",
