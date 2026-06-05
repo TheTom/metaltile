@@ -50,6 +50,10 @@ This generates ~104% of MLX's hand-tuned `rms` kernel throughput on M4 Max acros
 - **All three float dtypes.** `f32`, `f16`, and `bfloat16` work identically — native `bfloat` emitted on Metal 3.1+.
 - **CPU interpreter included.** Every kernel runs on the CPU reference interpreter (`metaltile-interp`) for CI without a Mac.
 
+## Scope & naming
+
+metaltile began as a Metal-only (MSL) kernel/code generator. It now emits MSL, CUDA, HIP, and Vulkan (SPIR-V) from a single `#[kernel]` DSL, so the "metal" in the name understates the current scope. A rename is under discussion to better reflect the multi-backend reality — a candidate is **TileForge**, but this is not final and is open for discussion. The current name (`metaltile`) still applies everywhere until any rename is decided.
+
 ## Status
 
 Early development — APIs are not yet stable. Core DSL works; autotuner and type-level shape algebra are planned for v0.2.
