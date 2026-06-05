@@ -21,3 +21,9 @@ pub use error::MetalTileError;
 
 #[cfg(feature = "cuda")]
 pub use device::cuda::{CudaDevice, CudaFunction, CudaModule, DeviceBuffer};
+
+#[cfg(feature = "hip")]
+pub use device::hip::{HipBuffer, HipDevice, HipKernel, HipModuleHandle};
+
+#[cfg(feature = "vulkan")]
+pub use device::vulkan::{VulkanBuffer, VulkanDevice, VulkanPipeline, compile_glsl_to_spv};
