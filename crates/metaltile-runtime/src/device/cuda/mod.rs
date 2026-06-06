@@ -468,25 +468,31 @@ impl CudaDevice {
         // Build void* pointer arrays (W, X, Out) for cuBLAS.
         // IMPORTANT: cublasGemmGroupedBatchedEx (like cublasGemmBatchedEx) requires
         // Aarray[], Barray[], Carray[] to be DEVICE-SIDE arrays of device pointers —
-        // NOT host arrays. Allocate and upload each pointer array to device memory.
-        let a_host: Vec<u64> = w_ptrs.to_vec();   // W device pointers
-        let b_host: Vec<u64> = x_ptrs.to_vec();   // X device pointers
-        let c_host: Vec<u64> = out_ptrs.to_vec(); // Out device pointers
+        // NOT host arrays. Pack all three into ONE contiguous host staging Vec and
+        // upload with a SINGLE H2D copy into ONE pooled device buffer (was: 3×
+        // cuMemAlloc + 3× cuMemcpyHtoD + 3× cuMemFree per call — each driver
+        // alloc/free is a device-wide sync that serialized the stream per grouped
+        // GEMM). `alloc_raw`/`free_raw_pooled` recycle the buffer across calls when
+        // METALTILE_POOL_ALLOC is set (the raw driver alloc here otherwise bypassed
+        // the caching allocator entirely).
         let ptr_bytes = group_count * 8; // each pointer is 8 bytes (u64)
+        let triple_bytes = ptr_bytes * 3;
+        // Layout: [A(W) | B(X) | C(Out)] contiguous.
+        let mut staging: Vec<u64> = Vec::with_capacity(group_count * 3);
+        staging.extend_from_slice(w_ptrs);   // A = W device pointers
+        staging.extend_from_slice(x_ptrs);   // B = X device pointers
+        staging.extend_from_slice(out_ptrs); // C = Out device pointers
 
-        let mut a_dev: CUdeviceptr = 0;
-        let mut b_dev: CUdeviceptr = 0;
-        let mut c_dev: CUdeviceptr = 0;
-        cu_check(unsafe { cuMemAlloc_v2(&mut a_dev, ptr_bytes) }, "cuMemAlloc(a_ptrs)")?;
-        cu_check(unsafe { cuMemAlloc_v2(&mut b_dev, ptr_bytes) }, "cuMemAlloc(b_ptrs)")?;
-        cu_check(unsafe { cuMemAlloc_v2(&mut c_dev, ptr_bytes) }, "cuMemAlloc(c_ptrs)")?;
-        // Synchronous H2D copy for the small pointer arrays
-        let a_bytes = unsafe { std::slice::from_raw_parts(a_host.as_ptr() as *const u8, ptr_bytes) };
-        let b_bytes = unsafe { std::slice::from_raw_parts(b_host.as_ptr() as *const u8, ptr_bytes) };
-        let c_bytes = unsafe { std::slice::from_raw_parts(c_host.as_ptr() as *const u8, ptr_bytes) };
-        cu_check(unsafe { cuMemcpyHtoD_v2(a_dev, a_bytes.as_ptr() as *const c_void, ptr_bytes) }, "cuMemcpyHtoD(a_ptrs)")?;
-        cu_check(unsafe { cuMemcpyHtoD_v2(b_dev, b_bytes.as_ptr() as *const c_void, ptr_bytes) }, "cuMemcpyHtoD(b_ptrs)")?;
-        cu_check(unsafe { cuMemcpyHtoD_v2(c_dev, c_bytes.as_ptr() as *const c_void, ptr_bytes) }, "cuMemcpyHtoD(c_ptrs)")?;
+        let base = self.alloc_raw(triple_bytes)?;
+        let a_dev: CUdeviceptr = base;
+        let b_dev: CUdeviceptr = base + ptr_bytes as CUdeviceptr;
+        let c_dev: CUdeviceptr = base + (2 * ptr_bytes) as CUdeviceptr;
+        let all_bytes = unsafe { std::slice::from_raw_parts(staging.as_ptr() as *const u8, triple_bytes) };
+        // Single synchronous H2D: `staging` is pageable host memory, so a sync copy
+        // guarantees it's fully consumed before this Vec drops (correctness over the
+        // marginal async win for a ≤few-KB pointer array). cuBLAS reads a_dev/b_dev/
+        // c_dev during the enqueued GEMM; the copy is complete before we enqueue.
+        cu_check(unsafe { cuMemcpyHtoD_v2(a_dev, all_bytes.as_ptr() as *const c_void, triple_bytes) }, "cuMemcpyHtoD(grouped_ptrs)")?;
 
         let st = unsafe {
             cublasGemmGroupedBatchedEx(
@@ -512,8 +518,12 @@ impl CudaDevice {
                 CUBLAS_COMPUTE_32F,
             )
         };
-        // Free the device pointer arrays immediately (cuBLAS has consumed them)
-        unsafe { cuMemFree_v2(a_dev); cuMemFree_v2(b_dev); cuMemFree_v2(c_dev); }
+        // Return the single pointer-array buffer to the pool. The GEMM was
+        // ENQUEUED on the ordered stream and reads a_dev/b_dev/c_dev there; any
+        // later op that reuses this buffer also enqueues on the same stream
+        // AFTER the GEMM, so stream order guarantees the read completes before a
+        // reuse overwrites it (same invariant the caching allocator relies on).
+        self.free_raw_pooled(base, triple_bytes);
         if st != CUBLAS_STATUS_SUCCESS {
             return Err(MetalTileError::Dispatch(format!(
                 "cublasGemmGroupedBatchedEx failed: status {st} (groups={group_count} n={n} k={k})"
