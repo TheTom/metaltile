@@ -163,18 +163,67 @@ impl Prepared<'_> {
     }
 }
 
+/// Soft cap on total bytes parked in the caching pool. Beyond this we stop
+/// retaining freed buffers (and evict on demand) so the pool can't hoard VRAM.
+/// 4 GiB is plenty of headroom for a forward's transients while leaving the
+/// 30B weights + KV resident on the 120 GB unified-memory GB10.
+const POOL_CAP_BYTES: usize = 4 * 1024 * 1024 * 1024;
+
+/// Round a requested allocation length up to a pool BUCKET size. A forward's
+/// transient outputs (per-layer/per-expert GEMM/attn buffers) have ever-varying
+/// exact sizes, so an exact-size free-list almost never hits; rounding coalesces
+/// "close enough" sizes into shared buckets so the cache actually reuses memory.
+///
+/// Scheme (mirrors PyTorch's CUDACachingAllocator block rounding):
+/// - `<= 1 MiB`: round up to the next 512 B (small, tight — avoids huge waste).
+/// - `> 1 MiB`:  round up to the next power-of-two-ish 1/8 step (≤ ~12% slack).
+///
+/// MUST be deterministic: `free` re-derives the same bucket from the requested
+/// len that `alloc` did, so a buffer always returns to the bucket it came from.
+#[inline]
+fn size_bucket(len: usize) -> usize {
+    debug_assert!(len > 0);
+    const MIN_BLOCK: usize = 512;
+    const SMALL_LIMIT: usize = 1024 * 1024; // 1 MiB
+    if len <= SMALL_LIMIT {
+        // Round up to a multiple of 512 B.
+        (len + MIN_BLOCK - 1) & !(MIN_BLOCK - 1)
+    } else {
+        // Round up to the next 1/8-of-a-power-of-two step: take the leading
+        // power of two, then snap to the next multiple of (pow2 / 8). Bounds
+        // worst-case slack to ~12.5% while keeping the bucket count small.
+        let pow2 = len.next_power_of_two();
+        let step = (pow2 / 8).max(MIN_BLOCK);
+        (len + step - 1) / step * step
+    }
+}
+
 /// CUDA device + context. NVIDIA analog of `MetalDevice`.
 pub struct CudaDevice {
     ctx: CUcontext,
     cc_major: i32,
     cc_minor: i32,
-    /// Size-bucketed free-list of device allocations. `cuMemAlloc`/`cuMemFree`
-    /// are synchronous (each blocks the device), so churning ~1000 of them per
-    /// decode token dominated step time. All GPU work is on one (default) stream
-    /// here, so reusing a freed buffer for a later op is safe — stream order
-    /// guarantees the prior kernel finished. Decode reuses the same shapes each
-    /// token ⇒ near-zero alloc cost after warm-up.
+    /// Caching device allocator (PyTorch-style). `cuMemAlloc`/`cuMemFree` are
+    /// each a DEVICE-WIDE SYNC on the driver, so churning thousands per forward
+    /// (one per transient GEMM/attn/Mamba output) serializes the whole pipeline
+    /// and starves the compute kernels (nsys: ~2958 alloc/free/forward, GPU 34%
+    /// busy). The pool keys a free-list by a ROUNDED size bucket (see
+    /// [`size_bucket`]) so the ever-varying output shapes of a forward still
+    /// hit the cache. On `free`, the (bucket-sized) buffer is returned to the
+    /// list instead of `cuMemFree`d; on `alloc`, a same-bucket buffer is popped
+    /// if present. All GPU work rides one ordered stream, so reusing a freed
+    /// buffer for a later op is safe — stream order guarantees the prior kernel
+    /// finished consuming it.
+    ///
+    /// Key = bucket size in bytes (NOT the requested len). `pooled_bytes`
+    /// tracks the total parked so we can cap the pool ([`POOL_CAP_BYTES`]) and
+    /// evict beyond it rather than hoard VRAM. Gated by `METALTILE_POOL_ALLOC`
+    /// ([`pool_enabled`]): off ⇒ direct `cuMemAlloc`/`cuMemFree` (clean A/B).
     pool: Mutex<HashMap<usize, Vec<CUdeviceptr>>>,
+    /// Total bytes currently parked in `pool` (sum of bucket_size × count).
+    pooled_bytes: Mutex<usize>,
+    /// `METALTILE_POOL_ALLOC` is set ⇒ caching allocator active. Cached once.
+    pool_enabled: bool,
     /// Pinned host-staging buffers for async H2D: free-list by size, plus the
     /// in-flight list whose copies haven't been synced yet (reclaimed on the next
     /// `synchronize`/`download`). `usize` holds the host pointer.
@@ -232,7 +281,8 @@ impl CudaDevice {
             cu_check(cuCtxCreate_v2(&mut ctx, 0, dev), "cuCtxCreate")?;
             let mut stream: CUstream = ptr::null_mut();
             cu_check(cuStreamCreate(&mut stream, CU_STREAM_NON_BLOCKING), "cuStreamCreate")?;
-            Ok(Some(CudaDevice { ctx, cc_major: major, cc_minor: minor, pool: Mutex::new(HashMap::new()), pinned_free: Mutex::new(HashMap::new()), pinned_inflight: Mutex::new(Vec::new()), stream, capturing: std::sync::atomic::AtomicBool::new(false), cublas: Mutex::new(0) }))
+            let pool_enabled = std::env::var("METALTILE_POOL_ALLOC").is_ok();
+            Ok(Some(CudaDevice { ctx, cc_major: major, cc_minor: minor, pool: Mutex::new(HashMap::new()), pooled_bytes: Mutex::new(0), pool_enabled, pinned_free: Mutex::new(HashMap::new()), pinned_inflight: Mutex::new(Vec::new()), stream, capturing: std::sync::atomic::AtomicBool::new(false), cublas: Mutex::new(0) }))
         }
     }
 
@@ -653,7 +703,21 @@ impl CudaDevice {
         if len == 0 {
             return Ok(0);
         }
-        // Reuse a same-size buffer from the pool if one is free.
+        if self.pool_enabled {
+            // Caching path: serve from the bucket free-list if possible, else
+            // allocate the FULL BUCKET size (so the buffer can be reused by any
+            // later request that rounds to the same bucket). The caller only
+            // touches `len` bytes; the extra slack is the rounding overhead.
+            let bucket = size_bucket(len);
+            if let Some(ptr) = self.pool.lock().unwrap().get_mut(&bucket).and_then(|v| v.pop()) {
+                *self.pooled_bytes.lock().unwrap() -= bucket;
+                return Ok(ptr);
+            }
+            let mut ptr: CUdeviceptr = 0;
+            cu_check(unsafe { cuMemAlloc_v2(&mut ptr, bucket) }, "cuMemAlloc")?;
+            return Ok(ptr);
+        }
+        // Default (pool off): legacy exact-size pool reuse, else fresh alloc.
         if let Some(ptr) = self.pool.lock().unwrap().get_mut(&len).and_then(|v| v.pop()) {
             return Ok(ptr);
         }
@@ -672,11 +736,32 @@ impl CudaDevice {
 
     /// Return a `len`-byte allocation to the size-bucketed pool for reuse
     /// instead of releasing it to the driver — avoids a synchronous
-    /// `cuMemFree`/`cuMemAlloc` round-trip on the next same-size request.
+    /// `cuMemFree`/`cuMemAlloc` round-trip (each a device-wide sync) on the next
+    /// same-bucket request. `len` MUST be the value passed to [`alloc_raw`] so
+    /// the bucket re-derives to the one the buffer was allocated as.
     pub fn free_raw_pooled(&self, ptr: CUdeviceptr, len: usize) {
-        if ptr != 0 {
-            self.pool.lock().unwrap().entry(len).or_default().push(ptr);
+        if ptr == 0 {
+            return;
         }
+        if self.pool_enabled {
+            let bucket = size_bucket(len);
+            // Cap the pool: if parking this buffer would exceed the soft cap,
+            // release it to the driver instead of hoarding VRAM. (One cuMemFree
+            // under memory pressure is acceptable vs. unbounded growth.)
+            let mut parked = self.pooled_bytes.lock().unwrap();
+            if *parked + bucket > POOL_CAP_BYTES {
+                drop(parked);
+                unsafe { cuMemFree_v2(ptr) };
+                return;
+            }
+            *parked += bucket;
+            drop(parked);
+            self.pool.lock().unwrap().entry(bucket).or_default().push(ptr);
+            return;
+        }
+        // Default (pool off): legacy exact-size retain (unbounded; matches the
+        // prior committed behaviour for A/B parity when the flag is unset).
+        self.pool.lock().unwrap().entry(len).or_default().push(ptr);
     }
 
     /// Copy host bytes into an existing device allocation (host→device), ASYNC
@@ -1140,6 +1225,9 @@ impl Drop for CudaDevice {
                     unsafe { cuMemFree_v2(p) };
                 }
             }
+        }
+        if let Ok(mut parked) = self.pooled_bytes.lock() {
+            *parked = 0;
         }
         if !self.ctx.is_null() {
             unsafe { cuCtxDestroy_v2(self.ctx) };
