@@ -395,14 +395,10 @@ impl CudaDevice {
             metaltile_core::DType::BF16 => CUDA_R_16BF,
             other => return Err(MetalTileError::Dispatch(format!("gemm_cublas_grouped: unsupported dtype {other:?}"))),
         };
-        let alpha: f32 = 1.0;
-        let beta: f32 = 0.0;
-
         // cublasGemmGroupedBatchedEx: col-major same as GemmEx.
         // Row-major C[m_i,n] = X[m_i,k] · W[n,k]^T
         // Col-major: transa=T (A=W, lda=k), transb=N (B=X, ldb=k), m_cm=n, n_cm=m_i
         // Each "group" has group_size[i]=1 (one GEMM with its own m).
-        // alpha_array / beta_array: one scalar per group (all same value).
         let n_i = n as i32;
         let k_i = k as i32;
         // alpha/beta: single scalar shared across all groups (same as GemmEx)
@@ -599,21 +595,10 @@ impl CudaDevice {
 
         // Load module (driver JITs PTX → cubin for the live arch).
         let mut module: CUmodule = ptr::null_mut();
-        let load_res = unsafe { cuModuleLoadData(&mut module, ptx.as_ptr() as *const c_void) };
-        if load_res != CUDA_SUCCESS {
-            let mut s: *const c_char = ptr::null();
-            let msg = unsafe {
-                if cuGetErrorString(load_res, &mut s) == CUDA_SUCCESS && !s.is_null() {
-                    std::ffi::CStr::from_ptr(s).to_string_lossy().into_owned()
-                } else { format!("code {load_res}") }
-            };
-            eprintln!("[metaltile] cuModuleLoadData FAILED: {msg} (ptx_size={}, ptr_align={}, prog_name={prog_name})",
-                ptx.len(), ptx.as_ptr() as usize % 8);
-            // Dump first 100 bytes of PTX for debugging
-            let preview: String = ptx.iter().take(100).map(|&b| b as char).collect();
-            eprintln!("[metaltile] PTX preview: {preview:?}");
-            return Err(MetalTileError::Dispatch(format!("cuModuleLoadData: {msg}")));
-        }
+        cu_check(
+            unsafe { cuModuleLoadData(&mut module, ptx.as_ptr() as *const c_void) },
+            "cuModuleLoadData",
+        )?;
         Ok(CudaModule { module })
     }
 
