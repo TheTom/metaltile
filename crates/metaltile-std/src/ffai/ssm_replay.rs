@@ -177,6 +177,19 @@ ssm_step_record!(
     "record_d128_128_32_2"
 );
 ssm_replay!(ssm_replay_d128_128_32, 128u32, 128u32, 32u32, 4u32, "replay_d128_128_32");
+// Nemotron-Nano-30B Mamba2 cell: Dh=64, Ds=128, H=64, G=8 (n_per_t=Ds/32=4).
+// Used as the BATCHED-PREFILL SSD scan: one dispatch runs the sequential SSD
+// forward over all `t_total` prompt tokens per (head, dh-channel), emitting
+// every per-token y[t] plus the final recurrent state for decode continuity.
+ssm_step_record!(
+    ssm_step_record_d64_128_64_8,
+    64u32,
+    128u32,
+    64u32,
+    8u32,
+    4u32,
+    "record_d64_128_64_8"
+);
 
 /// New-syntax correctness for the Mamba 2 SSD tape record + replay kernels on
 /// the small `d16_64_4` cell (Dh=16, Ds=64, H=4, G=2). Oracles are ported
@@ -388,6 +401,106 @@ pub mod kernel_tests {
     fn test_ssm_replay_d16_64_4_masked(dt: DType) -> TestSetup {
         replay_setup(dt, vec![1, 0, 1, 1, 0], true)
     }
+}
+
+/// Nemotron-Nano-30B Mamba2 SSD-scan cell (Dh=64, Ds=128, H=64, G=8). This
+/// registers `ssm_step_record_d64_128_64_8` in the test registry so the
+/// batched-prefill path can `lookup` it by name. Same `naive_record` oracle
+/// as the d16 cell, re-parameterised to the Nemotron dims.
+pub mod kernel_tests_nemotron {
+    use metaltile::{test::*, test_kernel};
+
+    use super::ssm_step_record_d64_128_64_8;
+    use crate::utils::{pack_f32, unpack_f32};
+
+    const DH: usize = 64;
+    const DS: usize = 128;
+    const H: usize = 64;
+    const G: usize = 8;
+
+    fn u32_bytes(v: &[u32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
+
+    #[allow(clippy::too_many_arguments)]
+    fn naive_record(
+        x: &[f32], a_log: &[f32], bmat: &[f32], cmat: &[f32], dvec: &[f32],
+        dt: &[f32], state_in: &[f32], batch: usize, t_total: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut y = vec![0.0_f32; batch * t_total * H * DH];
+        let mut state = state_in.to_vec();
+        for n in 0..batch * H {
+            let b = n / H;
+            let h = n % H;
+            let g = h / (H / G);
+            let a_neg = -a_log[h].exp();
+            for t in 0..t_total {
+                let bt = b * t_total + t;
+                let bt_h = bt * H + h;
+                let bt_g = bt * G + g;
+                let dt_v = dt[bt_h];
+                let d_a = (a_neg * dt_v).exp();
+                for dh in 0..DH {
+                    let x_v = x[bt_h * DH + dh];
+                    let mut y_acc = 0.0_f32;
+                    for ds in 0..DS {
+                        let dbx = x_v * dt_v * bmat[bt_g * DS + ds];
+                        let s0 = (n * DH + dh) * DS + ds;
+                        state[s0] = d_a * state[s0] + dbx;
+                        y_acc += state[s0] * cmat[bt_g * DS + ds];
+                    }
+                    y[bt_h * DH + dh] = y_acc + x_v * dvec[h];
+                }
+            }
+        }
+        (y, state)
+    }
+
+    fn src(n: usize, seed: u64, scale: f32) -> Vec<f32> {
+        let mut s = seed;
+        (0..n).map(|_| {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            (s % 20_000) as f32 / 20_000.0 * scale - scale * 0.5
+        }).collect()
+    }
+
+    fn record_setup(dt: DType) -> TestSetup {
+        let (batch, t) = (1usize, 3usize);
+        let n_total = batch * H;
+        let x = src(batch * t * H * DH, 0x1, 1.0);
+        let a_log = src(H, 0x2, 1.0);
+        let bmat = src(batch * t * G * DS, 0x3, 1.0);
+        let cmat = src(batch * t * G * DS, 0x4, 1.0);
+        let dvec = src(H, 0x5, 0.5);
+        let dtv: Vec<f32> = src(batch * t * H, 0x6, 0.1).iter().map(|v| 0.2 + v).collect();
+        let state_in = src(n_total * DH * DS, 0x7, 0.3);
+
+        let r = |xs: &[f32]| unpack_f32(&pack_f32(xs, dt), dt);
+        let (y_exp, s_exp) = naive_record(
+            &r(&x), &r(&a_log), &r(&bmat), &r(&cmat), &r(&dvec), &r(&dtv), &r(&state_in), batch, t,
+        );
+
+        TestSetup::new(ssm_step_record_d64_128_64_8::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .input(TestBuffer::from_vec("x", pack_f32(&x, dt), dt))
+            .input(TestBuffer::from_vec("a_log", pack_f32(&a_log, dt), dt))
+            .input(TestBuffer::from_vec("b", pack_f32(&bmat, dt), dt))
+            .input(TestBuffer::from_vec("c", pack_f32(&cmat, dt), dt))
+            .input(TestBuffer::from_vec("d", pack_f32(&dvec, dt), dt))
+            .input(TestBuffer::from_vec("dt", pack_f32(&dtv, dt), dt))
+            .input(TestBuffer::from_vec("state_in", pack_f32(&state_in, dt), dt))
+            .input(TestBuffer::from_vec("mask", u32_bytes(&vec![1u32; batch * t]), DType::U32))
+            .input(TestBuffer::zeros("y", batch * t * H * DH, dt))
+            .input(TestBuffer::zeros("state_out", n_total * DH * DS, dt))
+            .input(TestBuffer::zeros("da_log", batch * t * H * DS, dt))
+            .input(TestBuffer::zeros("dbx_log", batch * t * H * DH * DS, dt))
+            .constexpr("t_total", t as u32)
+            .constexpr("has_mask", 0u32)
+            .expect(TestBuffer::from_vec("y", pack_f32(&y_exp, dt), dt))
+            .expect(TestBuffer::from_vec("state_out", pack_f32(&s_exp, dt), dt))
+            .grid_3d(1, DH as u32, (batch * H) as u32, [32, 1, 1])
+    }
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 5e-3, 2e-2])]
+    fn test_ssm_step_record_d64_128_64_8(dt: DType) -> TestSetup { record_setup(dt) }
 }
 
 pub mod kernel_benches {

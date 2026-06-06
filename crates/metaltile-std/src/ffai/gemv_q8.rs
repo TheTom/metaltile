@@ -648,80 +648,95 @@ pub fn ffai_gemv_q4_coalesced_2row<T>(
 }
 
 /// Q4 coalesced matvec with fused ReLU² (MoE expert up).
+/// Multi-warp: `rows_per_tg` warps per threadgroup, each warp owns one output
+/// row. The single-warp form (`rows_per_tg=1`) is memory-LATENCY-bound (small
+/// shared-expert matrices: ~50% BW); packing several warps per TG keeps more
+/// global Q4 loads in flight to hide that latency. `rows_per_tg=1` is
+/// bit-identical to the original (warp=0, lane=tid, row=tgid_x).
 #[kernel]
 pub fn ffai_gemv_q4_coalesced_relu2<T>(
     qs: Tensor<u32>, d_f32: Tensor<f16>, x: Tensor<T>, mut out: Tensor<T>,
     #[constexpr] k_in: u32, #[constexpr] m_out: u32, #[constexpr] rows_per_group: u32,
+    #[constexpr] rows_per_tg: u32,
 ) {
-    let row = tgid_x;
-    let lane = tid;
-    let bpr = k_in / 32u32;
-    let nwords = bpr * 4u32;
-    let qs_base = row * bpr * 4u32;
-    let d_base = row * bpr;
-    let x_base = (row / rows_per_group) * k_in;
-    let mut dot = 0.0f32;
-    for j in range(lane, nwords, 32u32) {
-        let block = j / 4u32;
-        let sub = j % 4u32;
-        let packed = load(qs[qs_base + j]);
-        let d = load(d_f32[d_base + block]).cast::<f32>();
-        let x_blk = x_base + block * 32u32 + sub * 8u32;
-        // Scale `d` is constant across the block's 8 nibbles — factor it OUT of
-        // the inner loop (`d·Σ q·x` not `Σ d·q·x`): the dequant is ALU-bound
-        // (~56 ALU ops/word vs 1 load), so dropping 7 mul/word is a real win.
-        let mut blk = 0.0f32;
-        for i in range(0u32, 8u32, 1u32) {
-            let nib = (packed >> (i * 4u32)) & 0xfu32;
-            let q = nib.cast::<f32>() - select(nib > 7u32, 16.0f32, 0.0f32);
-            blk = blk + q * load(x[x_blk + i]).cast::<f32>();
+    let warp = tid / 32u32;
+    let lane = tid % 32u32;
+    let row = tgid_x * rows_per_tg + warp;
+    if row < m_out {
+        let bpr = k_in / 32u32;
+        let nwords = bpr * 4u32;
+        let qs_base = row * bpr * 4u32;
+        let d_base = row * bpr;
+        let x_base = (row / rows_per_group) * k_in;
+        let mut dot = 0.0f32;
+        for j in range(lane, nwords, 32u32) {
+            let block = j / 4u32;
+            let sub = j % 4u32;
+            let packed = load(qs[qs_base + j]);
+            let d = load(d_f32[d_base + block]).cast::<f32>();
+            let x_blk = x_base + block * 32u32 + sub * 8u32;
+            // Scale `d` is constant across the block's 8 nibbles — factor it OUT of
+            // the inner loop (`d·Σ q·x` not `Σ d·q·x`): the dequant is ALU-bound
+            // (~56 ALU ops/word vs 1 load), so dropping 7 mul/word is a real win.
+            let mut blk = 0.0f32;
+            for i in range(0u32, 8u32, 1u32) {
+                let nib = (packed >> (i * 4u32)) & 0xfu32;
+                let q = nib.cast::<f32>() - select(nib > 7u32, 16.0f32, 0.0f32);
+                blk = blk + q * load(x[x_blk + i]).cast::<f32>();
+            }
+            dot = dot + d * blk;
         }
-        dot = dot + d * blk;
-    }
-    let total = simd_sum(dot);
-    if lane == 0u32 {
-        let r = select(total > 0.0f32, total, 0.0f32);
-        store(out[row], (r * r).cast::<T>());
+        let total = simd_sum(dot);
+        if lane == 0u32 {
+            let r = select(total > 0.0f32, total, 0.0f32);
+            store(out[row], (r * r).cast::<T>());
+        }
     }
 }
 
 /// Q4 coalesced matvec, scale + accumulate in place (MoE expert down).
+/// Multi-warp (`rows_per_tg` warps/TG, one output row each) — same latency-
+/// hiding rationale as the relu2 variant; `rows_per_tg=1` is bit-identical.
 #[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn ffai_gemv_q4_coalesced_accum<T>(
     qs: Tensor<u32>, d_f32: Tensor<f16>, x: Tensor<T>, mut acc: Tensor<T>, scale: Tensor<f32>,
     #[constexpr] k_in: u32, #[constexpr] m_out: u32, #[constexpr] rows_per_group: u32,
+    #[constexpr] rows_per_tg: u32,
 ) {
-    let row = tgid_x;
-    let lane = tid;
-    let bpr = k_in / 32u32;
-    let nwords = bpr * 4u32;
-    let qs_base = row * bpr * 4u32;
-    let d_base = row * bpr;
-    let x_base = (row / rows_per_group) * k_in;
-    let mut dot = 0.0f32;
-    for j in range(lane, nwords, 32u32) {
-        let block = j / 4u32;
-        let sub = j % 4u32;
-        let packed = load(qs[qs_base + j]);
-        let d = load(d_f32[d_base + block]).cast::<f32>();
-        let x_blk = x_base + block * 32u32 + sub * 8u32;
-        // Scale `d` is constant across the block's 8 nibbles — factor it OUT of
-        // the inner loop (`d·Σ q·x` not `Σ d·q·x`): the dequant is ALU-bound
-        // (~56 ALU ops/word vs 1 load), so dropping 7 mul/word is a real win.
-        let mut blk = 0.0f32;
-        for i in range(0u32, 8u32, 1u32) {
-            let nib = (packed >> (i * 4u32)) & 0xfu32;
-            let q = nib.cast::<f32>() - select(nib > 7u32, 16.0f32, 0.0f32);
-            blk = blk + q * load(x[x_blk + i]).cast::<f32>();
+    let warp = tid / 32u32;
+    let lane = tid % 32u32;
+    let row = tgid_x * rows_per_tg + warp;
+    if row < m_out {
+        let bpr = k_in / 32u32;
+        let nwords = bpr * 4u32;
+        let qs_base = row * bpr * 4u32;
+        let d_base = row * bpr;
+        let x_base = (row / rows_per_group) * k_in;
+        let mut dot = 0.0f32;
+        for j in range(lane, nwords, 32u32) {
+            let block = j / 4u32;
+            let sub = j % 4u32;
+            let packed = load(qs[qs_base + j]);
+            let d = load(d_f32[d_base + block]).cast::<f32>();
+            let x_blk = x_base + block * 32u32 + sub * 8u32;
+            // Scale `d` is constant across the block's 8 nibbles — factor it OUT of
+            // the inner loop (`d·Σ q·x` not `Σ d·q·x`): the dequant is ALU-bound
+            // (~56 ALU ops/word vs 1 load), so dropping 7 mul/word is a real win.
+            let mut blk = 0.0f32;
+            for i in range(0u32, 8u32, 1u32) {
+                let nib = (packed >> (i * 4u32)) & 0xfu32;
+                let q = nib.cast::<f32>() - select(nib > 7u32, 16.0f32, 0.0f32);
+                blk = blk + q * load(x[x_blk + i]).cast::<f32>();
+            }
+            dot = dot + d * blk;
         }
-        dot = dot + d * blk;
-    }
-    let total = simd_sum(dot);
-    if lane == 0u32 {
-        let s = load(scale[0]);
-        let prev = load(acc[row]).cast::<f32>();
-        store(acc[row], (prev + s * total).cast::<T>());
+        let total = simd_sum(dot);
+        if lane == 0u32 {
+            let s = load(scale[0]);
+            let prev = load(acc[row]).cast::<f32>();
+            store(acc[row], (prev + s * total).cast::<T>());
+        }
     }
 }
 

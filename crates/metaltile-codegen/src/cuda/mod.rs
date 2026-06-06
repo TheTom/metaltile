@@ -602,11 +602,23 @@ impl CudaGenerator {
                     // coalesced accesses. Requires __restrict__ on the parameter
                     // (added in emit_param). Only apply to Tensor params (not
                     // builtins like simd_id, tid_x, …).
-                    let is_ro_tensor = kernel.params.iter().any(|p| {
+                    let ro_param = kernel.params.iter().find(|p| {
                         p.name == *src && p.kind == ParamKind::Tensor && !p.is_output
                     });
-                    if is_ro_tensor {
-                        writeln!(out, "{pad}auto {v} = __ldg(&{src}[{idx}]);").ok();
+                    if let Some(p) = ro_param {
+                        // Cache-streaming (`__ldcs`, `.cs` hint) for the BIG read-
+                        // ONCE Q4 weights (always U32-packed): they're streamed
+                        // through exactly once per token, so the default cache-all
+                        // (`__ldg`) just pollutes L2 — evicting reused activations.
+                        // `.cs` marks the line evict-first so the weight stream
+                        // doesn't thrash L2. Gated by MT_LDCS_WEIGHTS (default off);
+                        // activations/scales (T/f16) stay __ldg (reused across lanes).
+                        let ldcs = p.dtype == DType::U32 && std::env::var("MT_LDCS_WEIGHTS").is_ok();
+                        if ldcs {
+                            writeln!(out, "{pad}auto {v} = __ldcs(&{src}[{idx}]);").ok();
+                        } else {
+                            writeln!(out, "{pad}auto {v} = __ldg(&{src}[{idx}]);").ok();
+                        }
                     } else {
                         writeln!(out, "{pad}auto {v} = {src}[{idx}];").ok();
                     }

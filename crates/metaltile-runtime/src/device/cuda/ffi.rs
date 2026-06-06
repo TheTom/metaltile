@@ -78,6 +78,22 @@ unsafe extern "C" {
         kernel_params: *mut *mut c_void,
         extra: *mut *mut c_void,
     ) -> CUresult;
+    /// Cooperative kernel launch — all thread blocks can synchronize via
+    /// `cg::grid_group::sync()`. Required for two-phase fused kernels that
+    /// need a global barrier between phases (e.g. MoE up-proj → down-proj).
+    #[allow(clippy::too_many_arguments)]
+    pub fn cuLaunchCooperativeKernel(
+        f: CUfunction,
+        grid_dim_x: c_uint,
+        grid_dim_y: c_uint,
+        grid_dim_z: c_uint,
+        block_dim_x: c_uint,
+        block_dim_y: c_uint,
+        block_dim_z: c_uint,
+        shared_mem_bytes: c_uint,
+        stream: CUstream,
+        kernel_params: *mut *mut c_void,
+    ) -> CUresult;
     pub fn cuGetErrorString(error: CUresult, p_str: *mut *const c_char) -> CUresult;
     // Event-based device timing (GPU-side wall clock, independent of host
     // scheduling jitter). `cuEventElapsedTime` returns milliseconds as f32.
@@ -116,6 +132,120 @@ pub const CU_STREAM_NON_BLOCKING: c_uint = 1;
 
 /// Default event flag (`CU_EVENT_DEFAULT`) — blocking-sync timing event.
 pub const CU_EVENT_DEFAULT: c_uint = 0;
+
+// ── cuBLAS (tensor-core GEMM escape hatch, Path A) ──────────────────────────
+// Legacy cuBLAS API. `cublasGemmEx` exposes the mixed-precision tensor-core
+// path: bf16/f16 A·B with f32 accumulate (CUBLAS_COMPUTE_32F) + the
+// DEFAULT_TENSOR_OP algo selector drives the Tensor Cores on GB10.
+pub type cublasHandle_t = *mut c_void;
+pub type cublasStatus_t = c_int;
+pub const CUBLAS_STATUS_SUCCESS: cublasStatus_t = 0;
+
+// cublasOperation_t
+pub const CUBLAS_OP_N: c_int = 0;
+pub const CUBLAS_OP_T: c_int = 1;
+
+// cudaDataType_t (library_types.h)
+pub const CUDA_R_16F: c_int = 2;
+pub const CUDA_R_32F: c_int = 0;
+pub const CUDA_R_16BF: c_int = 14;
+
+// cublasComputeType_t
+pub const CUBLAS_COMPUTE_32F: c_int = 68;
+
+// cublasGemmAlgo_t
+pub const CUBLAS_GEMM_DEFAULT: c_int = -1;
+pub const CUBLAS_GEMM_DEFAULT_TENSOR_OP: c_int = 99;
+
+// cublasMath_t
+pub const CUBLAS_DEFAULT_MATH: c_int = 0;
+pub const CUBLAS_TENSOR_OP_MATH: c_int = 1;
+
+#[link(name = "cublas")]
+unsafe extern "C" {
+    pub fn cublasCreate_v2(handle: *mut cublasHandle_t) -> cublasStatus_t;
+    pub fn cublasDestroy_v2(handle: cublasHandle_t) -> cublasStatus_t;
+    pub fn cublasSetStream_v2(handle: cublasHandle_t, stream: CUstream) -> cublasStatus_t;
+    pub fn cublasSetMathMode(handle: cublasHandle_t, mode: c_int) -> cublasStatus_t;
+    #[allow(clippy::too_many_arguments)]
+    pub fn cublasGemmEx(
+        handle: cublasHandle_t,
+        transa: c_int,
+        transb: c_int,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        alpha: *const c_void,
+        a: CUdeviceptr,
+        atype: c_int,
+        lda: c_int,
+        b: CUdeviceptr,
+        btype: c_int,
+        ldb: c_int,
+        beta: *const c_void,
+        c: CUdeviceptr,
+        ctype: c_int,
+        ldc: c_int,
+        compute_type: c_int,
+        algo: c_int,
+    ) -> cublasStatus_t;
+    /// Strided-batched GEMM — one call does `batch` independent GEMMs whose
+    /// A/B/C each advance by a fixed stride. Used for the per-expert routed
+    /// MoE grouped GEMM when all experts share the same (m,n,k).
+    #[allow(clippy::too_many_arguments)]
+    pub fn cublasGemmStridedBatchedEx(
+        handle: cublasHandle_t,
+        transa: c_int,
+        transb: c_int,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        alpha: *const c_void,
+        a: CUdeviceptr,
+        atype: c_int,
+        lda: c_int,
+        stride_a: i64,
+        b: CUdeviceptr,
+        btype: c_int,
+        ldb: c_int,
+        stride_b: i64,
+        beta: *const c_void,
+        c: CUdeviceptr,
+        ctype: c_int,
+        ldc: c_int,
+        stride_c: i64,
+        batch_count: c_int,
+        compute_type: c_int,
+        algo: c_int,
+    ) -> cublasStatus_t;
+    /// Grouped-batched GEMM (CUDA 13+): one call over  independent
+    /// GEMM groups, each with its own m/n/k and pointer arrays. Ideal for MoE
+    /// prefill: each group is one active expert, eliminating the per-expert loop.
+    /// All groups share the same dtype (f16 or bf16) and compute type (f32).
+    #[allow(clippy::too_many_arguments)]
+    pub fn cublasGemmGroupedBatchedEx(
+        handle: cublasHandle_t,
+        transa_array: *const c_int,
+        transb_array: *const c_int,
+        m_array: *const c_int,
+        n_array: *const c_int,
+        k_array: *const c_int,
+        alpha_array: *const c_void,
+        aarray: *const *const c_void,
+        atype: c_int,
+        lda_array: *const c_int,
+        barray: *const *const c_void,
+        btype: c_int,
+        ldb_array: *const c_int,
+        beta_array: *const c_void,
+        carray: *mut *mut c_void,
+        ctype: c_int,
+        ldc_array: *const c_int,
+        group_count: c_int,
+        group_size: *const c_int,
+        compute_type: c_int,
+    ) -> cublasStatus_t;
+}
 
 #[link(name = "nvrtc")]
 unsafe extern "C" {

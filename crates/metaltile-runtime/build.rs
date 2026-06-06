@@ -43,6 +43,8 @@ fn cuda() {
 
     println!("cargo:rustc-link-lib=dylib=nvrtc");
     println!("cargo:rustc-link-lib=dylib=cuda");
+    // cuBLAS tensor-core GEMM escape hatch (Path A): ships in the CUDA toolkit.
+    println!("cargo:rustc-link-lib=dylib=cublas");
 }
 
 /// HIP / ROCm linker setup. Windows ships `amdhip64.lib` and `hiprtc.lib`

@@ -189,6 +189,12 @@ pub struct CudaDevice {
     /// When true, launches/copies are being recorded into a CUDA graph (no real
     /// execution yet) — `dtoh`/`synchronize` must NOT be called mid-capture.
     capturing: std::sync::atomic::AtomicBool,
+    /// Lazily-created cuBLAS handle (tensor-core GEMM escape hatch, Path A). The
+    /// coop_tile MMA lowers to software emulation on CUDA (~0.1% of peak); this
+    /// routes the prefill projection/MoE GEMMs through cuBLAS's tensor-core path
+    /// (`cublasGemmEx`, bf16/f16 × f32-accumulate). `usize` holds the handle ptr
+    /// (so the field is plain-Send); bound to `self.stream` on first use.
+    cublas: Mutex<usize>,
 }
 
 // The context is current on this struct's lifetime; we keep it single-
@@ -226,12 +232,249 @@ impl CudaDevice {
             cu_check(cuCtxCreate_v2(&mut ctx, 0, dev), "cuCtxCreate")?;
             let mut stream: CUstream = ptr::null_mut();
             cu_check(cuStreamCreate(&mut stream, CU_STREAM_NON_BLOCKING), "cuStreamCreate")?;
-            Ok(Some(CudaDevice { ctx, cc_major: major, cc_minor: minor, pool: Mutex::new(HashMap::new()), pinned_free: Mutex::new(HashMap::new()), pinned_inflight: Mutex::new(Vec::new()), stream, capturing: std::sync::atomic::AtomicBool::new(false) }))
+            Ok(Some(CudaDevice { ctx, cc_major: major, cc_minor: minor, pool: Mutex::new(HashMap::new()), pinned_free: Mutex::new(HashMap::new()), pinned_inflight: Mutex::new(Vec::new()), stream, capturing: std::sync::atomic::AtomicBool::new(false), cublas: Mutex::new(0) }))
         }
     }
 
     /// Compute capability as `(major, minor)` — e.g. `(12, 1)` on GB10.
     pub fn compute_capability(&self) -> (i32, i32) { (self.cc_major, self.cc_minor) }
+
+    /// Lazily create + cache the cuBLAS handle, bound to `self.stream` with the
+    /// tensor-op math mode. Returns the raw handle ptr.
+    fn cublas_handle(&self) -> Result<cublasHandle_t, MetalTileError> {
+        let mut guard = self.cublas.lock().unwrap();
+        if *guard == 0 {
+            let mut h: cublasHandle_t = ptr::null_mut();
+            let st = unsafe { cublasCreate_v2(&mut h) };
+            if st != CUBLAS_STATUS_SUCCESS {
+                return Err(MetalTileError::Dispatch(format!("cublasCreate failed: {st}")));
+            }
+            unsafe {
+                cublasSetStream_v2(h, self.stream);
+                cublasSetMathMode(h, CUBLAS_TENSOR_OP_MATH);
+            }
+            *guard = h as usize;
+        }
+        Ok(*guard as cublasHandle_t)
+    }
+
+    /// Tensor-core GEMM via cuBLAS (Path A escape hatch). Computes the ROW-MAJOR
+    /// product `C[m,n] = X[m,k] · W[n,k]ᵀ` — i.e. the standard projection
+    /// `out[r,o] = Σ_k W[o,k]·x[r,k]` where weight is `[out=n, k]` and activation
+    /// is `[rows=m, k]`. Inputs/output are device pointers of `dtype` (f16 or
+    /// bf16); accumulation is f32 (CUBLAS_COMPUTE_32F) on the Tensor Cores.
+    ///
+    /// cuBLAS is column-major: a row-major `C[m,n]` is a col-major `[n,m]`. The
+    /// identity `C = X·Wᵀ` (row-major) ⇒ in col-major call
+    /// `op(A)=Wᵀ? ` — we issue `transa=T, transb=N, m=n, n=m, k=k`,
+    /// `A=W (lda=k), B=X (ldb=k), C=out (ldc=n)`, which yields exactly C[m,n].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_cublas(
+        &self,
+        x: CUdeviceptr,   // [m, k] row-major activation
+        w: CUdeviceptr,   // [n, k] row-major weight
+        out: CUdeviceptr, // [m, n] row-major result
+        m: usize,
+        n: usize,
+        k: usize,
+        dtype: metaltile_core::DType,
+    ) -> Result<(), MetalTileError> {
+        let h = self.cublas_handle()?;
+        let cdt = match dtype {
+            metaltile_core::DType::F16 => CUDA_R_16F,
+            metaltile_core::DType::BF16 => CUDA_R_16BF,
+            other => return Err(MetalTileError::Dispatch(format!("gemm_cublas: unsupported dtype {other:?} (need f16/bf16)"))),
+        };
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        // Col-major: out_cm[n,m] = Wᵀ_op · X. A=W (transposed), B=X (no trans).
+        //   transa=T (A is [n,k] row-major = [k,n] col-major, opᵀ → [n,k])
+        //   transb=N (B is [m,k] row-major = [k,m] col-major)
+        //   result [n,m] col-major == [m,n] row-major (our C).
+        let st = unsafe {
+            cublasGemmEx(
+                h,
+                CUBLAS_OP_T,            // op(A) = Aᵀ
+                CUBLAS_OP_N,            // op(B) = B
+                n as c_int,             // rows of op(A) and C  (col-major)
+                m as c_int,             // cols of op(B) and C
+                k as c_int,             // shared dim
+                &alpha as *const f32 as *const c_void,
+                w, cdt, k as c_int,     // A = W, lda = k
+                x, cdt, k as c_int,     // B = X, ldb = k
+                &beta as *const f32 as *const c_void,
+                out, cdt, n as c_int,   // C = out, ldc = n
+                CUBLAS_COMPUTE_32F,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+            )
+        };
+        if st != CUBLAS_STATUS_SUCCESS {
+            return Err(MetalTileError::Dispatch(format!("cublasGemmEx failed: status {st} (m={m} n={n} k={k})")));
+        }
+        Ok(())
+    }
+
+    /// Strided-batched tensor-core GEMM via cuBLAS.
+    /// Computes `batch_count` independent GEMMs in one call:
+    ///   `C_i[m,n] = X_i[m,k] · W_i[n,k]^T`
+    /// where each matrix starts at `x_base + i*stride_x`, `w_base + i*stride_w`,
+    /// `out_base + i*stride_out` (all in BYTES, f16 inputs/output, f32 accumulate).
+    /// Strides must be multiples of 2 (f16 element size).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_cublas_strided_batched(
+        &self,
+        x_base: CUdeviceptr, stride_x: i64,
+        w_base: CUdeviceptr, stride_w: i64,
+        out_base: CUdeviceptr, stride_out: i64,
+        m: usize, n: usize, k: usize,
+        batch_count: usize,
+        dtype: metaltile_core::DType,
+    ) -> Result<(), MetalTileError> {
+        let h = self.cublas_handle()?;
+        let cdt = match dtype {
+            metaltile_core::DType::F16 => CUDA_R_16F,
+            metaltile_core::DType::BF16 => CUDA_R_16BF,
+            other => return Err(MetalTileError::Dispatch(format!("gemm_cublas_strided_batched: unsupported dtype {other:?}"))),
+        };
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        // Col-major: same transpose logic as gemm_cublas (transa=T, transb=N, args reordered).
+        // stride_x / stride_w / stride_out are in ELEMENTS (divide by 2 since f16).
+        let el = 2i64; // bytes per f16 / bf16
+        let st = unsafe {
+            cublasGemmStridedBatchedEx(
+                h,
+                CUBLAS_OP_T,
+                CUBLAS_OP_N,
+                n as c_int, m as c_int, k as c_int,
+                &alpha as *const f32 as *const c_void,
+                w_base, cdt, k as c_int, stride_w / el,
+                x_base, cdt, k as c_int, stride_x / el,
+                &beta as *const f32 as *const c_void,
+                out_base, cdt, n as c_int, stride_out / el,
+                batch_count as c_int,
+                CUBLAS_COMPUTE_32F,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+            )
+        };
+        if st != CUBLAS_STATUS_SUCCESS {
+            return Err(MetalTileError::Dispatch(format!("cublasGemmStridedBatchedEx failed: {st} (m={m} n={n} k={k} batch={batch_count})")));
+        }
+        Ok(())
+    }
+
+    /// Grouped-batched tensor-core GEMM (CUDA 13+). One cuBLAS call over
+    /// `group_count` independent GEMMs, each with its own `(m_i, n, k)` and
+    /// pointer pair `(x_i, w_i, out_i)`. Used for fused MoE prefill: each
+    /// group is one active expert (variable number of tokens, fixed n/k).
+    ///
+    /// All A/B are `[m_i, k]` / `[n, k]` row-major f16; C is `[m_i, n]` f16.
+    /// `x_ptrs[i]`, `w_ptrs[i]`, `out_ptrs[i]` are raw device pointers (u64)
+    /// into already-allocated buffers. `m_per_group[i]` is the token count for
+    /// group i; n and k are shared across all groups.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_cublas_grouped(
+        &self,
+        x_ptrs: &[u64],       // [group_count] device pointers for X
+        w_ptrs: &[u64],       // [group_count] device pointers for W
+        out_ptrs: &[u64],     // [group_count] device pointers for Out
+        m_per_group: &[i32],  // [group_count] rows per group (token count)
+        n: usize,             // shared output dim
+        k: usize,             // shared input dim
+        dtype: metaltile_core::DType,
+    ) -> Result<(), MetalTileError> {
+        let group_count = x_ptrs.len();
+        assert_eq!(w_ptrs.len(), group_count);
+        assert_eq!(out_ptrs.len(), group_count);
+        assert_eq!(m_per_group.len(), group_count);
+        if group_count == 0 { return Ok(()); }
+
+        let h = self.cublas_handle()?;
+        let cdt = match dtype {
+            metaltile_core::DType::F16 => CUDA_R_16F,
+            metaltile_core::DType::BF16 => CUDA_R_16BF,
+            other => return Err(MetalTileError::Dispatch(format!("gemm_cublas_grouped: unsupported dtype {other:?}"))),
+        };
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+
+        // cublasGemmGroupedBatchedEx: col-major same as GemmEx.
+        // Row-major C[m_i,n] = X[m_i,k] · W[n,k]^T
+        // Col-major: transa=T (A=W, lda=k), transb=N (B=X, ldb=k), m_cm=n, n_cm=m_i
+        // Each "group" has group_size[i]=1 (one GEMM with its own m).
+        // alpha_array / beta_array: one scalar per group (all same value).
+        let n_i = n as i32;
+        let k_i = k as i32;
+        // alpha/beta: single scalar shared across all groups (same as GemmEx)
+        let alpha_scalar: f32 = 1.0;
+        let beta_scalar:  f32 = 0.0;
+        let transas: Vec<c_int> = vec![CUBLAS_OP_T; group_count];
+        let transbs: Vec<c_int> = vec![CUBLAS_OP_N; group_count];
+        // m_array[i] = n (cm rows = output cols), n_array[i] = m_per_group[i] (cm cols = token rows)
+        let m_arr: Vec<c_int> = vec![n_i; group_count];
+        let n_arr: Vec<c_int> = m_per_group.to_vec();
+        let k_arr: Vec<c_int> = vec![k_i; group_count];
+        let lda:   Vec<c_int> = vec![k_i; group_count]; // A=W, lda=k
+        let ldb:   Vec<c_int> = vec![k_i; group_count]; // B=X, ldb=k
+        let ldc:   Vec<c_int> = vec![n_i; group_count]; // C=out, ldc=n
+        let group_sizes: Vec<c_int> = vec![1i32; group_count];
+
+        // Build void* pointer arrays (W, X, Out) for cuBLAS.
+        // IMPORTANT: cublasGemmGroupedBatchedEx (like cublasGemmBatchedEx) requires
+        // Aarray[], Barray[], Carray[] to be DEVICE-SIDE arrays of device pointers —
+        // NOT host arrays. Allocate and upload each pointer array to device memory.
+        let a_host: Vec<u64> = w_ptrs.to_vec();   // W device pointers
+        let b_host: Vec<u64> = x_ptrs.to_vec();   // X device pointers
+        let c_host: Vec<u64> = out_ptrs.to_vec(); // Out device pointers
+        let ptr_bytes = group_count * 8; // each pointer is 8 bytes (u64)
+
+        let mut a_dev: CUdeviceptr = 0;
+        let mut b_dev: CUdeviceptr = 0;
+        let mut c_dev: CUdeviceptr = 0;
+        cu_check(unsafe { cuMemAlloc_v2(&mut a_dev, ptr_bytes) }, "cuMemAlloc(a_ptrs)")?;
+        cu_check(unsafe { cuMemAlloc_v2(&mut b_dev, ptr_bytes) }, "cuMemAlloc(b_ptrs)")?;
+        cu_check(unsafe { cuMemAlloc_v2(&mut c_dev, ptr_bytes) }, "cuMemAlloc(c_ptrs)")?;
+        // Synchronous H2D copy for the small pointer arrays
+        let a_bytes = unsafe { std::slice::from_raw_parts(a_host.as_ptr() as *const u8, ptr_bytes) };
+        let b_bytes = unsafe { std::slice::from_raw_parts(b_host.as_ptr() as *const u8, ptr_bytes) };
+        let c_bytes = unsafe { std::slice::from_raw_parts(c_host.as_ptr() as *const u8, ptr_bytes) };
+        cu_check(unsafe { cuMemcpyHtoD_v2(a_dev, a_bytes.as_ptr() as *const c_void, ptr_bytes) }, "cuMemcpyHtoD(a_ptrs)")?;
+        cu_check(unsafe { cuMemcpyHtoD_v2(b_dev, b_bytes.as_ptr() as *const c_void, ptr_bytes) }, "cuMemcpyHtoD(b_ptrs)")?;
+        cu_check(unsafe { cuMemcpyHtoD_v2(c_dev, c_bytes.as_ptr() as *const c_void, ptr_bytes) }, "cuMemcpyHtoD(c_ptrs)")?;
+
+        let st = unsafe {
+            cublasGemmGroupedBatchedEx(
+                h,
+                transas.as_ptr(),
+                transbs.as_ptr(),
+                m_arr.as_ptr(),
+                n_arr.as_ptr(),
+                k_arr.as_ptr(),
+                &alpha_scalar as *const f32 as *const c_void,
+                a_dev as *const *const c_void,
+                cdt,
+                lda.as_ptr(),
+                b_dev as *const *const c_void,
+                cdt,
+                ldb.as_ptr(),
+                &beta_scalar as *const f32 as *const c_void,
+                c_dev as *mut *mut c_void,
+                cdt,
+                ldc.as_ptr(),
+                group_count as c_int,
+                group_sizes.as_ptr(),
+                CUBLAS_COMPUTE_32F,
+            )
+        };
+        // Free the device pointer arrays immediately (cuBLAS has consumed them)
+        unsafe { cuMemFree_v2(a_dev); cuMemFree_v2(b_dev); cuMemFree_v2(c_dev); }
+        if st != CUBLAS_STATUS_SUCCESS {
+            return Err(MetalTileError::Dispatch(format!(
+                "cublasGemmGroupedBatchedEx failed: status {st} (groups={group_count} n={n} k={k})"
+            )));
+        }
+        Ok(())
+    }
 
     /// Compile CUDA C++ source → PTX → loaded module via NVRTC + the
     /// driver JIT. Targets the device's own virtual arch
@@ -265,6 +508,27 @@ impl CudaDevice {
             .or_else(|_| std::env::var("CUDA_HOME"))
             .unwrap_or_else(|_| "/usr/local/cuda".to_string());
         let inc = CString::new(format!("--include-path={cuda_root}/include")).unwrap();
+        // CCCL (CUDA C++ Core Libraries) include — needed for cooperative_groups.h
+        // which includes <cuda/std/type_traits> on CUDA 12+. CCCL lives at either
+        // {cuda_root}/include (older installs) or in the targets/<arch>/include/cccl
+        // sub-directory on distro packages. We probe for the sub-dir and add it if found.
+        // CCCL headers may live in a versioned targets sub-dir (distro CUDA packages
+        // on CUDA 12+). Check common paths; fall back to just the main include dir.
+        let cccl_path = {
+            let fixed1 = format!("{cuda_root}/targets/sbsa-linux/include/cccl");
+            let fixed2 = format!("{cuda_root}/targets/x86_64-linux/include/cccl");
+            // Also try the versioned cuda-13.x path (some distros install both).
+            let by_ver = std::fs::read_dir(format!("{cuda_root}-{}.{}/targets",
+                    self.cc_major, self.cc_minor))
+                .ok()
+                .and_then(|mut rd| rd.next())
+                .and_then(|e| e.ok())
+                .map(|e| format!("{}/include/cccl", e.path().display()));
+            if std::path::Path::new(&fixed1).exists() { Some(fixed1) }
+            else if std::path::Path::new(&fixed2).exists() { Some(fixed2) }
+            else { by_ver.filter(|p| std::path::Path::new(p).exists()) }
+        };
+        let cccl_inc = cccl_path.as_ref().map(|p| CString::new(format!("--include-path={p}")).unwrap());
         // Disable contraction of `a*b+c` into FMA by default: the CPU oracle
         // uses non-fused IEEE arithmetic, so default FMA fusion drifts in
         // accumulation-heavy kernels (conv, attention, recurrence). Matching
@@ -281,13 +545,25 @@ impl CudaDevice {
         // intrinsics: __expf, __sinf, etc.). Trades ~1-2 ULP precision for
         // ~2-4x faster transcendentals. Safe for inference softmax.
         let fast_math_on = std::env::var("MT_FAST_MATH").map(|v| v == "1" || v == "true").unwrap_or(false);
-        let compile_res = if fast_math_on {
-            let fast = CString::new("--use_fast_math").unwrap();
-            let opts: [*const c_char; 3] = [arch.as_ptr(), inc.as_ptr(), fast.as_ptr()];
-            unsafe { nvrtcCompileProgram(prog, opts.len() as _, opts.as_ptr()) }
-        } else {
-            let opts: [*const c_char; 3] = [arch.as_ptr(), inc.as_ptr(), fmad.as_ptr()];
-            unsafe { nvrtcCompileProgram(prog, opts.len() as _, opts.as_ptr()) }
+        let compile_res = match (fast_math_on, cccl_inc.as_ref()) {
+            (true, Some(cccl)) => {
+                let fast = CString::new("--use_fast_math").unwrap();
+                let opts: [*const c_char; 4] = [arch.as_ptr(), inc.as_ptr(), cccl.as_ptr(), fast.as_ptr()];
+                unsafe { nvrtcCompileProgram(prog, opts.len() as _, opts.as_ptr()) }
+            }
+            (false, Some(cccl)) => {
+                let opts: [*const c_char; 4] = [arch.as_ptr(), inc.as_ptr(), cccl.as_ptr(), fmad.as_ptr()];
+                unsafe { nvrtcCompileProgram(prog, opts.len() as _, opts.as_ptr()) }
+            }
+            (true, None) => {
+                let fast = CString::new("--use_fast_math").unwrap();
+                let opts: [*const c_char; 3] = [arch.as_ptr(), inc.as_ptr(), fast.as_ptr()];
+                unsafe { nvrtcCompileProgram(prog, opts.len() as _, opts.as_ptr()) }
+            }
+            (false, None) => {
+                let opts: [*const c_char; 3] = [arch.as_ptr(), inc.as_ptr(), fmad.as_ptr()];
+                unsafe { nvrtcCompileProgram(prog, opts.len() as _, opts.as_ptr()) }
+            }
         };
 
         // Always fetch the log — it carries the actual compiler diagnostics.
@@ -323,10 +599,21 @@ impl CudaDevice {
 
         // Load module (driver JITs PTX → cubin for the live arch).
         let mut module: CUmodule = ptr::null_mut();
-        cu_check(
-            unsafe { cuModuleLoadData(&mut module, ptx.as_ptr() as *const c_void) },
-            "cuModuleLoadData",
-        )?;
+        let load_res = unsafe { cuModuleLoadData(&mut module, ptx.as_ptr() as *const c_void) };
+        if load_res != CUDA_SUCCESS {
+            let mut s: *const c_char = ptr::null();
+            let msg = unsafe {
+                if cuGetErrorString(load_res, &mut s) == CUDA_SUCCESS && !s.is_null() {
+                    std::ffi::CStr::from_ptr(s).to_string_lossy().into_owned()
+                } else { format!("code {load_res}") }
+            };
+            eprintln!("[metaltile] cuModuleLoadData FAILED: {msg} (ptx_size={}, ptr_align={}, prog_name={prog_name})",
+                ptx.len(), ptx.as_ptr() as usize % 8);
+            // Dump first 100 bytes of PTX for debugging
+            let preview: String = ptx.iter().take(100).map(|&b| b as char).collect();
+            eprintln!("[metaltile] PTX preview: {preview:?}");
+            return Err(MetalTileError::Dispatch(format!("cuModuleLoadData: {msg}")));
+        }
         Ok(CudaModule { module })
     }
 
@@ -556,6 +843,46 @@ impl CudaDevice {
             },
             "cuLaunchKernel",
         )
+    }
+
+    /// Cooperative kernel launch — uses `cuLaunchCooperativeKernel` so the
+    /// kernel can call `cg::this_grid().sync()` for a global grid barrier.
+    /// Required for two-phase fused kernels (e.g. MoE up+down in one launch).
+    /// Note: cooperative launch is NOT capturable in a CUDA graph. Fallback to
+    /// eager mode when CUDA-graph capture is active.
+    pub fn launch_async_coop(
+        &self,
+        func: CudaFunction,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_bytes: u32,
+        args: &mut [*mut c_void],
+    ) -> Result<(), MetalTileError> {
+        if shared_bytes > 0 {
+            unsafe {
+                cuFuncSetAttribute(func.func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shared_bytes as c_int)
+            };
+        }
+        cu_check(
+            unsafe {
+                cuLaunchCooperativeKernel(
+                    func.func,
+                    grid[0], grid[1], grid[2],
+                    block[0], block[1], block[2],
+                    shared_bytes,
+                    self.stream,
+                    args.as_mut_ptr(),
+                )
+            },
+            "cuLaunchCooperativeKernel",
+        )
+    }
+
+    /// Returns `true` if a CUDA-graph capture is currently in progress on this
+    /// device's stream. Callers that use non-capturable launches (e.g. cooperative
+    /// kernel) must fall back to a capturable alternative during capture.
+    pub fn is_capturing(&self) -> bool {
+        self.capturing.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Begin recording all subsequent stream work into a CUDA graph (phase-1
