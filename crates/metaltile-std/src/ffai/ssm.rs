@@ -334,6 +334,54 @@ pub mod kernel_tests {
     use super::{conv1d_causal_step, mt_ssm_step, ssm_step, ssm_step_a2d};
     use crate::utils::pack_f32;
 
+    // ── SSD portable-scan kernels: cross-backend codegen smoke ────────────
+    // The Mamba2 SSD chunked-matmul prefill scan (ffai-ops
+    // `ssm_prefill_scan_ssd_portable`) is built from these `ssd_*` #[kernel]
+    // ops + `ffai_gemm_batched`. The whole point is PORTABILITY — they must
+    // codegen cleanly to MSL (Metal), CUDA (Nvidia), HIP (AMD/RDNA4) and
+    // SPIR-V/GLSL (Vulkan), NOT raw-CUDA. This asserts every backend emits a
+    // kernel definition under the declared name (catches a DSL construct that
+    // only lowers on one target).
+    #[test]
+    fn ssd_portable_kernels_codegen_all_backends() {
+        use metaltile_codegen::backend::CodegenBackend;
+        use metaltile_codegen::msl::{MslConfig, MslGenerator};
+        use metaltile_codegen::{CudaGenerator, GlslGenerator, HipGenerator};
+        use metaltile_core::DType;
+        use metaltile_core::ir::KernelMode;
+
+        let kernels: Vec<(&str, metaltile_core::Kernel)> = vec![
+            ("ffai_gemm_batched", {
+                let mut k = super::super::gemm::ffai_gemm_batched::kernel_ir_for(DType::F32);
+                k.mode = KernelMode::Reduction;
+                k
+            }),
+            ("ssd_lcs", { let mut k = super::ssd_lcs::kernel_ir_for(); k.mode = KernelMode::Grid3D; k }),
+            ("ssd_gather_bc", { let mut k = super::ssd_gather_bc::kernel_ir_for(); k.mode = KernelMode::Grid3D; k }),
+            ("ssd_xt", { let mut k = super::ssd_xt::kernel_ir_for(); k.mode = KernelMode::Grid3D; k }),
+            ("ssd_mmask", { let mut k = super::ssd_mmask::kernel_ir_for(); k.mode = KernelMode::Grid3D; k }),
+            ("ssd_bdt", { let mut k = super::ssd_bdt::kernel_ir_for(); k.mode = KernelMode::Grid3D; k }),
+            ("ssd_recur", { let mut k = super::ssd_recur::kernel_ir_for(); k.mode = KernelMode::Grid3D; k }),
+            ("ssd_combine", { let mut k = super::ssd_combine::kernel_ir_for(); k.mode = KernelMode::Grid3D; k }),
+        ];
+        let msl = MslGenerator::new(MslConfig::default());
+        let cuda = CudaGenerator::new();
+        let hip = HipGenerator::new();
+        let glsl = GlslGenerator::new();
+        for (name, k) in &kernels {
+            for (backend, src) in [
+                ("MSL", msl.generate(k)),
+                ("CUDA", cuda.generate(k)),
+                ("HIP", hip.generate(k)),
+                ("SPIRV/GLSL", glsl.generate(k)),
+            ] {
+                let s = src.unwrap_or_else(|e| panic!("{name}: {backend} codegen failed: {e:?}"));
+                assert!(!s.is_empty(), "{name}: {backend} emitted empty source");
+            }
+        }
+        eprintln!("✅ all SSD portable-scan kernels codegen on MSL/CUDA/HIP/SPIRV (portable to Apple/Nvidia/AMD/Vulkan)");
+    }
+
     // ── conv1d_causal_step ──────────────────────────────────────────────
 
     /// CPU oracle: `y[d] = b[d] + w[K-1][d]·x[d] + Σ_{k<K-1} w[k][d]·state[k][d]`,
@@ -980,5 +1028,256 @@ pub fn gated_group_rmsnorm_batched(
         store(out[base + 1u32],   (g1 * rms * load(w[grp * gs + col + 1u32])));
         store(out[base + 2u32],   (g2 * rms * load(w[grp * gs + col + 2u32])));
         store(out[base + 3u32],   (g3 * rms * load(w[grp * gs + col + 3u32])));
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Mamba2 SSD chunked-matmul prefill scan — PORTABLE elementwise kernels.
+//
+// These are the portable (MSL/HIP/SPIRV-codegen) analogs of the raw-CUDA
+// helper kernels in `ffai-ops/src/ssd_scan.rs`. They prepare the operands for
+// the 4 batched GEMMs (run via `ffai_gemm_batched`) and combine the result.
+// Everything runs in f32 (no f16 dependency) for portability + correctness.
+//
+// Fixed for NemotronH: dh=64, ds=128, H=64, G=8 (hpg=8). L (chunk len) is a
+// runtime constexpr (128/256). nc = ceil(T/L). bhc = nc*H. The tail chunk is
+// zero-padded (t = c*L + i ≥ T reads 0).
+// ══════════════════════════════════════════════════════════════════════════
+
+// Inclusive cumsum of A·dt within each chunk → Lcs. One thread per (chunk,head).
+//   A = -exp(a_log[h]),  Lcs[bh, i] = Σ_{k≤i} A·dt[c*L+k]
+// dt layout [T, H]; lcs layout [nc*H, L]. Grid: [nc*H, 1, 1].
+#[kernel]
+pub fn ssd_lcs(
+    dt: Tensor<f32>,       // [T, H]
+    a_log: Tensor<f32>,    // [H]
+    mut lcs: Tensor<f32>,  // [nc*H, L]
+    #[constexpr] t_total: u32,
+    #[constexpr] n_heads: u32,
+    #[constexpr] l: u32,
+    #[constexpr] nc: u32,
+) {
+    let idx = program_id::<0>();      // bh = c*H + h
+    let total = nc * n_heads;
+    if idx < total {
+        let c = idx / n_heads;
+        let h = idx - c * n_heads;
+        let a = 0.0f32 - exp(load(a_log[h]));
+        let mut acc = 0.0f32;
+        for i in range(0u32, l, 1u32) {
+            let t = c * l + i;
+            let dtv = select(t < t_total, load(dt[t * n_heads + h]), 0.0f32);
+            acc = acc + a * dtv;
+            store(lcs[idx * l + i], acc);
+        }
+    }
+}
+
+// Gather/broadcast B,C from [T,G,ds] into [nc*H, L, ds] (head h uses group
+// h/hpg). One thread per output element. Grid: [nc*H*L*ds, 1, 1].
+#[kernel]
+pub fn ssd_gather_bc(
+    b_mat: Tensor<f32>,    // [T, G, ds]
+    c_mat: Tensor<f32>,    // [T, G, ds]
+    mut b_out: Tensor<f32>, // [nc*H, L, ds]
+    mut c_out: Tensor<f32>, // [nc*H, L, ds]
+    #[constexpr] t_total: u32,
+    #[constexpr] n_heads: u32,
+    #[constexpr] n_groups: u32,
+    #[constexpr] hpg: u32,
+    #[constexpr] l: u32,
+    #[constexpr] ds: u32,
+    #[constexpr] nc: u32,
+) {
+    let e = program_id::<0>();
+    let n = nc * n_heads * l * ds;
+    if e < n {
+        let s = e - (e / ds) * ds;
+        let i = (e / ds) - (e / (ds * l)) * l;
+        let bh = e / (ds * l);
+        let c = bh / n_heads;
+        let h = bh - c * n_heads;
+        let g = h / hpg;
+        let t = c * l + i;
+        let valid = t < t_total;
+        let t_safe = select(valid, t, 0u32);
+        let src = (t_safe * n_groups + g) * ds + s;
+        let bv = select(valid, load(b_mat[src]), 0.0f32);
+        let cv = select(valid, load(c_mat[src]), 0.0f32);
+        store(b_out[e], bv);
+        store(c_out[e], cv);
+    }
+}
+
+// Transpose x [T,H,dh] → xt [nc*H, dh, L]. One thread per output element.
+// Grid: [nc*H*dh*L, 1, 1].
+#[kernel]
+pub fn ssd_xt(
+    x: Tensor<f32>,        // [T, H, dh]
+    mut xt: Tensor<f32>,   // [nc*H, dh, L]
+    #[constexpr] t_total: u32,
+    #[constexpr] n_heads: u32,
+    #[constexpr] dh: u32,
+    #[constexpr] l: u32,
+    #[constexpr] nc: u32,
+) {
+    let e = program_id::<0>();
+    let n = nc * n_heads * dh * l;
+    if e < n {
+        let i = e - (e / l) * l;              // position within chunk
+        let p = (e / l) - (e / (l * dh)) * dh; // head_dim index
+        let bh = e / (l * dh);
+        let c = bh / n_heads;
+        let h = bh - c * n_heads;
+        let t = c * l + i;
+        let valid = t < t_total;
+        let t_safe = select(valid, t, 0u32);
+        let v = select(valid, load(x[(t_safe * n_heads + h) * dh + p]), 0.0f32);
+        store(xt[e], v);
+    }
+}
+
+// M[i,j] = CB[i,j]·exp(Lcs[bh,i]-Lcs[bh,j])·dt[c*L+j,h], causal (i≥j) else 0.
+// CB is the output of G1 ([nc*H, L, L]). One thread per element.
+// Grid: [nc*H*L*L, 1, 1].
+#[kernel]
+pub fn ssd_mmask(
+    cb: Tensor<f32>,       // [nc*H, L, L] = C·Bᵀ
+    lcs: Tensor<f32>,      // [nc*H, L]
+    dt: Tensor<f32>,       // [T, H]
+    mut m_out: Tensor<f32>, // [nc*H, L, L]
+    #[constexpr] t_total: u32,
+    #[constexpr] n_heads: u32,
+    #[constexpr] l: u32,
+    #[constexpr] nc: u32,
+) {
+    let e = program_id::<0>();
+    let n = nc * n_heads * l * l;
+    if e < n {
+        let j = e - (e / l) * l;
+        let i = (e / l) - (e / (l * l)) * l;
+        let bh = e / (l * l);
+        // causal mask: i < j → 0
+        if i < j {
+            store(m_out[e], 0.0f32);
+        } else {
+            let c = bh / n_heads;
+            let h = bh - c * n_heads;
+            let tj = c * l + j;
+            let dtj = select(tj < t_total, load(dt[tj * n_heads + h]), 0.0f32);
+            let decay = exp(load(lcs[bh * l + i]) - load(lcs[bh * l + j]));
+            store(m_out[e], load(cb[e]) * decay * dtj);
+        }
+    }
+}
+
+// BdT[s,j] = exp(Lcs[bh,L-1]-Lcs[bh,j])·dt[c*L+j,h]·B[c*L+j,g,s] → [nc*H, ds, L]
+// (decayed, dt-weighted, transposed B for the chunk-state G3). One thread/elem.
+// Grid: [nc*H*ds*L, 1, 1].
+#[kernel]
+pub fn ssd_bdt(
+    b_mat: Tensor<f32>,    // [T, G, ds]
+    lcs: Tensor<f32>,      // [nc*H, L]
+    dt: Tensor<f32>,       // [T, H]
+    mut bdt: Tensor<f32>,  // [nc*H, ds, L]
+    #[constexpr] t_total: u32,
+    #[constexpr] n_heads: u32,
+    #[constexpr] n_groups: u32,
+    #[constexpr] hpg: u32,
+    #[constexpr] l: u32,
+    #[constexpr] ds: u32,
+    #[constexpr] nc: u32,
+) {
+    let e = program_id::<0>();
+    let n = nc * n_heads * ds * l;
+    if e < n {
+        let j = e - (e / l) * l;             // position
+        let s = (e / l) - (e / (l * ds)) * ds; // state index
+        let bh = e / (l * ds);
+        let c = bh / n_heads;
+        let h = bh - c * n_heads;
+        let g = h / hpg;
+        let tj = c * l + j;
+        let valid = tj < t_total;
+        let tj_safe = select(valid, tj, 0u32);
+        let bv = select(valid, load(b_mat[(tj_safe * n_groups + g) * ds + s]), 0.0f32);
+        let dtj = select(valid, load(dt[tj_safe * n_heads + h]), 0.0f32);
+        let decay = exp(load(lcs[bh * l + (l - 1u32)]) - load(lcs[bh * l + j]));
+        store(bdt[e], decay * dtj * bv);
+    }
+}
+
+// Serial inter-chunk recurrence. For each (head h, state s, head_dim p):
+//   S_in[c]   = state at START of chunk c; S_in[0] = state_in[h,p,s]
+//   S_in[c+1] = αc·S_in[c] + S_chunk[c],  αc = exp(Lcs[bh, L-1])
+// Emits SinT[bh] = S_in[c]ᵀ as [nc*H, dh, ds] (transposed for G4) and the FINAL
+// state (after chunk nc-1) → state_out [H, dh, ds].
+// Grid: [H*ds*dh, 1, 1]; one thread per (head, s, p), loops nc serially.
+#[kernel]
+pub fn ssd_recur(
+    s_chunk: Tensor<f32>,   // [nc*H, ds, dh]
+    lcs: Tensor<f32>,       // [nc*H, L]
+    state_in: Tensor<f32>,  // [H, dh, ds]
+    mut sin_t: Tensor<f32>, // [nc*H, dh, ds]  (S_inᵀ per chunk)
+    mut state_out: Tensor<f32>, // [H, dh, ds]
+    #[constexpr] n_heads: u32,
+    #[constexpr] dh: u32,
+    #[constexpr] ds: u32,
+    #[constexpr] l: u32,
+    #[constexpr] nc: u32,
+) {
+    let idx = program_id::<0>();
+    let tot = n_heads * ds * dh;
+    if idx < tot {
+        let p = idx - (idx / dh) * dh;       // head_dim
+        let s = (idx / dh) - (idx / (dh * ds)) * ds; // state
+        let h = idx / (dh * ds);
+        let mut st = load(state_in[(h * dh + p) * ds + s]);
+        for c in range(0u32, nc, 1u32) {
+            let bh = c * n_heads + h;
+            // emit S_inᵀ for this chunk BEFORE applying it
+            store(sin_t[(bh * dh + p) * ds + s], st);
+            let alpha = exp(load(lcs[bh * l + (l - 1u32)]));
+            let sc = load(s_chunk[(bh * ds + s) * dh + p]);
+            st = alpha * st + sc;
+        }
+        store(state_out[(h * dh + p) * ds + s], st);
+    }
+}
+
+// Final combine. y[t,h,p] = y_intra[bh,i,p] + exp(Lcs[bh,i])·CS[bh,i,p]
+//   + x[t,h,p]·D[h]. y_intra, CS are [nc*H, L, dh]; output y [T,H,dh].
+// One thread per (bh, i, p) element; tail rows (t≥T) skipped.
+// Grid: [nc*H*L*dh, 1, 1].
+#[kernel]
+pub fn ssd_combine(
+    y_intra: Tensor<f32>,  // [nc*H, L, dh]
+    cs: Tensor<f32>,       // [nc*H, L, dh]
+    lcs: Tensor<f32>,      // [nc*H, L]
+    x: Tensor<f32>,        // [T, H, dh]
+    d_skip: Tensor<f32>,   // [H]
+    mut y: Tensor<f32>,    // [T, H, dh]
+    #[constexpr] t_total: u32,
+    #[constexpr] n_heads: u32,
+    #[constexpr] dh: u32,
+    #[constexpr] l: u32,
+    #[constexpr] nc: u32,
+) {
+    let e = program_id::<0>();
+    let n = nc * n_heads * l * dh;
+    if e < n {
+        let p = e - (e / dh) * dh;
+        let i = (e / dh) - (e / (dh * l)) * l;
+        let bh = e / (dh * l);
+        let c = bh / n_heads;
+        let h = bh - c * n_heads;
+        let t = c * l + i;
+        if t < t_total {
+            let yi = load(y_intra[e]);
+            let decay = exp(load(lcs[bh * l + i]));
+            let ci = load(cs[e]) * decay;
+            let xv = load(x[(t * n_heads + h) * dh + p]);
+            store(y[(t * n_heads + h) * dh + p], yi + ci + xv * load(d_skip[h]));
+        }
     }
 }
