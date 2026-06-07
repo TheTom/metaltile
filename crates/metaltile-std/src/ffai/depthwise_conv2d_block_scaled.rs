@@ -91,7 +91,7 @@ pub fn mt_mxfp4_depthwise_conv2d<T>(
             let col = ky * k + kx;
             let nib = (load(weight[w_row_pack + col / 8u32]) >> ((col % 8u32) * 4u32)) & 0xFu32;
             let scale = exp2(load(scales[w_row_blk + col / block_size]).cast::<f32>() - 127.0f32);
-            let wt = e2m1_decode(nib) * scale;
+            let wt = mt_decode_e2m1(nib) * scale;
             acc = acc + x_m * wt;
         }
     }
@@ -150,8 +150,8 @@ pub fn mt_nvfp4_depthwise_conv2d<T>(
             let col = ky * k + kx;
             let nib = (load(weight[w_row_pack + col / 8u32]) >> ((col % 8u32) * 4u32)) & 0xFu32;
             let scale =
-                e4m3_decode(load(scales[w_row_blk + col / block_size]).cast::<u32>()) * global;
-            let wt = e2m1_decode(nib) * scale;
+                mt_decode_e4m3(load(scales[w_row_blk + col / block_size]).cast::<u32>()) * global;
+            let wt = mt_decode_e2m1(nib) * scale;
             acc = acc + x_m * wt;
         }
     }
@@ -209,7 +209,7 @@ pub fn mt_fp4_depthwise_conv2d<T>(
             let col = ky * k + kx;
             let nib = (load(weight[w_row_pack + col / 8u32]) >> ((col % 8u32) * 4u32)) & 0xFu32;
             let scale = load(scales[w_row_blk + col / block_size]);
-            let wt = e2m1_decode(nib) * scale;
+            let wt = mt_decode_e2m1(nib) * scale;
             acc = acc + x_m * wt;
         }
     }
@@ -264,7 +264,7 @@ pub fn mt_mxfp8_e4m3_depthwise_conv2d<T>(
             let x = load(input[in_c_base + ih * in_w + iw]).cast::<f32>();
             let x_m = select(valid, x, 0.0f32);
             let col = ky * k + kx;
-            let elem = e4m3_decode(load(weight[w_row + col]).cast::<u32>());
+            let elem = mt_decode_e4m3(load(weight[w_row + col]).cast::<u32>());
             let scale = exp2(load(scales[w_row_blk + col / block_size]).cast::<f32>() - 127.0f32);
             let wt = elem * scale;
             acc = acc + x_m * wt;
@@ -321,7 +321,7 @@ pub fn mt_mxfp8_e5m2_depthwise_conv2d<T>(
             let x = load(input[in_c_base + ih * in_w + iw]).cast::<f32>();
             let x_m = select(valid, x, 0.0f32);
             let col = ky * k + kx;
-            let elem = e5m2_decode(load(weight[w_row + col]).cast::<u32>());
+            let elem = mt_decode_e5m2(load(weight[w_row + col]).cast::<u32>());
             let scale = exp2(load(scales[w_row_blk + col / block_size]).cast::<f32>() - 127.0f32);
             let wt = elem * scale;
             acc = acc + x_m * wt;
@@ -378,7 +378,7 @@ pub fn mt_fp8_e5m2_depthwise_conv2d<T>(
             let x = load(input[in_c_base + ih * in_w + iw]).cast::<f32>();
             let x_m = select(valid, x, 0.0f32);
             let col = ky * k + kx;
-            let elem = e5m2_decode(load(weight[w_row + col]).cast::<u32>());
+            let elem = mt_decode_e5m2(load(weight[w_row + col]).cast::<u32>());
             let scale = load(scales[w_row_blk + col / block_size]);
             let wt = elem * scale;
             acc = acc + x_m * wt;
@@ -436,7 +436,7 @@ pub fn mt_nvfp8_depthwise_conv2d<T>(
             let x = load(input[in_c_base + ih * in_w + iw]).cast::<f32>();
             let x_m = select(valid, x, 0.0f32);
             let col = ky * k + kx;
-            let elem = e4m3_decode(load(weight[w_row + col]).cast::<u32>());
+            let elem = mt_decode_e4m3(load(weight[w_row + col]).cast::<u32>());
             let scale = load(scales[w_row_blk + col / block_size]);
             let wt = elem * scale;
             acc = acc + x_m * wt;
@@ -493,7 +493,7 @@ pub fn mt_int8_depthwise_conv2d<T>(
             let x = load(input[in_c_base + ih * in_w + iw]).cast::<f32>();
             let x_m = select(valid, x, 0.0f32);
             let col = ky * k + kx;
-            let elem = int8_decode(load(weight[w_row + col]).cast::<u32>());
+            let elem = mt_decode_int8(load(weight[w_row + col]).cast::<u32>());
             let scale = load(scales[w_row_blk + col / block_size]);
             let wt = elem * scale;
             acc = acc + x_m * wt;
@@ -734,7 +734,7 @@ pub fn mt_mxint8_depthwise_conv2d<T>(
             let x = load(input[in_c_base + ih * in_w + iw]).cast::<f32>();
             let x_m = select(valid, x, 0.0f32);
             let col = ky * k + kx;
-            let elem = int8_decode(load(weight[w_row + col]).cast::<u32>());
+            let elem = mt_decode_int8(load(weight[w_row + col]).cast::<u32>());
             let sbits = load(scales[w_row_blk + col / block_size]).cast::<f32>();
             let scale = exp2(sbits - 127.0f32); // E8M0: 2^(bits-127)
             let wt = elem * scale;
@@ -805,7 +805,7 @@ pub fn mt_fp4_f16_depthwise_conv2d<T>(
             let col = ky * k + kx;
             let nib = (load(weight[w_row_pack + col / 8u32]) >> ((col % 8u32) * 4u32)) & 0xFu32;
             let scale = load(scales[w_row_blk + col / block_size]).cast::<f32>();
-            let wt = e2m1_decode(nib) * scale;
+            let wt = mt_decode_e2m1(nib) * scale;
             acc = acc + x_m * wt;
         }
     }
@@ -861,7 +861,7 @@ pub fn mt_fp8_e5m2_f16_depthwise_conv2d<T>(
             let x = load(input[in_c_base + ih * in_w + iw]).cast::<f32>();
             let x_m = select(valid, x, 0.0f32);
             let col = ky * k + kx;
-            let elem = e5m2_decode(load(weight[w_row + col]).cast::<u32>());
+            let elem = mt_decode_e5m2(load(weight[w_row + col]).cast::<u32>());
             let scale = load(scales[w_row_blk + col / block_size]).cast::<f32>();
             let wt = elem * scale;
             acc = acc + x_m * wt;
@@ -920,7 +920,7 @@ pub fn mt_nvfp8_f16_depthwise_conv2d<T>(
             let x = load(input[in_c_base + ih * in_w + iw]).cast::<f32>();
             let x_m = select(valid, x, 0.0f32);
             let col = ky * k + kx;
-            let elem = e4m3_decode(load(weight[w_row + col]).cast::<u32>());
+            let elem = mt_decode_e4m3(load(weight[w_row + col]).cast::<u32>());
             let scale = load(scales[w_row_blk + col / block_size]).cast::<f32>();
             let wt = elem * scale;
             acc = acc + x_m * wt;
@@ -1064,7 +1064,7 @@ pub fn mt_int8_f16_depthwise_conv2d<T>(
             let x = load(input[in_c_base + ih * in_w + iw]).cast::<f32>();
             let x_m = select(valid, x, 0.0f32);
             let col = ky * k + kx;
-            let elem = int8_decode(load(weight[w_row + col]).cast::<u32>());
+            let elem = mt_decode_int8(load(weight[w_row + col]).cast::<u32>());
             let scale = load(scales[w_row_blk + col / block_size]).cast::<f32>();
             let wt = elem * scale;
             acc = acc + x_m * wt;
@@ -1753,188 +1753,59 @@ pub mod kernel_benches {
     }
 
     macro_rules! dw_bench_fmt {
-        ($fn:ident, $kernel:path, $fmt:expr, $name:literal) => {
-            #[bench(name = $name, dtypes = [f32, f16, bf16])]
+        ($fn:ident, $kernel:path, $fmt:expr) => {
+            #[bench(dtypes = [f32, f16, bf16])]
             fn $fn(dt: DType) -> BenchSetup {
                 dw_bench($kernel(dt), $fmt, 1, 256, 64, 64, 8, 1, 0, 1, dt)
             }
         };
     }
-    dw_bench_fmt!(
-        bench_mxfp4,
-        mt_mxfp4_depthwise_conv2d::kernel_ir_for,
-        QFormat::Mxfp4,
-        "ffai/depthwise_conv2d_block/mxfp4"
-    );
-    dw_bench_fmt!(
-        bench_nvfp4,
-        mt_nvfp4_depthwise_conv2d::kernel_ir_for,
-        QFormat::Nvfp4,
-        "ffai/depthwise_conv2d_block/nvfp4"
-    );
-    dw_bench_fmt!(
-        bench_fp4,
-        mt_fp4_depthwise_conv2d::kernel_ir_for,
-        QFormat::Fp4,
-        "ffai/depthwise_conv2d_block/fp4"
-    );
+    dw_bench_fmt!(bench_mxfp4, mt_mxfp4_depthwise_conv2d::kernel_ir_for, QFormat::Mxfp4);
+    dw_bench_fmt!(bench_nvfp4, mt_nvfp4_depthwise_conv2d::kernel_ir_for, QFormat::Nvfp4);
+    dw_bench_fmt!(bench_fp4, mt_fp4_depthwise_conv2d::kernel_ir_for, QFormat::Fp4);
     dw_bench_fmt!(
         bench_mxfp8_e4m3,
         mt_mxfp8_e4m3_depthwise_conv2d::kernel_ir_for,
-        QFormat::Mxfp8E4,
-        "ffai/depthwise_conv2d_block/mxfp8_e4m3"
+        QFormat::Mxfp8E4
     );
     dw_bench_fmt!(
         bench_mxfp8_e5m2,
         mt_mxfp8_e5m2_depthwise_conv2d::kernel_ir_for,
-        QFormat::Mxfp8E5,
-        "ffai/depthwise_conv2d_block/mxfp8_e5m2"
+        QFormat::Mxfp8E5
     );
-    dw_bench_fmt!(
-        bench_fp8_e5m2,
-        mt_fp8_e5m2_depthwise_conv2d::kernel_ir_for,
-        QFormat::Fp8E5m2,
-        "ffai/depthwise_conv2d_block/fp8_e5m2"
-    );
-    dw_bench_fmt!(
-        bench_nvfp8,
-        mt_nvfp8_depthwise_conv2d::kernel_ir_for,
-        QFormat::Nvfp8,
-        "ffai/depthwise_conv2d_block/nvfp8"
-    );
-    dw_bench_fmt!(
-        bench_int8,
-        mt_int8_depthwise_conv2d::kernel_ir_for,
-        QFormat::Int8,
-        "ffai/depthwise_conv2d_block/int8"
-    );
+    dw_bench_fmt!(bench_fp8_e5m2, mt_fp8_e5m2_depthwise_conv2d::kernel_ir_for, QFormat::Fp8E5m2);
+    dw_bench_fmt!(bench_nvfp8, mt_nvfp8_depthwise_conv2d::kernel_ir_for, QFormat::Nvfp8);
+    dw_bench_fmt!(bench_int8, mt_int8_depthwise_conv2d::kernel_ir_for, QFormat::Int8);
     // Symmetric sub-byte ints (int2-6, FP32 group scale) + MXINT (mxint2-6, E8M0
     // block scale) + MXINT8 (8-bit, E8M0).
-    dw_bench_fmt!(
-        bench_int2,
-        mt_int2_depthwise_conv2d::kernel_ir_for,
-        QFormat::Int2,
-        "ffai/depthwise_conv2d_block/int2"
-    );
-    dw_bench_fmt!(
-        bench_int3,
-        mt_int3_depthwise_conv2d::kernel_ir_for,
-        QFormat::Int3,
-        "ffai/depthwise_conv2d_block/int3"
-    );
-    dw_bench_fmt!(
-        bench_int4,
-        mt_int4_depthwise_conv2d::kernel_ir_for,
-        QFormat::Int4,
-        "ffai/depthwise_conv2d_block/int4"
-    );
-    dw_bench_fmt!(
-        bench_int5,
-        mt_int5_depthwise_conv2d::kernel_ir_for,
-        QFormat::Int5,
-        "ffai/depthwise_conv2d_block/int5"
-    );
-    dw_bench_fmt!(
-        bench_int6,
-        mt_int6_depthwise_conv2d::kernel_ir_for,
-        QFormat::Int6,
-        "ffai/depthwise_conv2d_block/int6"
-    );
-    dw_bench_fmt!(
-        bench_mxint2,
-        mt_mxint2_depthwise_conv2d::kernel_ir_for,
-        QFormat::Mxint2,
-        "ffai/depthwise_conv2d_block/mxint2"
-    );
-    dw_bench_fmt!(
-        bench_mxint3,
-        mt_mxint3_depthwise_conv2d::kernel_ir_for,
-        QFormat::Mxint3,
-        "ffai/depthwise_conv2d_block/mxint3"
-    );
-    dw_bench_fmt!(
-        bench_mxint4,
-        mt_mxint4_depthwise_conv2d::kernel_ir_for,
-        QFormat::Mxint4,
-        "ffai/depthwise_conv2d_block/mxint4"
-    );
-    dw_bench_fmt!(
-        bench_mxint5,
-        mt_mxint5_depthwise_conv2d::kernel_ir_for,
-        QFormat::Mxint5,
-        "ffai/depthwise_conv2d_block/mxint5"
-    );
-    dw_bench_fmt!(
-        bench_mxint6,
-        mt_mxint6_depthwise_conv2d::kernel_ir_for,
-        QFormat::Mxint6,
-        "ffai/depthwise_conv2d_block/mxint6"
-    );
-    dw_bench_fmt!(
-        bench_mxint8,
-        mt_mxint8_depthwise_conv2d::kernel_ir_for,
-        QFormat::Mxint8,
-        "ffai/depthwise_conv2d_block/mxint8"
-    );
+    dw_bench_fmt!(bench_int2, mt_int2_depthwise_conv2d::kernel_ir_for, QFormat::Int2);
+    dw_bench_fmt!(bench_int3, mt_int3_depthwise_conv2d::kernel_ir_for, QFormat::Int3);
+    dw_bench_fmt!(bench_int4, mt_int4_depthwise_conv2d::kernel_ir_for, QFormat::Int4);
+    dw_bench_fmt!(bench_int5, mt_int5_depthwise_conv2d::kernel_ir_for, QFormat::Int5);
+    dw_bench_fmt!(bench_int6, mt_int6_depthwise_conv2d::kernel_ir_for, QFormat::Int6);
+    dw_bench_fmt!(bench_mxint2, mt_mxint2_depthwise_conv2d::kernel_ir_for, QFormat::Mxint2);
+    dw_bench_fmt!(bench_mxint3, mt_mxint3_depthwise_conv2d::kernel_ir_for, QFormat::Mxint3);
+    dw_bench_fmt!(bench_mxint4, mt_mxint4_depthwise_conv2d::kernel_ir_for, QFormat::Mxint4);
+    dw_bench_fmt!(bench_mxint5, mt_mxint5_depthwise_conv2d::kernel_ir_for, QFormat::Mxint5);
+    dw_bench_fmt!(bench_mxint6, mt_mxint6_depthwise_conv2d::kernel_ir_for, QFormat::Mxint6);
+    dw_bench_fmt!(bench_mxint8, mt_mxint8_depthwise_conv2d::kernel_ir_for, QFormat::Mxint8);
     // FP16-scale twins (fp8_e4m3_f16 reuses the nvfp8_f16 kernel).
-    dw_bench_fmt!(
-        bench_nvfp8_f16,
-        mt_nvfp8_f16_depthwise_conv2d::kernel_ir_for,
-        QFormat::Nvfp8F16,
-        "ffai/depthwise_conv2d_block/nvfp8_f16"
-    );
+    dw_bench_fmt!(bench_nvfp8_f16, mt_nvfp8_f16_depthwise_conv2d::kernel_ir_for, QFormat::Nvfp8F16);
     dw_bench_fmt!(
         bench_fp8_e4m3_f16,
         mt_nvfp8_f16_depthwise_conv2d::kernel_ir_for,
-        QFormat::Fp8E4m3F16,
-        "ffai/depthwise_conv2d_block/fp8_e4m3_f16"
+        QFormat::Fp8E4m3F16
     );
-    dw_bench_fmt!(
-        bench_fp4_f16,
-        mt_fp4_f16_depthwise_conv2d::kernel_ir_for,
-        QFormat::Fp4F16,
-        "ffai/depthwise_conv2d_block/fp4_f16"
-    );
+    dw_bench_fmt!(bench_fp4_f16, mt_fp4_f16_depthwise_conv2d::kernel_ir_for, QFormat::Fp4F16);
     dw_bench_fmt!(
         bench_fp8_e5m2_f16,
         mt_fp8_e5m2_f16_depthwise_conv2d::kernel_ir_for,
-        QFormat::Fp8E5m2F16,
-        "ffai/depthwise_conv2d_block/fp8_e5m2_f16"
+        QFormat::Fp8E5m2F16
     );
-    dw_bench_fmt!(
-        bench_int2_f16,
-        mt_int2_f16_depthwise_conv2d::kernel_ir_for,
-        QFormat::Int2F16,
-        "ffai/depthwise_conv2d_block/int2_f16"
-    );
-    dw_bench_fmt!(
-        bench_int3_f16,
-        mt_int3_f16_depthwise_conv2d::kernel_ir_for,
-        QFormat::Int3F16,
-        "ffai/depthwise_conv2d_block/int3_f16"
-    );
-    dw_bench_fmt!(
-        bench_int4_f16,
-        mt_int4_f16_depthwise_conv2d::kernel_ir_for,
-        QFormat::Int4F16,
-        "ffai/depthwise_conv2d_block/int4_f16"
-    );
-    dw_bench_fmt!(
-        bench_int5_f16,
-        mt_int5_f16_depthwise_conv2d::kernel_ir_for,
-        QFormat::Int5F16,
-        "ffai/depthwise_conv2d_block/int5_f16"
-    );
-    dw_bench_fmt!(
-        bench_int6_f16,
-        mt_int6_f16_depthwise_conv2d::kernel_ir_for,
-        QFormat::Int6F16,
-        "ffai/depthwise_conv2d_block/int6_f16"
-    );
-    dw_bench_fmt!(
-        bench_int8_f16,
-        mt_int8_f16_depthwise_conv2d::kernel_ir_for,
-        QFormat::Int8F16,
-        "ffai/depthwise_conv2d_block/int8_f16"
-    );
+    dw_bench_fmt!(bench_int2_f16, mt_int2_f16_depthwise_conv2d::kernel_ir_for, QFormat::Int2F16);
+    dw_bench_fmt!(bench_int3_f16, mt_int3_f16_depthwise_conv2d::kernel_ir_for, QFormat::Int3F16);
+    dw_bench_fmt!(bench_int4_f16, mt_int4_f16_depthwise_conv2d::kernel_ir_for, QFormat::Int4F16);
+    dw_bench_fmt!(bench_int5_f16, mt_int5_f16_depthwise_conv2d::kernel_ir_for, QFormat::Int5F16);
+    dw_bench_fmt!(bench_int6_f16, mt_int6_f16_depthwise_conv2d::kernel_ir_for, QFormat::Int6F16);
+    dw_bench_fmt!(bench_int8_f16, mt_int8_f16_depthwise_conv2d::kernel_ir_for, QFormat::Int8F16);
 }

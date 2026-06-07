@@ -172,10 +172,9 @@ pub fn mt_moe_gather_qmm_mma_int4_bm8_mpp<T>(
 
 #[cfg(test)]
 mod tests {
-    use metaltile_core::ir::Op;
+    use metaltile::core::{DType, ir::Op};
 
     use super::*;
-    use crate::bench_types::DType;
 
     #[test]
     fn kernel_ir_constructs_and_uses_coop_tile_ops() {
@@ -238,7 +237,7 @@ pub mod kernel_benches {
     use super::mt_moe_gather_qmm_mma_int4_bm8_mpp;
     use crate::ffai::moe_mpp_shared::{MmaBenchShape, int4_mma_bench};
 
-    #[bench(name = "ffai/moe_mpp/gather_qmm_mma_int4_bm8", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_moe_gather_qmm_mma_int4_bm8_mpp(dt: DType) -> BenchSetup {
         int4_mma_bench(
             mt_moe_gather_qmm_mma_int4_bm8_mpp::kernel_ir_for(dt),

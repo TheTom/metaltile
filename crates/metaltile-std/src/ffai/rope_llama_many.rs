@@ -163,7 +163,7 @@ pub mod kernel_benches {
 
     use super::ffai_rope_llama_many;
 
-    #[bench(name = "ffai/rope/rope_llama_many", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_rope_llama_many(dt: DType) -> BenchSetup {
         let (t_len, n_heads, head_dim) = (512usize, 32usize, 128usize);
         let half = head_dim / 2;
@@ -183,7 +183,7 @@ pub mod kernel_benches {
             .constexpr("original_max_position", 8192.0f32)
             .with_shape_label(format!(
                 "T{t_len} h{n_heads} d{head_dim} {}",
-                crate::bench_types::dtype_label(dt)
+                crate::utils::dtype_label(dt)
             ))
             .grid_3d(t_len as u32, n_heads as u32, half as u32, [1, 1, 1])
             .bytes_moved((2 * t_len * row_stride * dt.size_bytes()) as u64)

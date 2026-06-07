@@ -316,11 +316,12 @@ pub fn mt_gated_mixer_norm<T>(
 
 #[cfg(test)]
 mod wide_tests {
-    use metaltile_codegen::msl::MslGenerator;
-    use metaltile_core::ir::KernelMode;
+    use metaltile::{
+        codegen::msl::MslGenerator,
+        core::{DType, ir::KernelMode},
+    };
 
     use super::mt_rms_norm_wide;
-    use crate::bench_types::DType;
 
     fn msl_for(dt: DType) -> String {
         let mut k = mt_rms_norm_wide::kernel_ir_for(dt);
@@ -489,7 +490,7 @@ pub mod kernel_benches {
     use metaltile::{bench, test::*};
 
     use super::{mt_gated_mixer_norm, mt_rms_norm, mt_rms_norm_small, mt_rms_norm_wide};
-    use crate::bench_types::{InputDomain, dtype_tol, input_buffer, mlx_tname};
+    use crate::utils::{InputDomain, dtype_tol, input_buffer, mlx_tname};
 
     // Build the MLX `rms_single_row` (`rms{tn}`) reference for a `(rows, n)`
     // RMSNorm bench. Buffer order: `x`[[buffer(0)]], `w`[[buffer(1)]],
@@ -522,7 +523,7 @@ pub mod kernel_benches {
         .tol(dtype_tol(dt).max(1e-4))
     }
 
-    #[bench(name = "mlx/rms_norm", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_rms_norm(dt: DType) -> BenchSetup {
         let (rows, n) = (4096usize, 4096usize);
         BenchSetup::new(mt_rms_norm::kernel_ir_for(dt))
@@ -541,7 +542,7 @@ pub mod kernel_benches {
     // (head_dim=64, 1024 rows) matching the legacy bench(b=1024, n=64). The
     // MLX reference (`rms_single_row`, 4 elements/thread) is the same kernel as
     // the parent bench; only the MT-side per-thread layout differs.
-    #[bench(name = "mlx/rms_norm/rms_norm_small", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_rms_norm_small(dt: DType) -> BenchSetup {
         let (rows, n) = (1024usize, 64usize);
         BenchSetup::new(mt_rms_norm_small::kernel_ir_for(dt))
@@ -559,7 +560,7 @@ pub mod kernel_benches {
     // rms_norm_wide: strided over the row, one threadgroup (tpg=1024) per
     // row. Handles rows wider than the 4096 cap of mt_rms_norm — use a
     // large-hidden shape (n=5376, Gemma-class) to exercise the strided path.
-    #[bench(name = "mlx/rms_norm/rms_norm_wide", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_rms_norm_wide(dt: DType) -> BenchSetup {
         let (rows, n) = (4096usize, 5376usize);
         const TPG: u32 = 1024;
@@ -576,7 +577,7 @@ pub mod kernel_benches {
 
     // gated_mixer_norm: out = rms_norm(y, w) · silu(z). N = tpg*4. `y` is
     // fp32 (recurrence output); z/w/out in model dtype. GDN-mixer shape.
-    #[bench(name = "mlx/rms_norm/gated_mixer_norm", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_gated_mixer_norm(dt: DType) -> BenchSetup {
         let (rows, n) = (4096usize, 512usize);
         BenchSetup::new(mt_gated_mixer_norm::kernel_ir_for(dt))

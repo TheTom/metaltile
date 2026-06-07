@@ -211,16 +211,15 @@ pub fn mt_gated_delta_prep_step<T>(
 
 #[cfg(test)]
 mod tests {
-    use metaltile_core::ir::KernelMode;
+    use metaltile::core::{DType, ir::KernelMode};
 
     use super::*;
-    use crate::bench_types::DType;
 
     /// Developer aid — dump the full generated MSL for inspection.
     /// `cargo test -p metaltile-std --lib --release -- ffai::gated_delta_prep::tests::dump --nocapture`
     #[test]
     fn dump() {
-        use metaltile_codegen::msl::MslGenerator;
+        use metaltile::codegen::msl::MslGenerator;
         let mut k = mt_gated_delta_prep_step::kernel_ir_for(DType::F32);
         k.mode = KernelMode::Reduction;
         let msl = MslGenerator::default().generate(&k).expect("codegen");
@@ -449,7 +448,7 @@ pub mod kernel_benches {
     // Grid `[dv, b*hv, 1]`, TG `[32,1,1]`, Reduction — identical geometry to
     // `mt_gated_delta_step`. conv_out is the fused q|k|v slab of width
     // `2·Hk·Dk + Hv·Dv`.
-    #[bench(name = "ffai/gated_delta_prep_step", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_gated_delta_prep_step(dt: DType) -> BenchSetup {
         let (b, hv, hk, dv, dk) = (2usize, 4usize, 2usize, 64usize, 64usize);
         let n_total = b * hv;

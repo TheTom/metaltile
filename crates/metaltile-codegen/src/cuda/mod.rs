@@ -1244,10 +1244,6 @@ impl CudaGenerator {
             // `copysignf` would map 0 → +1, so emit the explicit form.
             Sign => format!("((float)({arg}) > 0.0f ? 1.0f : ((float)({arg}) < 0.0f ? -1.0f : 0.0f))"),
             // Block-scaled-quant decode helpers (preamble __device__ fns).
-            DecodeE2m1 => format!("mt_decode_e2m1((unsigned int)({arg}))"),
-            DecodeE4m3 => format!("mt_decode_e4m3((unsigned int)({arg}))"),
-            DecodeE5m2 => format!("mt_decode_e5m2((unsigned int)({arg}))"),
-            DecodeInt8 => format!("mt_decode_int8((unsigned int)({arg}))"),
             _ => format!("{}({arg})", self.profile.unary_intrinsic(op)),
         }
     }

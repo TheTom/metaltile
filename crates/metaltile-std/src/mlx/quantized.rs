@@ -4266,268 +4266,349 @@ pub fn mt_affine_dequantize_int6<T>(
 // - **`K` must be a multiple of 32** and **`G` must divide `K`**.
 //   Every Qwen3 / Qwen3.6 quantized shape satisfies both.
 
+// ── qmv / qmm (matvec / batched matvec, y = W·x) ────────────────────────
+//
+// Two body shapes: pow2 bit-widths (pack-aligned extraction) and odd
+// bit-widths (two-word bit-stream extraction). Each body is parameterised
+// on BITS via `#[kernel(variants(...))]`.
+//
+// `mt_qmm_b*` is the M-batched form of `mt_qmv_b*`; the bodies are
+// identical — dispatch `grid = [N, M, 1]` for batched, `[N, 1, 1]` for
+// the plain matvec.
+
 /// Quantized matvec / matmul (`y = W · x`) — pow2 bit-widths (4, 8).
-/// `mt_qmm_b*` is the M-batched form; `mt_qmv_b*` its M=1 row. W is
-/// `[N, K]` row-major; element `(row, d)` lives in a pack-aligned u32.
-#[rustfmt::skip]
-macro_rules! qmv_pow2 {
-    ($name:ident, $bits:literal, $subop:literal) => {
-        #[kernel]
-        pub fn $name<T>(
-            w: Tensor<u32>,
-            scales: Tensor<T>,
-            biases: Tensor<T>,
-            x: Tensor<T>,
-            out: Tensor<T>,
-            #[constexpr] k: u32,
-            #[constexpr] n: u32,
-            #[constexpr] group_size: u32,
-        ) {
-            // tgid_x = output row, tgid_y = batch row (M). At M=1 the
-            // grid's y extent is 1, so this is the plain matvec.
-            let row = tgid_x;
-            let m_row = tgid_y;
-            let lane = simd_lane;
+/// W is `[N, K]` row-major; element `(row, d)` lives in a pack-aligned u32.
+/// Produces: `mt_qmv_b4`, `mt_qmv_b8`.
+#[kernel(variants(BITS = [4u32, 8u32], suffix = "b{BITS}"))]
+pub fn mt_qmv<T>(
+    w: Tensor<u32>,
+    scales: Tensor<T>,
+    biases: Tensor<T>,
+    x: Tensor<T>,
+    out: Tensor<T>,
+    #[constexpr] k: u32,
+    #[constexpr] n: u32,
+    #[constexpr] group_size: u32,
+) {
+    // tgid_x = output row, tgid_y = batch row (M). At M=1 the
+    // grid's y extent is 1, so this is the plain matvec.
+    let row = tgid_x;
+    let m_row = tgid_y;
+    let lane = simd_lane;
 
-            let groups_per_row = k / group_size;
-            let scale_row_base = row * groups_per_row;
-            let x_row_base = m_row * k;
+    let groups_per_row = k / group_size;
+    let scale_row_base = row * groups_per_row;
+    let x_row_base = m_row * k;
 
-            let vals_per_pack = 32u32 / $bits;
-            let packs_per_row = k / vals_per_pack;
-            let mask = (1u32 << $bits) - 1u32;
+    let vals_per_pack = 32u32 / BITS;
+    let packs_per_row = k / vals_per_pack;
+    let mask = (1u32 << BITS) - 1u32;
 
-            // Each lane owns K-positions lane, lane+32, lane+64, ...
-            let mut acc = 0.0f32;
-            let n_iters = (k + 31u32) / 32u32;
-            for _it in range(0u32, n_iters, 1u32) {
-                let d = _it * 32u32 + lane;
-                if d < k {
-                    let g = d / group_size;
-                    let scale = load(scales[scale_row_base + g]).cast::<f32>();
-                    let bias = load(biases[scale_row_base + g]).cast::<f32>();
+    // Each lane owns K-positions lane, lane+32, lane+64, ...
+    let mut acc = 0.0f32;
+    let n_iters = (k + 31u32) / 32u32;
+    for _it in range(0u32, n_iters, 1u32) {
+        let d = _it * 32u32 + lane;
+        if d < k {
+            let g = d / group_size;
+            let scale = load(scales[scale_row_base + g]).cast::<f32>();
+            let bias = load(biases[scale_row_base + g]).cast::<f32>();
 
-                    // Pack-aligned int-$bits weight code at (row, d).
-                    let pack = d / vals_per_pack;
-                    let slot = d - pack * vals_per_pack;
-                    let word = load(w[row * packs_per_row + pack]);
-                    let q = (word >> (slot * $bits)) & mask;
+            // Pack-aligned weight code at (row, d).
+            let pack = d / vals_per_pack;
+            let slot = d - pack * vals_per_pack;
+            let word = load(w[row * packs_per_row + pack]);
+            let q = (word >> (slot * BITS)) & mask;
 
-                    let wv = q.cast::<f32>() * scale + bias;
-                    acc = acc + wv * load(x[x_row_base + d]).cast::<f32>();
-                }
-            }
-
-            let total = simd_sum(acc);
-            if lane == 0u32 {
-                store(out[m_row * n + row], total.cast::<T>());
-            }
+            let wv = q.cast::<f32>() * scale + bias;
+            acc = acc + wv * load(x[x_row_base + d]).cast::<f32>();
         }
-    };
+    }
+
+    let total = simd_sum(acc);
+    if lane == 0u32 {
+        store(out[m_row * n + row], total.cast::<T>());
+    }
 }
 
 /// Quantized matvec / matmul (`y = W · x`) — odd bit-widths (3, 5, 6).
 /// W is `[N, K]` bit-stream-packed; element `(row, d)` may straddle two
 /// consecutive u32 words.
-#[rustfmt::skip]
-macro_rules! qmv_odd {
-    ($name:ident, $bits:literal, $subop:literal) => {
-        #[kernel]
-        pub fn $name<T>(
-            w: Tensor<u32>,
-            scales: Tensor<T>,
-            biases: Tensor<T>,
-            x: Tensor<T>,
-            out: Tensor<T>,
-            #[constexpr] k: u32,
-            #[constexpr] n: u32,
-            #[constexpr] group_size: u32,
-        ) {
-            let row = tgid_x;
-            let m_row = tgid_y;
-            let lane = simd_lane;
+/// Produces: `mt_qmv_odd_b3`, `mt_qmv_odd_b5`, `mt_qmv_odd_b6`.
+#[kernel(variants(BITS = [3u32, 5u32, 6u32], suffix = "b{BITS}"))]
+pub fn mt_qmv_odd<T>(
+    w: Tensor<u32>,
+    scales: Tensor<T>,
+    biases: Tensor<T>,
+    x: Tensor<T>,
+    out: Tensor<T>,
+    #[constexpr] k: u32,
+    #[constexpr] n: u32,
+    #[constexpr] group_size: u32,
+) {
+    let row = tgid_x;
+    let m_row = tgid_y;
+    let lane = simd_lane;
 
-            let groups_per_row = k / group_size;
-            let scale_row_base = row * groups_per_row;
-            let x_row_base = m_row * k;
+    let groups_per_row = k / group_size;
+    let scale_row_base = row * groups_per_row;
+    let x_row_base = m_row * k;
 
-            let u32_per_row = k * $bits / 32u32;
-            let row_u32_off = row * u32_per_row;
+    let u32_per_row = k * BITS / 32u32;
+    let row_u32_off = row * u32_per_row;
 
-            let mut acc = 0.0f32;
-            let n_iters = (k + 31u32) / 32u32;
-            for _it in range(0u32, n_iters, 1u32) {
-                let d = _it * 32u32 + lane;
-                if d < k {
-                    let g = d / group_size;
-                    let scale = load(scales[scale_row_base + g]).cast::<f32>();
-                    let bias = load(biases[scale_row_base + g]).cast::<f32>();
+    let mut acc = 0.0f32;
+    let n_iters = (k + 31u32) / 32u32;
+    for _it in range(0u32, n_iters, 1u32) {
+        let d = _it * 32u32 + lane;
+        if d < k {
+            let g = d / group_size;
+            let scale = load(scales[scale_row_base + g]).cast::<f32>();
+            let bias = load(biases[scale_row_base + g]).cast::<f32>();
 
-                    // Two-word bit-stream extract — code may straddle a
-                    // u32 boundary (`spill` bits land in the next word).
-                    let bit_off = d * $bits;
-                    let word_idx = bit_off / 32u32;
-                    let bit_in_w = bit_off & 31u32;
-                    let bits_in_w0 = 32u32 - bit_in_w;
-                    let lo_bits = select(bits_in_w0 >= $bits, $bits, bits_in_w0);
-                    let spill = $bits - lo_bits;
-                    let w0 = load(w[row_u32_off + word_idx]);
-                    let w1idx = select(spill > 0u32, word_idx + 1u32, word_idx);
-                    let w1 = load(w[row_u32_off + w1idx]);
-                    let lo = (w0 >> bit_in_w) & ((1u32 << lo_bits) - 1u32);
-                    let hi = (w1 & ((1u32 << spill) - 1u32)) << lo_bits;
-                    let q = lo | hi;
+            // Two-word bit-stream extract — code may straddle a
+            // u32 boundary (`spill` bits land in the next word).
+            let bit_off = d * BITS;
+            let word_idx = bit_off / 32u32;
+            let bit_in_w = bit_off & 31u32;
+            let bits_in_w0 = 32u32 - bit_in_w;
+            let lo_bits = select(bits_in_w0 >= BITS, BITS, bits_in_w0);
+            let spill = BITS - lo_bits;
+            let w0 = load(w[row_u32_off + word_idx]);
+            let w1idx = select(spill > 0u32, word_idx + 1u32, word_idx);
+            let w1 = load(w[row_u32_off + w1idx]);
+            let lo = (w0 >> bit_in_w) & ((1u32 << lo_bits) - 1u32);
+            let hi = (w1 & ((1u32 << spill) - 1u32)) << lo_bits;
+            let q = lo | hi;
 
-                    let wv = q.cast::<f32>() * scale + bias;
-                    acc = acc + wv * load(x[x_row_base + d]).cast::<f32>();
-                }
-            }
-
-            let total = simd_sum(acc);
-            if lane == 0u32 {
-                store(out[m_row * n + row], total.cast::<T>());
-            }
+            let wv = q.cast::<f32>() * scale + bias;
+            acc = acc + wv * load(x[x_row_base + d]).cast::<f32>();
         }
-    };
+    }
+
+    let total = simd_sum(acc);
+    if lane == 0u32 {
+        store(out[m_row * n + row], total.cast::<T>());
+    }
 }
+
+/// Quantized matmul / batched matvec (`y = W · x`) — pow2 bit-widths.
+/// Identical body to `mt_qmv`; registered under `qmm_b*` so the bench
+/// scoreboard tracks it separately. Dispatch `grid = [N, M, 1]`.
+/// Produces: `mt_qmm_b4`, `mt_qmm_b8`.
+#[kernel(variants(BITS = [4u32, 8u32], suffix = "b{BITS}"))]
+pub fn mt_qmm<T>(
+    w: Tensor<u32>,
+    scales: Tensor<T>,
+    biases: Tensor<T>,
+    x: Tensor<T>,
+    out: Tensor<T>,
+    #[constexpr] k: u32,
+    #[constexpr] n: u32,
+    #[constexpr] group_size: u32,
+) {
+    let row = tgid_x;
+    let m_row = tgid_y;
+    let lane = simd_lane;
+
+    let groups_per_row = k / group_size;
+    let scale_row_base = row * groups_per_row;
+    let x_row_base = m_row * k;
+
+    let vals_per_pack = 32u32 / BITS;
+    let packs_per_row = k / vals_per_pack;
+    let mask = (1u32 << BITS) - 1u32;
+
+    let mut acc = 0.0f32;
+    let n_iters = (k + 31u32) / 32u32;
+    for _it in range(0u32, n_iters, 1u32) {
+        let d = _it * 32u32 + lane;
+        if d < k {
+            let g = d / group_size;
+            let scale = load(scales[scale_row_base + g]).cast::<f32>();
+            let bias = load(biases[scale_row_base + g]).cast::<f32>();
+
+            let pack = d / vals_per_pack;
+            let slot = d - pack * vals_per_pack;
+            let word = load(w[row * packs_per_row + pack]);
+            let q = (word >> (slot * BITS)) & mask;
+
+            let wv = q.cast::<f32>() * scale + bias;
+            acc = acc + wv * load(x[x_row_base + d]).cast::<f32>();
+        }
+    }
+
+    let total = simd_sum(acc);
+    if lane == 0u32 {
+        store(out[m_row * n + row], total.cast::<T>());
+    }
+}
+
+/// Quantized matmul (`y = W · x`) — odd bit-widths.
+/// Produces: `mt_qmm_odd_b3`, `mt_qmm_odd_b5`, `mt_qmm_odd_b6`.
+#[kernel(variants(BITS = [3u32, 5u32, 6u32], suffix = "b{BITS}"))]
+pub fn mt_qmm_odd<T>(
+    w: Tensor<u32>,
+    scales: Tensor<T>,
+    biases: Tensor<T>,
+    x: Tensor<T>,
+    out: Tensor<T>,
+    #[constexpr] k: u32,
+    #[constexpr] n: u32,
+    #[constexpr] group_size: u32,
+) {
+    let row = tgid_x;
+    let m_row = tgid_y;
+    let lane = simd_lane;
+
+    let groups_per_row = k / group_size;
+    let scale_row_base = row * groups_per_row;
+    let x_row_base = m_row * k;
+
+    let u32_per_row = k * BITS / 32u32;
+    let row_u32_off = row * u32_per_row;
+
+    let mut acc = 0.0f32;
+    let n_iters = (k + 31u32) / 32u32;
+    for _it in range(0u32, n_iters, 1u32) {
+        let d = _it * 32u32 + lane;
+        if d < k {
+            let g = d / group_size;
+            let scale = load(scales[scale_row_base + g]).cast::<f32>();
+            let bias = load(biases[scale_row_base + g]).cast::<f32>();
+
+            let bit_off = d * BITS;
+            let word_idx = bit_off / 32u32;
+            let bit_in_w = bit_off & 31u32;
+            let bits_in_w0 = 32u32 - bit_in_w;
+            let lo_bits = select(bits_in_w0 >= BITS, BITS, bits_in_w0);
+            let spill = BITS - lo_bits;
+            let w0 = load(w[row_u32_off + word_idx]);
+            let w1idx = select(spill > 0u32, word_idx + 1u32, word_idx);
+            let w1 = load(w[row_u32_off + w1idx]);
+            let lo = (w0 >> bit_in_w) & ((1u32 << lo_bits) - 1u32);
+            let hi = (w1 & ((1u32 << spill) - 1u32)) << lo_bits;
+            let q = lo | hi;
+
+            let wv = q.cast::<f32>() * scale + bias;
+            acc = acc + wv * load(x[x_row_base + d]).cast::<f32>();
+        }
+    }
+
+    let total = simd_sum(acc);
+    if lane == 0u32 {
+        store(out[m_row * n + row], total.cast::<T>());
+    }
+}
+
+// ── qvm (vecmat, y = xᵀ·W) ───────────────────────────────────────────────
 
 /// Quantized vecmat (`y = xᵀ · W`) — pow2 bit-widths. W is `[K, N]`
 /// row-major; output column `c` sums over K, reading element `(d, c)`.
-#[rustfmt::skip]
-macro_rules! qvm_pow2 {
-    ($name:ident, $bits:literal, $subop:literal) => {
-        #[kernel]
-        pub fn $name<T>(
-            w: Tensor<u32>,
-            scales: Tensor<T>,
-            biases: Tensor<T>,
-            x: Tensor<T>,
-            out: Tensor<T>,
-            #[constexpr] k: u32,
-            #[constexpr] n: u32,
-            #[constexpr] group_size: u32,
-        ) {
-            // tgid_x = output column, tgid_y = batch row (M).
-            let col = tgid_x;
-            let m_row = tgid_y;
-            let lane = simd_lane;
+/// Produces: `mt_qvm_b4`, `mt_qvm_b8`.
+#[kernel(variants(BITS = [4u32, 8u32], suffix = "b{BITS}"))]
+pub fn mt_qvm<T>(
+    w: Tensor<u32>,
+    scales: Tensor<T>,
+    biases: Tensor<T>,
+    x: Tensor<T>,
+    out: Tensor<T>,
+    #[constexpr] k: u32,
+    #[constexpr] n: u32,
+    #[constexpr] group_size: u32,
+) {
+    // tgid_x = output column, tgid_y = batch row (M).
+    let col = tgid_x;
+    let m_row = tgid_y;
+    let lane = simd_lane;
 
-            let x_row_base = m_row * k;
-            let vals_per_pack = 32u32 / $bits;
-            let packs_per_row = n / vals_per_pack;
-            let mask = (1u32 << $bits) - 1u32;
+    let x_row_base = m_row * k;
+    let vals_per_pack = 32u32 / BITS;
+    let packs_per_row = n / vals_per_pack;
+    let mask = (1u32 << BITS) - 1u32;
 
-            let mut acc = 0.0f32;
-            let n_iters = (k + 31u32) / 32u32;
-            for _it in range(0u32, n_iters, 1u32) {
-                let d = _it * 32u32 + lane;
-                if d < k {
-                    // Groups run along K; scales/biases are [K/G, N].
-                    let g = d / group_size;
-                    let scale = load(scales[g * n + col]).cast::<f32>();
-                    let bias = load(biases[g * n + col]).cast::<f32>();
+    let mut acc = 0.0f32;
+    let n_iters = (k + 31u32) / 32u32;
+    for _it in range(0u32, n_iters, 1u32) {
+        let d = _it * 32u32 + lane;
+        if d < k {
+            // Groups run along K; scales/biases are [K/G, N].
+            let g = d / group_size;
+            let scale = load(scales[g * n + col]).cast::<f32>();
+            let bias = load(biases[g * n + col]).cast::<f32>();
 
-                    // Element (d, col) of a [K, N]-packed weight matrix.
-                    let pack = col / vals_per_pack;
-                    let slot = col - pack * vals_per_pack;
-                    let word = load(w[d * packs_per_row + pack]);
-                    let q = (word >> (slot * $bits)) & mask;
+            // Element (d, col) of a [K, N]-packed weight matrix.
+            let pack = col / vals_per_pack;
+            let slot = col - pack * vals_per_pack;
+            let word = load(w[d * packs_per_row + pack]);
+            let q = (word >> (slot * BITS)) & mask;
 
-                    let wv = q.cast::<f32>() * scale + bias;
-                    acc = acc + wv * load(x[x_row_base + d]).cast::<f32>();
-                }
-            }
-
-            let total = simd_sum(acc);
-            if lane == 0u32 {
-                store(out[m_row * n + col], total.cast::<T>());
-            }
+            let wv = q.cast::<f32>() * scale + bias;
+            acc = acc + wv * load(x[x_row_base + d]).cast::<f32>();
         }
-    };
+    }
+
+    let total = simd_sum(acc);
+    if lane == 0u32 {
+        store(out[m_row * n + col], total.cast::<T>());
+    }
 }
 
 /// Quantized vecmat (`y = xᵀ · W`) — odd bit-widths. W is `[K, N]`
 /// bit-stream-packed.
-#[rustfmt::skip]
-macro_rules! qvm_odd {
-    ($name:ident, $bits:literal, $subop:literal) => {
-        #[kernel]
-        pub fn $name<T>(
-            w: Tensor<u32>,
-            scales: Tensor<T>,
-            biases: Tensor<T>,
-            x: Tensor<T>,
-            out: Tensor<T>,
-            #[constexpr] k: u32,
-            #[constexpr] n: u32,
-            #[constexpr] group_size: u32,
-        ) {
-            let col = tgid_x;
-            let m_row = tgid_y;
-            let lane = simd_lane;
+/// Produces: `mt_qvm_odd_b3`, `mt_qvm_odd_b5`, `mt_qvm_odd_b6`.
+#[kernel(variants(BITS = [3u32, 5u32, 6u32], suffix = "b{BITS}"))]
+pub fn mt_qvm_odd<T>(
+    w: Tensor<u32>,
+    scales: Tensor<T>,
+    biases: Tensor<T>,
+    x: Tensor<T>,
+    out: Tensor<T>,
+    #[constexpr] k: u32,
+    #[constexpr] n: u32,
+    #[constexpr] group_size: u32,
+) {
+    let col = tgid_x;
+    let m_row = tgid_y;
+    let lane = simd_lane;
 
-            let x_row_base = m_row * k;
-            let u32_per_row = n * $bits / 32u32;
+    let x_row_base = m_row * k;
+    let u32_per_row = n * BITS / 32u32;
 
-            let mut acc = 0.0f32;
-            let n_iters = (k + 31u32) / 32u32;
-            for _it in range(0u32, n_iters, 1u32) {
-                let d = _it * 32u32 + lane;
-                if d < k {
-                    let g = d / group_size;
-                    let scale = load(scales[g * n + col]).cast::<f32>();
-                    let bias = load(biases[g * n + col]).cast::<f32>();
+    let mut acc = 0.0f32;
+    let n_iters = (k + 31u32) / 32u32;
+    for _it in range(0u32, n_iters, 1u32) {
+        let d = _it * 32u32 + lane;
+        if d < k {
+            let g = d / group_size;
+            let scale = load(scales[g * n + col]).cast::<f32>();
+            let bias = load(biases[g * n + col]).cast::<f32>();
 
-                    // Two-word bit-stream extract of element (d, col).
-                    let row_u32_off = d * u32_per_row;
-                    let bit_off = col * $bits;
-                    let word_idx = bit_off / 32u32;
-                    let bit_in_w = bit_off & 31u32;
-                    let bits_in_w0 = 32u32 - bit_in_w;
-                    let lo_bits = select(bits_in_w0 >= $bits, $bits, bits_in_w0);
-                    let spill = $bits - lo_bits;
-                    let w0 = load(w[row_u32_off + word_idx]);
-                    let w1idx = select(spill > 0u32, word_idx + 1u32, word_idx);
-                    let w1 = load(w[row_u32_off + w1idx]);
-                    let lo = (w0 >> bit_in_w) & ((1u32 << lo_bits) - 1u32);
-                    let hi = (w1 & ((1u32 << spill) - 1u32)) << lo_bits;
-                    let q = lo | hi;
+            // Two-word bit-stream extract of element (d, col).
+            let row_u32_off = d * u32_per_row;
+            let bit_off = col * BITS;
+            let word_idx = bit_off / 32u32;
+            let bit_in_w = bit_off & 31u32;
+            let bits_in_w0 = 32u32 - bit_in_w;
+            let lo_bits = select(bits_in_w0 >= BITS, BITS, bits_in_w0);
+            let spill = BITS - lo_bits;
+            let w0 = load(w[row_u32_off + word_idx]);
+            let w1idx = select(spill > 0u32, word_idx + 1u32, word_idx);
+            let w1 = load(w[row_u32_off + w1idx]);
+            let lo = (w0 >> bit_in_w) & ((1u32 << lo_bits) - 1u32);
+            let hi = (w1 & ((1u32 << spill) - 1u32)) << lo_bits;
+            let q = lo | hi;
 
-                    let wv = q.cast::<f32>() * scale + bias;
-                    acc = acc + wv * load(x[x_row_base + d]).cast::<f32>();
-                }
-            }
-
-            let total = simd_sum(acc);
-            if lane == 0u32 {
-                store(out[m_row * n + col], total.cast::<T>());
-            }
+            let wv = q.cast::<f32>() * scale + bias;
+            acc = acc + wv * load(x[x_row_base + d]).cast::<f32>();
         }
-    };
+    }
+
+    let total = simd_sum(acc);
+    if lane == 0u32 {
+        store(out[m_row * n + col], total.cast::<T>());
+    }
 }
-
-// qmv (matvec) — pow2 widths 4/8, odd widths 3/5/6.
-qmv_pow2!(mt_qmv_b4, 4u32, "qmv_b4");
-qmv_pow2!(mt_qmv_b8, 8u32, "qmv_b8");
-qmv_odd!(mt_qmv_b3, 3u32, "qmv_b3");
-qmv_odd!(mt_qmv_b5, 5u32, "qmv_b5");
-qmv_odd!(mt_qmv_b6, 6u32, "qmv_b6");
-
-// qmm (matmul / batched matvec) — identical body to qmv, registered
-// under the `qmm_b*` subop so the bench scoreboard tracks it
-// separately. Dispatch with `grid = [N, M, 1]`.
-qmv_pow2!(mt_qmm_b4, 4u32, "qmm_b4");
-qmv_pow2!(mt_qmm_b8, 8u32, "qmm_b8");
-qmv_odd!(mt_qmm_b3, 3u32, "qmm_b3");
-qmv_odd!(mt_qmm_b5, 5u32, "qmm_b5");
-qmv_odd!(mt_qmm_b6, 6u32, "qmm_b6");
-
-// qvm (vecmat) — the genuinely missing op; W transposed to [K, N].
-qvm_pow2!(mt_qvm_b4, 4u32, "qvm_b4");
-qvm_pow2!(mt_qvm_b8, 8u32, "qvm_b8");
-qvm_odd!(mt_qvm_b3, 3u32, "qvm_b3");
-qvm_odd!(mt_qvm_b5, 5u32, "qvm_b5");
-qvm_odd!(mt_qvm_b6, 6u32, "qvm_b6");
 
 // ─── mt_qvm_int4_fast ─────────────────────────────────────────────────
 //
@@ -4711,305 +4792,258 @@ pub fn mt_qvm_int4_fast<T>(
 // Mirrors the `gather_qmm_mma!` macro in `ffai/moe.rs` — exactly the same
 // coop-dequant strategy, just applied to the dense (non-expert) GEMM.
 //
+
 // `w` layout: `[N, k*bits/32]` uint32 LSB-first bit-stream packed.
 // `group_size` must divide `k`; the 8-K span per lane within a BK=32
 // block is group-aligned (`pack_in_row*8 % group_size == 0`).
 //
 // Grid: [N/32, M/32, 1], tpg=128 (4 SG × 32 lanes).
-#[rustfmt::skip]
-macro_rules! qmm_mma_bitwidth {
-    ($name:ident, $bits:literal, $subop:literal) => {
-        #[kernel]
-        #[allow(clippy::too_many_arguments)]
-        pub fn $name<T>(
-            w: Tensor<u32>,
-            scales: Tensor<T>,
-            biases: Tensor<T>,
-            x: Tensor<T>,
-            out: Tensor<T>,
-            #[constexpr] k: u32,
-            #[constexpr] n: u32,
-            #[constexpr] gs_per_row: u32,
-        ) {
-            let n_tile = tgid_x;
-            let m_tile = tgid_y;
-            let lane = simd_lane;
-            let sg = simd_group_id();
-            let sm = sg / 2u32;
-            let sn = sg & 1u32;
-            let lane_in_tg = sg * 32u32 + lane;
+/// Odd-bit-width MMA quantized matmul — variable bit-widths (3, 5, 6).
+///
+/// Produces kernels: `mt_qmm_mma_b3`, `mt_qmm_mma_b5`, `mt_qmm_mma_b6`.
+///
+/// Each variant is a cooperative-dequant GEMM that unpacks `BITS`-wide
+/// LSB-first codes from the bit-stream weight layout, dequantizes via
+/// `q * scale + bias`, and accumulates using four `simdgroup_matrix`
+/// fragments per threadgroup — identical to `gather_qmm_mma` in
+/// `ffai/moe.rs` but applied to dense (non-expert) GEMMs.
+///
+/// `w` layout: `[N, k * BITS / 32]` uint32, LSB-first packed.
+/// `group_size` must divide `k`; the 8-K span per lane within each
+/// BK=32 block is group-aligned (`pack_in_row * 8 % group_size == 0`).
+///
+/// Grid: `[N/32, M/32, 1]`, tpg = 128 (4 SG × 32 lanes).
+#[kernel(variants(BITS = [3, 5, 6], suffix = "b{BITS}"))]
+#[allow(clippy::too_many_arguments)]
+pub fn mt_qmm_mma<T>(
+    w: Tensor<u32>,
+    scales: Tensor<T>,
+    biases: Tensor<T>,
+    x: Tensor<T>,
+    out: Tensor<T>,
+    #[constexpr] k: u32,
+    #[constexpr] n: u32,
+    #[constexpr] gs_per_row: u32,
+) {
+    let n_tile = tgid_x;
+    let m_tile = tgid_y;
+    let lane = simd_lane;
+    let sg = simd_group_id();
+    let sm = sg / 2u32;
+    let sn = sg & 1u32;
+    let lane_in_tg = sg * 32u32 + lane;
 
-            let qid = lane / 4u32;
-            let fm = (qid & 4u32) + ((lane / 2u32) % 4u32);
-            let fn0 = (qid & 2u32) * 2u32 + (lane % 2u32) * 2u32;
-            let fn1 = fn0 + 1u32;
+    let qid = lane / 4u32;
+    let fm = (qid & 4u32) + ((lane / 2u32) % 4u32);
+    let fn0 = (qid & 2u32) * 2u32 + (lane % 2u32) * 2u32;
+    let fn1 = fn0 + 1u32;
 
-            // TG memory: Xs [BM×BK], Ws [BN×BK], both stride BK+4=36
-            // (skew avoids 32-bank conflicts on the MMA frag column reads).
-            threadgroup_alloc("xs", 1152, T);
-            threadgroup_alloc("ws", 1152, T);
+    // TG memory: Xs [BM×BK], Ws [BN×BK], both stride BK+4=36
+    // (skew avoids 32-bank conflicts on the MMA frag column reads).
+    threadgroup_alloc("xs", 1152, T);
+    threadgroup_alloc("ws", 1152, T);
 
-            let c_f00 = simdgroup_alloc::<f32, 8, 8>();
-            simdgroup_elem_store(c_f00, 0, 0.0f32);
-            simdgroup_elem_store(c_f00, 1, 0.0f32);
-            let c_f01 = simdgroup_alloc::<f32, 8, 8>();
-            simdgroup_elem_store(c_f01, 0, 0.0f32);
-            simdgroup_elem_store(c_f01, 1, 0.0f32);
-            let c_f10 = simdgroup_alloc::<f32, 8, 8>();
-            simdgroup_elem_store(c_f10, 0, 0.0f32);
-            simdgroup_elem_store(c_f10, 1, 0.0f32);
-            let c_f11 = simdgroup_alloc::<f32, 8, 8>();
-            simdgroup_elem_store(c_f11, 0, 0.0f32);
-            simdgroup_elem_store(c_f11, 1, 0.0f32);
+    let c_f00 = simdgroup_alloc::<f32, 8, 8>();
+    simdgroup_elem_store(c_f00, 0, 0.0f32);
+    simdgroup_elem_store(c_f00, 1, 0.0f32);
+    let c_f01 = simdgroup_alloc::<f32, 8, 8>();
+    simdgroup_elem_store(c_f01, 0, 0.0f32);
+    simdgroup_elem_store(c_f01, 1, 0.0f32);
+    let c_f10 = simdgroup_alloc::<f32, 8, 8>();
+    simdgroup_elem_store(c_f10, 0, 0.0f32);
+    simdgroup_elem_store(c_f10, 1, 0.0f32);
+    let c_f11 = simdgroup_alloc::<f32, 8, 8>();
+    simdgroup_elem_store(c_f11, 0, 0.0f32);
+    simdgroup_elem_store(c_f11, 1, 0.0f32);
 
-            let a_f0 = simdgroup_alloc::<T, 8, 8>();
-            let a_f1 = simdgroup_alloc::<T, 8, 8>();
-            let b_f0 = simdgroup_alloc::<T, 8, 8>();
-            let b_f1 = simdgroup_alloc::<T, 8, 8>();
+    let a_f0 = simdgroup_alloc::<T, 8, 8>();
+    let a_f1 = simdgroup_alloc::<T, 8, 8>();
+    let b_f0 = simdgroup_alloc::<T, 8, 8>();
+    let b_f1 = simdgroup_alloc::<T, 8, 8>();
 
-            // W coop-dequant lane assignments:
-            //   w_row = lane_in_tg / 4  ∈ 0..32  (the N-row inside the BN=32 tile)
-            //   pack_in_row = lane_in_tg & 3  ∈ 0..4  (8-K span index within BK=32)
-            let w_row = lane_in_tg / 4u32;
-            let pack_in_row = lane_in_tg & 3u32;
+    // W coop-dequant lane assignments:
+    //   w_row = lane_in_tg / 4  ∈ 0..32  (the N-row inside the BN=32 tile)
+    //   pack_in_row = lane_in_tg & 3  ∈ 0..4  (8-K span index within BK=32)
+    let w_row = lane_in_tg / 4u32;
+    let pack_in_row = lane_in_tg & 3u32;
 
-            // X coop-load lane assignments: same shape as mt_qmm_mma.
-            let x_m_row = lane_in_tg / 4u32;
-            let x_k_quad = lane_in_tg & 3u32;
-            let x_k_base = x_k_quad * 8u32;
+    // X coop-load lane assignments: same shape as mt_qmm_mma.
+    let x_m_row = lane_in_tg / 4u32;
+    let x_k_quad = lane_in_tg & 3u32;
+    let x_k_base = x_k_quad * 8u32;
 
-            let xs_ld = 36u32;
-            let ws_ld = 36u32;
+    let xs_ld = 36u32;
+    let ws_ld = 36u32;
 
-            let x_m_base = m_tile * 32u32;
-            let w_n_base = n_tile * 32u32;
-            // Bit-stream: u32_per_row = k * bits / 32 words per weight row.
-            let u32_per_row = k * $bits / 32u32;
-            let group_size = k / gs_per_row;
-            let sb_base = (w_n_base + w_row) * gs_per_row;
-            let w_row_base = (w_n_base + w_row) * u32_per_row;
+    let x_m_base = m_tile * 32u32;
+    let w_n_base = n_tile * 32u32;
+    // Bit-stream: u32_per_row = k * BITS / 32 words per weight row.
+    let u32_per_row = k * BITS / 32u32;
+    let group_size = k / gs_per_row;
+    let sb_base = (w_n_base + w_row) * gs_per_row;
+    let w_row_base = (w_n_base + w_row) * u32_per_row;
 
-            for kb in range(0u32, k, 32u32) {
-                // ── 1. Coop X load — identical to mt_qmm_mma ──
-                let x_row_dev_base = (x_m_base + x_m_row) * k + kb + x_k_base;
-                let x_ws_base = x_m_row * xs_ld + x_k_base;
-                let xv0 = load(x[x_row_dev_base]).cast::<T>();
-                let xv1 = load(x[x_row_dev_base + 1u32]).cast::<T>();
-                let xv2 = load(x[x_row_dev_base + 2u32]).cast::<T>();
-                let xv3 = load(x[x_row_dev_base + 3u32]).cast::<T>();
-                let xv4 = load(x[x_row_dev_base + 4u32]).cast::<T>();
-                let xv5 = load(x[x_row_dev_base + 5u32]).cast::<T>();
-                let xv6 = load(x[x_row_dev_base + 6u32]).cast::<T>();
-                let xv7 = load(x[x_row_dev_base + 7u32]).cast::<T>();
-                threadgroup_store("xs", x_ws_base, xv0);
-                threadgroup_store("xs", x_ws_base + 1u32, xv1);
-                threadgroup_store("xs", x_ws_base + 2u32, xv2);
-                threadgroup_store("xs", x_ws_base + 3u32, xv3);
-                threadgroup_store("xs", x_ws_base + 4u32, xv4);
-                threadgroup_store("xs", x_ws_base + 5u32, xv5);
-                threadgroup_store("xs", x_ws_base + 6u32, xv6);
-                threadgroup_store("xs", x_ws_base + 7u32, xv7);
+    for kb in range(0u32, k, 32u32) {
+        // ── 1. Coop X load — identical to mt_qmm_mma ──
+        let x_row_dev_base = (x_m_base + x_m_row) * k + kb + x_k_base;
+        let x_ws_base = x_m_row * xs_ld + x_k_base;
+        let xv0 = load(x[x_row_dev_base]).cast::<T>();
+        let xv1 = load(x[x_row_dev_base + 1u32]).cast::<T>();
+        let xv2 = load(x[x_row_dev_base + 2u32]).cast::<T>();
+        let xv3 = load(x[x_row_dev_base + 3u32]).cast::<T>();
+        let xv4 = load(x[x_row_dev_base + 4u32]).cast::<T>();
+        let xv5 = load(x[x_row_dev_base + 5u32]).cast::<T>();
+        let xv6 = load(x[x_row_dev_base + 6u32]).cast::<T>();
+        let xv7 = load(x[x_row_dev_base + 7u32]).cast::<T>();
+        threadgroup_store("xs", x_ws_base, xv0);
+        threadgroup_store("xs", x_ws_base + 1u32, xv1);
+        threadgroup_store("xs", x_ws_base + 2u32, xv2);
+        threadgroup_store("xs", x_ws_base + 3u32, xv3);
+        threadgroup_store("xs", x_ws_base + 4u32, xv4);
+        threadgroup_store("xs", x_ws_base + 5u32, xv5);
+        threadgroup_store("xs", x_ws_base + 6u32, xv6);
+        threadgroup_store("xs", x_ws_base + 7u32, xv7);
 
-                // ── 2. Coop W bit-stream dequant ──
-                // Each lane is responsible for 8 contiguous K positions
-                // starting at k0 = kb + pack_in_row*8. It extracts 8 codes
-                // from the LSB-first bit-stream, dequantizes them, and
-                // writes the 8 fp-T values into Ws[w_row*ws_ld + pack_in_row*8 + i].
-                let k0 = kb + pack_in_row * 8u32;
-                let g = k0 / group_size;
-                let s = load(scales[sb_base + g]).cast::<f32>();
-                let b = load(biases[sb_base + g]).cast::<f32>();
-                let ws_base = w_row * ws_ld + pack_in_row * 8u32;
-                for _ci in range(0u32, 8u32, 1u32) {
-                    // Straddle-aware two-word bit-stream extract.
-                    // bit_off = absolute bit position of this code's LSB.
-                    let bit_off = (k0 + _ci) * $bits;
-                    let word_idx = bit_off / 32u32;
-                    let bit_in_w = bit_off & 31u32;
-                    let bits_in_w0 = 32u32 - bit_in_w;
-                    let lo_bits = select(bits_in_w0 >= $bits, $bits, bits_in_w0);
-                    let spill = $bits - lo_bits;
-                    let w0 = load(w[w_row_base + word_idx]);
-                    // Avoid an out-of-bounds load when there is no spill: read
-                    // from the same word (the bits will be masked to 0 anyway).
-                    let w1idx = select(spill > 0u32, word_idx + 1u32, word_idx);
-                    let w1 = load(w[w_row_base + w1idx]);
-                    let lo = (w0 >> bit_in_w) & ((1u32 << lo_bits) - 1u32);
-                    let hi = (w1 & ((1u32 << spill) - 1u32)) << lo_bits;
-                    let q = (lo | hi).cast::<f32>();
-                    threadgroup_store("ws", ws_base + _ci, (s * q + b).cast::<T>());
-                }
-
-                threadgroup_barrier();
-
-                // ── 3. MMA inner loop — 4 frags × 4 k-inner ──
-                // Identical to mt_qmm_mma: serpentine (0,0)→(0,1)→(1,1)→(1,0).
-                let row_a0 = sm * 16u32 + fm;
-                let row_a1 = sm * 16u32 + 8u32 + fm;
-                let col_b0 = sn * 16u32;
-                let col_b1 = sn * 16u32 + 8u32;
-
-                // k_inner = 0
-                simdgroup_elem_store(a_f0, 0, threadgroup_load("xs", row_a0 * xs_ld + fn0));
-                simdgroup_elem_store(a_f0, 1, threadgroup_load("xs", row_a0 * xs_ld + fn1));
-                simdgroup_elem_store(a_f1, 0, threadgroup_load("xs", row_a1 * xs_ld + fn0));
-                simdgroup_elem_store(a_f1, 1, threadgroup_load("xs", row_a1 * xs_ld + fn1));
-                simdgroup_barrier_mem_none();
-                simdgroup_elem_store(b_f0, 0, threadgroup_load("ws", (col_b0 + fn0) * ws_ld + fm));
-                simdgroup_elem_store(b_f0, 1, threadgroup_load("ws", (col_b0 + fn1) * ws_ld + fm));
-                simdgroup_elem_store(b_f1, 0, threadgroup_load("ws", (col_b1 + fn0) * ws_ld + fm));
-                simdgroup_elem_store(b_f1, 1, threadgroup_load("ws", (col_b1 + fn1) * ws_ld + fm));
-                simdgroup_barrier_mem_none();
-                simdgroup_matmul(a_f0, b_f0, c_f00);
-                simdgroup_matmul(a_f0, b_f1, c_f01);
-                simdgroup_matmul(a_f1, b_f1, c_f11);
-                simdgroup_matmul(a_f1, b_f0, c_f10);
-                simdgroup_barrier_mem_none();
-
-                // k_inner = 1
-                simdgroup_elem_store(a_f0, 0, threadgroup_load("xs", row_a0 * xs_ld + 8u32 + fn0));
-                simdgroup_elem_store(a_f0, 1, threadgroup_load("xs", row_a0 * xs_ld + 8u32 + fn1));
-                simdgroup_elem_store(a_f1, 0, threadgroup_load("xs", row_a1 * xs_ld + 8u32 + fn0));
-                simdgroup_elem_store(a_f1, 1, threadgroup_load("xs", row_a1 * xs_ld + 8u32 + fn1));
-                simdgroup_barrier_mem_none();
-                simdgroup_elem_store(
-                    b_f0,
-                    0,
-                    threadgroup_load("ws", (col_b0 + fn0) * ws_ld + 8u32 + fm),
-                );
-                simdgroup_elem_store(
-                    b_f0,
-                    1,
-                    threadgroup_load("ws", (col_b0 + fn1) * ws_ld + 8u32 + fm),
-                );
-                simdgroup_elem_store(
-                    b_f1,
-                    0,
-                    threadgroup_load("ws", (col_b1 + fn0) * ws_ld + 8u32 + fm),
-                );
-                simdgroup_elem_store(
-                    b_f1,
-                    1,
-                    threadgroup_load("ws", (col_b1 + fn1) * ws_ld + 8u32 + fm),
-                );
-                simdgroup_barrier_mem_none();
-                simdgroup_matmul(a_f0, b_f0, c_f00);
-                simdgroup_matmul(a_f0, b_f1, c_f01);
-                simdgroup_matmul(a_f1, b_f1, c_f11);
-                simdgroup_matmul(a_f1, b_f0, c_f10);
-                simdgroup_barrier_mem_none();
-
-                // k_inner = 2
-                simdgroup_elem_store(a_f0, 0, threadgroup_load("xs", row_a0 * xs_ld + 16u32 + fn0));
-                simdgroup_elem_store(a_f0, 1, threadgroup_load("xs", row_a0 * xs_ld + 16u32 + fn1));
-                simdgroup_elem_store(a_f1, 0, threadgroup_load("xs", row_a1 * xs_ld + 16u32 + fn0));
-                simdgroup_elem_store(a_f1, 1, threadgroup_load("xs", row_a1 * xs_ld + 16u32 + fn1));
-                simdgroup_barrier_mem_none();
-                simdgroup_elem_store(
-                    b_f0,
-                    0,
-                    threadgroup_load("ws", (col_b0 + fn0) * ws_ld + 16u32 + fm),
-                );
-                simdgroup_elem_store(
-                    b_f0,
-                    1,
-                    threadgroup_load("ws", (col_b0 + fn1) * ws_ld + 16u32 + fm),
-                );
-                simdgroup_elem_store(
-                    b_f1,
-                    0,
-                    threadgroup_load("ws", (col_b1 + fn0) * ws_ld + 16u32 + fm),
-                );
-                simdgroup_elem_store(
-                    b_f1,
-                    1,
-                    threadgroup_load("ws", (col_b1 + fn1) * ws_ld + 16u32 + fm),
-                );
-                simdgroup_barrier_mem_none();
-                simdgroup_matmul(a_f0, b_f0, c_f00);
-                simdgroup_matmul(a_f0, b_f1, c_f01);
-                simdgroup_matmul(a_f1, b_f1, c_f11);
-                simdgroup_matmul(a_f1, b_f0, c_f10);
-                simdgroup_barrier_mem_none();
-
-                // k_inner = 3
-                simdgroup_elem_store(a_f0, 0, threadgroup_load("xs", row_a0 * xs_ld + 24u32 + fn0));
-                simdgroup_elem_store(a_f0, 1, threadgroup_load("xs", row_a0 * xs_ld + 24u32 + fn1));
-                simdgroup_elem_store(a_f1, 0, threadgroup_load("xs", row_a1 * xs_ld + 24u32 + fn0));
-                simdgroup_elem_store(a_f1, 1, threadgroup_load("xs", row_a1 * xs_ld + 24u32 + fn1));
-                simdgroup_barrier_mem_none();
-                simdgroup_elem_store(
-                    b_f0,
-                    0,
-                    threadgroup_load("ws", (col_b0 + fn0) * ws_ld + 24u32 + fm),
-                );
-                simdgroup_elem_store(
-                    b_f0,
-                    1,
-                    threadgroup_load("ws", (col_b0 + fn1) * ws_ld + 24u32 + fm),
-                );
-                simdgroup_elem_store(
-                    b_f1,
-                    0,
-                    threadgroup_load("ws", (col_b1 + fn0) * ws_ld + 24u32 + fm),
-                );
-                simdgroup_elem_store(
-                    b_f1,
-                    1,
-                    threadgroup_load("ws", (col_b1 + fn1) * ws_ld + 24u32 + fm),
-                );
-                simdgroup_barrier_mem_none();
-                simdgroup_matmul(a_f0, b_f0, c_f00);
-                simdgroup_matmul(a_f0, b_f1, c_f01);
-                simdgroup_matmul(a_f1, b_f1, c_f11);
-                simdgroup_matmul(a_f1, b_f0, c_f10);
-                simdgroup_barrier_mem_none();
-
-                threadgroup_barrier();
-            }
-
-            // ── 4. Write 4 C frags to global out ──
-            let out_m_base = m_tile * 32u32 + sm * 16u32;
-            let out_n_base = n_tile * 32u32 + sn * 16u32;
-            store(
-                out[(out_m_base + fm) * n + out_n_base + fn0],
-                simdgroup_elem_load(c_f00, 0).cast::<T>(),
-            );
-            store(
-                out[(out_m_base + fm) * n + out_n_base + fn1],
-                simdgroup_elem_load(c_f00, 1).cast::<T>(),
-            );
-            store(
-                out[(out_m_base + fm) * n + out_n_base + 8u32 + fn0],
-                simdgroup_elem_load(c_f01, 0).cast::<T>(),
-            );
-            store(
-                out[(out_m_base + fm) * n + out_n_base + 8u32 + fn1],
-                simdgroup_elem_load(c_f01, 1).cast::<T>(),
-            );
-            store(
-                out[(out_m_base + 8u32 + fm) * n + out_n_base + fn0],
-                simdgroup_elem_load(c_f10, 0).cast::<T>(),
-            );
-            store(
-                out[(out_m_base + 8u32 + fm) * n + out_n_base + fn1],
-                simdgroup_elem_load(c_f10, 1).cast::<T>(),
-            );
-            store(
-                out[(out_m_base + 8u32 + fm) * n + out_n_base + 8u32 + fn0],
-                simdgroup_elem_load(c_f11, 0).cast::<T>(),
-            );
-            store(
-                out[(out_m_base + 8u32 + fm) * n + out_n_base + 8u32 + fn1],
-                simdgroup_elem_load(c_f11, 1).cast::<T>(),
-            );
+        // ── 2. Coop W bit-stream dequant ──
+        // Each lane is responsible for 8 contiguous K positions
+        // starting at k0 = kb + pack_in_row*8. It extracts 8 codes
+        // from the LSB-first bit-stream, dequantizes them, and
+        // writes the 8 fp-T values into Ws[w_row*ws_ld + pack_in_row*8 + i].
+        let k0 = kb + pack_in_row * 8u32;
+        let g = k0 / group_size;
+        let s = load(scales[sb_base + g]).cast::<f32>();
+        let b = load(biases[sb_base + g]).cast::<f32>();
+        let ws_base = w_row * ws_ld + pack_in_row * 8u32;
+        for _ci in range(0u32, 8u32, 1u32) {
+            // Straddle-aware two-word bit-stream extract.
+            // bit_off = absolute bit position of this code's LSB.
+            let bit_off = (k0 + _ci) * BITS;
+            let word_idx = bit_off / 32u32;
+            let bit_in_w = bit_off & 31u32;
+            let bits_in_w0 = 32u32 - bit_in_w;
+            let lo_bits = select(bits_in_w0 >= BITS, BITS, bits_in_w0);
+            let spill = BITS - lo_bits;
+            let w0 = load(w[w_row_base + word_idx]);
+            // Avoid an out-of-bounds load when there is no spill: read
+            // from the same word (the bits will be masked to 0 anyway).
+            let w1idx = select(spill > 0u32, word_idx + 1u32, word_idx);
+            let w1 = load(w[w_row_base + w1idx]);
+            let lo = (w0 >> bit_in_w) & ((1u32 << lo_bits) - 1u32);
+            let hi = (w1 & ((1u32 << spill) - 1u32)) << lo_bits;
+            let q = (lo | hi).cast::<f32>();
+            threadgroup_store("ws", ws_base + _ci, (s * q + b).cast::<T>());
         }
-    };
-}
 
-qmm_mma_bitwidth!(mt_qmm_mma_b3, 3u32, "qmm_mma_b3");
-qmm_mma_bitwidth!(mt_qmm_mma_b5, 5u32, "qmm_mma_b5");
-qmm_mma_bitwidth!(mt_qmm_mma_b6, 6u32, "qmm_mma_b6");
+        threadgroup_barrier();
+
+        // ── 3. MMA inner loop — 4 frags × 4 k-inner ──
+        // Identical to mt_qmm_mma: serpentine (0,0)→(0,1)→(1,1)→(1,0).
+        let row_a0 = sm * 16u32 + fm;
+        let row_a1 = sm * 16u32 + 8u32 + fm;
+        let col_b0 = sn * 16u32;
+        let col_b1 = sn * 16u32 + 8u32;
+
+        // k_inner = 0
+        simdgroup_elem_store(a_f0, 0, threadgroup_load("xs", row_a0 * xs_ld + fn0));
+        simdgroup_elem_store(a_f0, 1, threadgroup_load("xs", row_a0 * xs_ld + fn1));
+        simdgroup_elem_store(a_f1, 0, threadgroup_load("xs", row_a1 * xs_ld + fn0));
+        simdgroup_elem_store(a_f1, 1, threadgroup_load("xs", row_a1 * xs_ld + fn1));
+        simdgroup_barrier_mem_none();
+        simdgroup_elem_store(b_f0, 0, threadgroup_load("ws", (col_b0 + fn0) * ws_ld + fm));
+        simdgroup_elem_store(b_f0, 1, threadgroup_load("ws", (col_b0 + fn1) * ws_ld + fm));
+        simdgroup_elem_store(b_f1, 0, threadgroup_load("ws", (col_b1 + fn0) * ws_ld + fm));
+        simdgroup_elem_store(b_f1, 1, threadgroup_load("ws", (col_b1 + fn1) * ws_ld + fm));
+        simdgroup_barrier_mem_none();
+        simdgroup_matmul(a_f0, b_f0, c_f00);
+        simdgroup_matmul(a_f0, b_f1, c_f01);
+        simdgroup_matmul(a_f1, b_f1, c_f11);
+        simdgroup_matmul(a_f1, b_f0, c_f10);
+        simdgroup_barrier_mem_none();
+
+        // k_inner = 1
+        simdgroup_elem_store(a_f0, 0, threadgroup_load("xs", row_a0 * xs_ld + 8u32 + fn0));
+        simdgroup_elem_store(a_f0, 1, threadgroup_load("xs", row_a0 * xs_ld + 8u32 + fn1));
+        simdgroup_elem_store(a_f1, 0, threadgroup_load("xs", row_a1 * xs_ld + 8u32 + fn0));
+        simdgroup_elem_store(a_f1, 1, threadgroup_load("xs", row_a1 * xs_ld + 8u32 + fn1));
+        simdgroup_barrier_mem_none();
+        simdgroup_elem_store(b_f0, 0, threadgroup_load("ws", (col_b0 + fn0) * ws_ld + 8u32 + fm));
+        simdgroup_elem_store(b_f0, 1, threadgroup_load("ws", (col_b0 + fn1) * ws_ld + 8u32 + fm));
+        simdgroup_elem_store(b_f1, 0, threadgroup_load("ws", (col_b1 + fn0) * ws_ld + 8u32 + fm));
+        simdgroup_elem_store(b_f1, 1, threadgroup_load("ws", (col_b1 + fn1) * ws_ld + 8u32 + fm));
+        simdgroup_barrier_mem_none();
+        simdgroup_matmul(a_f0, b_f0, c_f00);
+        simdgroup_matmul(a_f0, b_f1, c_f01);
+        simdgroup_matmul(a_f1, b_f1, c_f11);
+        simdgroup_matmul(a_f1, b_f0, c_f10);
+        simdgroup_barrier_mem_none();
+
+        // k_inner = 2
+        simdgroup_elem_store(a_f0, 0, threadgroup_load("xs", row_a0 * xs_ld + 16u32 + fn0));
+        simdgroup_elem_store(a_f0, 1, threadgroup_load("xs", row_a0 * xs_ld + 16u32 + fn1));
+        simdgroup_elem_store(a_f1, 0, threadgroup_load("xs", row_a1 * xs_ld + 16u32 + fn0));
+        simdgroup_elem_store(a_f1, 1, threadgroup_load("xs", row_a1 * xs_ld + 16u32 + fn1));
+        simdgroup_barrier_mem_none();
+        simdgroup_elem_store(b_f0, 0, threadgroup_load("ws", (col_b0 + fn0) * ws_ld + 16u32 + fm));
+        simdgroup_elem_store(b_f0, 1, threadgroup_load("ws", (col_b0 + fn1) * ws_ld + 16u32 + fm));
+        simdgroup_elem_store(b_f1, 0, threadgroup_load("ws", (col_b1 + fn0) * ws_ld + 16u32 + fm));
+        simdgroup_elem_store(b_f1, 1, threadgroup_load("ws", (col_b1 + fn1) * ws_ld + 16u32 + fm));
+        simdgroup_barrier_mem_none();
+        simdgroup_matmul(a_f0, b_f0, c_f00);
+        simdgroup_matmul(a_f0, b_f1, c_f01);
+        simdgroup_matmul(a_f1, b_f1, c_f11);
+        simdgroup_matmul(a_f1, b_f0, c_f10);
+        simdgroup_barrier_mem_none();
+
+        // k_inner = 3
+        simdgroup_elem_store(a_f0, 0, threadgroup_load("xs", row_a0 * xs_ld + 24u32 + fn0));
+        simdgroup_elem_store(a_f0, 1, threadgroup_load("xs", row_a0 * xs_ld + 24u32 + fn1));
+        simdgroup_elem_store(a_f1, 0, threadgroup_load("xs", row_a1 * xs_ld + 24u32 + fn0));
+        simdgroup_elem_store(a_f1, 1, threadgroup_load("xs", row_a1 * xs_ld + 24u32 + fn1));
+        simdgroup_barrier_mem_none();
+        simdgroup_elem_store(b_f0, 0, threadgroup_load("ws", (col_b0 + fn0) * ws_ld + 24u32 + fm));
+        simdgroup_elem_store(b_f0, 1, threadgroup_load("ws", (col_b0 + fn1) * ws_ld + 24u32 + fm));
+        simdgroup_elem_store(b_f1, 0, threadgroup_load("ws", (col_b1 + fn0) * ws_ld + 24u32 + fm));
+        simdgroup_elem_store(b_f1, 1, threadgroup_load("ws", (col_b1 + fn1) * ws_ld + 24u32 + fm));
+        simdgroup_barrier_mem_none();
+        simdgroup_matmul(a_f0, b_f0, c_f00);
+        simdgroup_matmul(a_f0, b_f1, c_f01);
+        simdgroup_matmul(a_f1, b_f1, c_f11);
+        simdgroup_matmul(a_f1, b_f0, c_f10);
+        simdgroup_barrier_mem_none();
+
+        threadgroup_barrier();
+    }
+
+    // ── 4. Write 4 C frags to global out ──
+    let out_m_base = m_tile * 32u32 + sm * 16u32;
+    let out_n_base = n_tile * 32u32 + sn * 16u32;
+    store(out[(out_m_base + fm) * n + out_n_base + fn0], simdgroup_elem_load(c_f00, 0).cast::<T>());
+    store(out[(out_m_base + fm) * n + out_n_base + fn1], simdgroup_elem_load(c_f00, 1).cast::<T>());
+    store(
+        out[(out_m_base + fm) * n + out_n_base + 8u32 + fn0],
+        simdgroup_elem_load(c_f01, 0).cast::<T>(),
+    );
+    store(
+        out[(out_m_base + fm) * n + out_n_base + 8u32 + fn1],
+        simdgroup_elem_load(c_f01, 1).cast::<T>(),
+    );
+    store(
+        out[(out_m_base + 8u32 + fm) * n + out_n_base + fn0],
+        simdgroup_elem_load(c_f10, 0).cast::<T>(),
+    );
+    store(
+        out[(out_m_base + 8u32 + fm) * n + out_n_base + fn1],
+        simdgroup_elem_load(c_f10, 1).cast::<T>(),
+    );
+    store(
+        out[(out_m_base + 8u32 + fm) * n + out_n_base + 8u32 + fn0],
+        simdgroup_elem_load(c_f11, 0).cast::<T>(),
+    );
+    store(
+        out[(out_m_base + 8u32 + fm) * n + out_n_base + 8u32 + fn1],
+        simdgroup_elem_load(c_f11, 1).cast::<T>(),
+    );
+}
 
 /// Auto-select the best `mt_qmm*` kernel for a given dtype + M
 /// (number of tokens / batched rows in this prefill). Returns the
@@ -5037,8 +5071,8 @@ qmm_mma_bitwidth!(mt_qmm_mma_b6, 6u32, "qmm_mma_b6");
 /// At M=32, mma f32 essentially at MLX parity; f16 remains 9-16pt
 /// below MLX (open follow-up — 4 layered tweaks identified by the
 /// MLX archaeology study at `/tmp/mlx_archaeology.md`).
-pub fn mt_qmm_for(dtype: metaltile_core::dtype::DType, m: u32) -> metaltile_core::ir::Kernel {
-    use metaltile_core::ir::KernelMode;
+pub fn mt_qmm_for(dtype: metaltile::core::dtype::DType, m: u32) -> metaltile::core::ir::Kernel {
+    use metaltile::core::ir::KernelMode;
     let mut k = if m >= 32 && m.is_multiple_of(32) {
         // Full simdgroup-matrix MMA path (M=32, 64, 96, ...).
         let mut kk = mt_qmm_mma::kernel_ir_for(dtype);
@@ -5082,10 +5116,10 @@ pub fn mt_qmm_for(dtype: metaltile_core::dtype::DType, m: u32) -> metaltile_core
 /// (3-barrier MMA, vectorized X load, serpentine MMA order) it is
 /// expected to land the missing 9-16pt.
 pub fn patch_qmm_mma_dtype_aware_skew(
-    kernel: &mut metaltile_core::ir::Kernel,
-    dtype: metaltile_core::dtype::DType,
+    kernel: &mut metaltile::core::ir::Kernel,
+    dtype: metaltile::core::dtype::DType,
 ) {
-    use metaltile_core::dtype::DType;
+    use metaltile::core::dtype::DType;
     // f32 keeps its default 36 stride — nothing to do.
     let bytes = match dtype {
         DType::F32 => 4,
@@ -5126,7 +5160,7 @@ pub fn patch_qmm_mma_dtype_aware_skew(
 
 #[cfg(test)]
 mod qmm_selector_tests {
-    use metaltile_core::dtype::DType;
+    use metaltile::core::dtype::DType;
 
     use super::*;
 
@@ -5191,7 +5225,7 @@ mod qmm_selector_tests {
             let k = mt_qmm_for(DType::F32, m);
             assert_eq!(
                 k.mode,
-                metaltile_core::ir::KernelMode::Reduction,
+                metaltile::core::ir::KernelMode::Reduction,
                 "m={m}: missing Reduction mode",
             );
         }
@@ -5925,10 +5959,10 @@ pub mod kernel_tests {
             }
         };
     }
-    qmv_test!(test_qmv_b3, mt_qmv_b3, 3);
+    qmv_test!(test_qmv_b3, mt_qmv_odd_b3, 3);
     qmv_test!(test_qmv_b4, mt_qmv_b4, 4);
-    qmv_test!(test_qmv_b5, mt_qmv_b5, 5);
-    qmv_test!(test_qmv_b6, mt_qmv_b6, 6);
+    qmv_test!(test_qmv_b5, mt_qmv_odd_b5, 5);
+    qmv_test!(test_qmv_b6, mt_qmv_odd_b6, 6);
     qmv_test!(test_qmv_b8, mt_qmv_b8, 8);
 
     // Generic qmm (M-batched matvec): grid [n, m, 1].
@@ -5951,10 +5985,10 @@ pub mod kernel_tests {
             }
         };
     }
-    qmm_test!(test_qmm_b3, mt_qmm_b3, 3);
+    qmm_test!(test_qmm_b3, mt_qmm_odd_b3, 3);
     qmm_test!(test_qmm_b4, mt_qmm_b4, 4);
-    qmm_test!(test_qmm_b5, mt_qmm_b5, 5);
-    qmm_test!(test_qmm_b6, mt_qmm_b6, 6);
+    qmm_test!(test_qmm_b5, mt_qmm_odd_b5, 5);
+    qmm_test!(test_qmm_b6, mt_qmm_odd_b6, 6);
     qmm_test!(test_qmm_b8, mt_qmm_b8, 8);
 
     // Generic qvm (vecmat, M=1): grid [n, 1, 1].
@@ -5966,10 +6000,10 @@ pub mod kernel_tests {
             }
         };
     }
-    qvm_test!(test_qvm_b3, mt_qvm_b3, 3);
+    qvm_test!(test_qvm_b3, mt_qvm_odd_b3, 3);
     qvm_test!(test_qvm_b4, mt_qvm_b4, 4);
-    qvm_test!(test_qvm_b5, mt_qvm_b5, 5);
-    qvm_test!(test_qvm_b6, mt_qvm_b6, 6);
+    qvm_test!(test_qvm_b5, mt_qvm_odd_b5, 5);
+    qvm_test!(test_qvm_b6, mt_qvm_odd_b6, 6);
     qvm_test!(test_qvm_b8, mt_qvm_b8, 8);
 
     // Odd-width simdgroup-matrix MMA (b3/b5/b6): grid [n/32, m/32, 1], tpg 128,
@@ -6003,7 +6037,7 @@ pub mod kernel_benches {
     use metaltile::{bench, core::ir::Kernel, test::*};
 
     use super::*;
-    use crate::bench_types::{InputDomain, dtype_tol, input_buffer};
+    use crate::utils::{InputDomain, dtype_tol, input_buffer};
 
     fn db(kernel: Kernel, bits: u32, group_size: usize, n_groups: usize, dt: DType) -> BenchSetup {
         let pack_factor = (32 / bits) as usize;
@@ -6020,17 +6054,10 @@ pub mod kernel_benches {
             .bytes_moved((n_elem * dt.size_bytes()) as u64)
     }
 
-    #[bench(name = "mlx/affine/dequantize_int4", dtypes = [f32, f16, bf16])]
-    fn bench_dequant_int4(dt: DType) -> BenchSetup {
-        db(mt_affine_dequantize_int4::kernel_ir_for(dt), 4, 64, 65536, dt)
-    }
-    #[bench(name = "mlx/affine/dequantize_int8", dtypes = [f32, f16, bf16])]
-    fn bench_dequant_int8(dt: DType) -> BenchSetup {
-        db(mt_affine_dequantize_int8::kernel_ir_for(dt), 8, 64, 65536, dt)
-    }
-    #[bench(name = "mlx/affine/dequantize_int2", dtypes = [f32, f16, bf16])]
-    fn bench_dequant_int2(dt: DType) -> BenchSetup {
-        db(mt_affine_dequantize_int2::kernel_ir_for(dt), 2, 64, 65536, dt)
+    #[bench(dtypes = [f32, f16, bf16],
+            variants(BITS = [2, 4, 8], suffix = "int{BITS}"))]
+    fn bench_dequant_pow2(dt: DType) -> BenchSetup {
+        db(mt_affine_dequantize_intBITS::kernel_ir_for(dt), BITS, 64, 65536, dt)
     }
 
     // ── odd-bit dequant (int3/5/6) ─────────────────────────────────────────
@@ -6063,15 +6090,15 @@ pub mod kernel_benches {
             .bytes_moved((n_elem * dt.size_bytes()) as u64)
     }
 
-    #[bench(name = "mlx/affine/dequantize_int3", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_dequant_int3(dt: DType) -> BenchSetup {
         db_odd(mt_affine_dequantize_int3::kernel_ir_for(dt), 8, 3, 32, 65536, dt)
     }
-    #[bench(name = "mlx/affine/dequantize_int5", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_dequant_int5(dt: DType) -> BenchSetup {
         db_odd(mt_affine_dequantize_int5::kernel_ir_for(dt), 8, 5, 32, 65536, dt)
     }
-    #[bench(name = "mlx/affine/dequantize_int6", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_dequant_int6(dt: DType) -> BenchSetup {
         db_odd(mt_affine_dequantize_int6::kernel_ir_for(dt), 4, 3, 32, 65536, dt)
     }
@@ -6093,29 +6120,16 @@ pub mod kernel_benches {
             .bytes_moved((n_elem * dt.size_bytes() + out_words * 4) as u64)
     }
 
-    #[bench(name = "mlx/affine/quantize_int2", dtypes = [f32, f16, bf16])]
-    fn bench_quant_int2(dt: DType) -> BenchSetup {
-        qb(mt_affine_quantize_int2::kernel_ir_for(dt), 2, 64, 65536, dt)
+    #[bench(dtypes = [f32, f16, bf16],
+            variants(BITS = [2, 4, 8], suffix = "int{BITS}"))]
+    fn bench_quant_pow2(dt: DType) -> BenchSetup {
+        qb(mt_affine_quantize_intBITS::kernel_ir_for(dt), BITS, 64, 65536, dt)
     }
-    #[bench(name = "mlx/affine/quantize_int3", dtypes = [f32, f16, bf16])]
-    fn bench_quant_int3(dt: DType) -> BenchSetup {
-        qb(mt_affine_quantize_int3::kernel_ir_for(dt), 3, 32, 65536, dt)
-    }
-    #[bench(name = "mlx/affine/quantize_int4", dtypes = [f32, f16, bf16])]
-    fn bench_quant_int4(dt: DType) -> BenchSetup {
-        qb(mt_affine_quantize_int4::kernel_ir_for(dt), 4, 64, 65536, dt)
-    }
-    #[bench(name = "mlx/affine/quantize_int5", dtypes = [f32, f16, bf16])]
-    fn bench_quant_int5(dt: DType) -> BenchSetup {
-        qb(mt_affine_quantize_int5::kernel_ir_for(dt), 5, 32, 65536, dt)
-    }
-    #[bench(name = "mlx/affine/quantize_int6", dtypes = [f32, f16, bf16])]
-    fn bench_quant_int6(dt: DType) -> BenchSetup {
-        qb(mt_affine_quantize_int6::kernel_ir_for(dt), 6, 32, 65536, dt)
-    }
-    #[bench(name = "mlx/affine/quantize_int8", dtypes = [f32, f16, bf16])]
-    fn bench_quant_int8(dt: DType) -> BenchSetup {
-        qb(mt_affine_quantize_int8::kernel_ir_for(dt), 8, 64, 65536, dt)
+
+    #[bench(dtypes = [f32, f16, bf16],
+            variants(BITS = [3, 5, 6], suffix = "int{BITS}"))]
+    fn bench_quant_odd(dt: DType) -> BenchSetup {
+        qb(mt_affine_quantize_intBITS::kernel_ir_for(dt), BITS, 32, 65536, dt)
     }
 
     // ── qmv / qmm matmul-family benches ────────────────────────────────────
@@ -6139,7 +6153,7 @@ pub mod kernel_benches {
     }
 
     /// MLX kernel type-string for the `<tn>` slot (`float` / `float16_t` /
-    /// `bfloat16_t`). Distinct from `bench_types::mlx_tname` (which yields the
+    /// `bfloat16_t`). Distinct from `utils::mlx_tname` (which yields the
     /// dispatch-side `float16`, not the kernel-template `float16_t`).
     fn mlx_quant_tname(dt: DType) -> &'static str {
         match dt {
@@ -6331,7 +6345,7 @@ pub mod kernel_benches {
             bs = bs.constexpr("n", n as u32);
         }
         bs = bs
-            .with_shape_label(format!("m{m} n{n} k{k} {}", crate::bench_types::dtype_label(dt)))
+            .with_shape_label(format!("m{m} n{n} k{k} {}", crate::utils::dtype_label(dt)))
             .grid_3d(grid[0], grid[1], grid[2], tpg)
             .bytes_moved(bytes as u64)
             // qmm/qmv out[m,n] = x[m,k] · dequant(w)[k,n]: 2 MACs per (m, n, k).
@@ -6348,7 +6362,7 @@ pub mod kernel_benches {
     const QMV_TOL: f32 = 1e-3;
     const QMM_TOL: f32 = 1e-2;
 
-    #[bench(name = "mlx/quantized/qmv", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qmv(dt: DType) -> BenchSetup {
         qmb_ref(
             mt_qmv::kernel_ir_for(dt),
@@ -6364,7 +6378,7 @@ pub mod kernel_benches {
             Some((QuantRef::QmvFast, QMV_TOL)),
         )
     }
-    #[bench(name = "mlx/quantized/qmv_int8_fast", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qmv_int8_fast(dt: DType) -> BenchSetup {
         qmb_ref(
             mt_qmv_int8_fast::kernel_ir_for(dt),
@@ -6380,7 +6394,7 @@ pub mod kernel_benches {
             Some((QuantRef::QmvFast, QMV_TOL)),
         )
     }
-    #[bench(name = "mlx/quantized/qmm", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qmm(dt: DType) -> BenchSetup {
         qmb_ref(
             mt_qmm::kernel_ir_for(dt),
@@ -6396,7 +6410,7 @@ pub mod kernel_benches {
             Some((QuantRef::QmmT, QMM_TOL)),
         )
     }
-    #[bench(name = "mlx/quantized/qmm_bm2", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qmm_bm2(dt: DType) -> BenchSetup {
         qmb_ref(
             mt_qmm_bm2::kernel_ir_for(dt),
@@ -6412,7 +6426,7 @@ pub mod kernel_benches {
             Some((QuantRef::QmmT, QMM_TOL)),
         )
     }
-    #[bench(name = "mlx/quantized/qmm_bm4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qmm_bm4(dt: DType) -> BenchSetup {
         qmb_ref(
             mt_qmm_bm4::kernel_ir_for(dt),
@@ -6428,7 +6442,7 @@ pub mod kernel_benches {
             Some((QuantRef::QmmT, QMM_TOL)),
         )
     }
-    #[bench(name = "mlx/quantized/qmm_int8_fast", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qmm_int8_fast(dt: DType) -> BenchSetup {
         qmb_ref(
             mt_qmm_int8_fast::kernel_ir_for(dt),
@@ -6444,7 +6458,7 @@ pub mod kernel_benches {
             Some((QuantRef::QmmT, QMM_TOL)),
         )
     }
-    #[bench(name = "mlx/quantized/qmm_bm2_int8_fast", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qmm_bm2_int8_fast(dt: DType) -> BenchSetup {
         qmb_ref(
             mt_qmm_bm2_int8_fast::kernel_ir_for(dt),
@@ -6460,7 +6474,7 @@ pub mod kernel_benches {
             Some((QuantRef::QmmT, QMM_TOL)),
         )
     }
-    #[bench(name = "mlx/quantized/qmm_bm4_int8_fast", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qmm_bm4_int8_fast(dt: DType) -> BenchSetup {
         qmb_ref(
             mt_qmm_bm4_int8_fast::kernel_ir_for(dt),
@@ -6476,7 +6490,7 @@ pub mod kernel_benches {
             Some((QuantRef::QmmT, QMM_TOL)),
         )
     }
-    #[bench(name = "mlx/quantized/qmm_mma", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qmm_mma(dt: DType) -> BenchSetup {
         qmb_ref(
             mt_qmm_mma::kernel_ir_for(dt),
@@ -6492,7 +6506,7 @@ pub mod kernel_benches {
             Some((QuantRef::QmmT, QMM_TOL)),
         )
     }
-    #[bench(name = "mlx/quantized/qmm_mma_m16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qmm_mma_m16(dt: DType) -> BenchSetup {
         qmb_ref(
             mt_qmm_mma_m16::kernel_ir_for(dt),
@@ -6508,7 +6522,7 @@ pub mod kernel_benches {
             Some((QuantRef::QmmT, QMM_TOL)),
         )
     }
-    #[bench(name = "mlx/quantized/qmm_mma_int8", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qmm_mma_int8(dt: DType) -> BenchSetup {
         qmb_ref(
             mt_qmm_mma_int8::kernel_ir_for(dt),
@@ -6524,7 +6538,7 @@ pub mod kernel_benches {
             Some((QuantRef::QmmT, QMM_TOL)),
         )
     }
-    #[bench(name = "mlx/quantized/qmm_mma_m16_int8", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qmm_mma_m16_int8(dt: DType) -> BenchSetup {
         qmb_ref(
             mt_qmm_mma_m16_int8::kernel_ir_for(dt),
@@ -6540,7 +6554,7 @@ pub mod kernel_benches {
             Some((QuantRef::QmmT, QMM_TOL)),
         )
     }
-    #[bench(name = "mlx/quantized/qmm_mma_int2", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qmm_mma_int2(dt: DType) -> BenchSetup {
         qmb_ref(
             mt_qmm_mma_int2::kernel_ir_for(dt),
@@ -6558,7 +6572,7 @@ pub mod kernel_benches {
     }
 
     // qvm: transposed weight [K, N], 8 output columns per TG.
-    #[bench(name = "mlx/quantized/qvm_int4_fast", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qvm_int4_fast(dt: DType) -> BenchSetup {
         let (n, k, group_size) = (4096usize, 4096usize, 64usize);
         let gs_per_col = k / group_size;
@@ -6574,7 +6588,7 @@ pub mod kernel_benches {
             .constexpr("k", k as u32)
             .constexpr("n", n as u32)
             .constexpr("gs_per_col", gs_per_col as u32)
-            .with_shape_label(format!("n{n} k{k} {}", crate::bench_types::dtype_label(dt)))
+            .with_shape_label(format!("n{n} k{k} {}", crate::utils::dtype_label(dt)))
             .grid_3d((n / 8) as u32, 1, 1, [64, 1, 1])
             .bytes_moved(bytes as u64)
             // qvm vector-mat out[n] = x[k] · dequant(w)[k,n]: 2 MACs per (n, k).
@@ -6619,7 +6633,7 @@ pub mod kernel_benches {
             .constexpr("k", k as u32)
             .constexpr("n", n as u32)
             .constexpr("group_size", group_size as u32)
-            .with_shape_label(format!("m{m} n{n} k{k} {}", crate::bench_types::dtype_label(dt)))
+            .with_shape_label(format!("m{m} n{n} k{k} {}", crate::utils::dtype_label(dt)))
             .grid_3d(grid[0], grid[1], grid[2], [32, 1, 1])
             .bytes_moved(bytes as u64)
             // qmv/qvm/qmm out[m,n] = x[m,k] · dequant(w)[k,n]: 2 MACs per (m, n, k).
@@ -6627,68 +6641,68 @@ pub mod kernel_benches {
     }
 
     // qmv (matvec, M=1): grid [N, 1, 1].
-    #[bench(name = "mlx/quantized/qmv_b3", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qmv_b3(dt: DType) -> BenchSetup {
-        qmb_gs(mt_qmv_b3::kernel_ir_for(dt), 1, 4096, 4096, 3, 64, [4096, 1, 1], dt)
+        qmb_gs(mt_qmv_odd_b3::kernel_ir_for(dt), 1, 4096, 4096, 3, 64, [4096, 1, 1], dt)
     }
-    #[bench(name = "mlx/quantized/qmv_b4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qmv_b4(dt: DType) -> BenchSetup {
         qmb_gs(mt_qmv_b4::kernel_ir_for(dt), 1, 4096, 4096, 4, 64, [4096, 1, 1], dt)
     }
-    #[bench(name = "mlx/quantized/qmv_b5", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qmv_b5(dt: DType) -> BenchSetup {
-        qmb_gs(mt_qmv_b5::kernel_ir_for(dt), 1, 4096, 4096, 5, 64, [4096, 1, 1], dt)
+        qmb_gs(mt_qmv_odd_b5::kernel_ir_for(dt), 1, 4096, 4096, 5, 64, [4096, 1, 1], dt)
     }
-    #[bench(name = "mlx/quantized/qmv_b6", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qmv_b6(dt: DType) -> BenchSetup {
-        qmb_gs(mt_qmv_b6::kernel_ir_for(dt), 1, 4096, 4096, 6, 64, [4096, 1, 1], dt)
+        qmb_gs(mt_qmv_odd_b6::kernel_ir_for(dt), 1, 4096, 4096, 6, 64, [4096, 1, 1], dt)
     }
-    #[bench(name = "mlx/quantized/qmv_b8", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qmv_b8(dt: DType) -> BenchSetup {
         qmb_gs(mt_qmv_b8::kernel_ir_for(dt), 1, 4096, 4096, 8, 64, [4096, 1, 1], dt)
     }
 
     // qvm (vecmat, M=1): W is [K, N]; grid [N, 1, 1]. Same buffer totals as
     // qmv (n·k codes, n·gspr scales) — only the kernel's index math differs.
-    #[bench(name = "mlx/quantized/qvm_b3", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qvm_b3(dt: DType) -> BenchSetup {
-        qmb_gs(mt_qvm_b3::kernel_ir_for(dt), 1, 4096, 4096, 3, 64, [4096, 1, 1], dt)
+        qmb_gs(mt_qvm_odd_b3::kernel_ir_for(dt), 1, 4096, 4096, 3, 64, [4096, 1, 1], dt)
     }
-    #[bench(name = "mlx/quantized/qvm_b4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qvm_b4(dt: DType) -> BenchSetup {
         qmb_gs(mt_qvm_b4::kernel_ir_for(dt), 1, 4096, 4096, 4, 64, [4096, 1, 1], dt)
     }
-    #[bench(name = "mlx/quantized/qvm_b5", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qvm_b5(dt: DType) -> BenchSetup {
-        qmb_gs(mt_qvm_b5::kernel_ir_for(dt), 1, 4096, 4096, 5, 64, [4096, 1, 1], dt)
+        qmb_gs(mt_qvm_odd_b5::kernel_ir_for(dt), 1, 4096, 4096, 5, 64, [4096, 1, 1], dt)
     }
-    #[bench(name = "mlx/quantized/qvm_b6", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qvm_b6(dt: DType) -> BenchSetup {
-        qmb_gs(mt_qvm_b6::kernel_ir_for(dt), 1, 4096, 4096, 6, 64, [4096, 1, 1], dt)
+        qmb_gs(mt_qvm_odd_b6::kernel_ir_for(dt), 1, 4096, 4096, 6, 64, [4096, 1, 1], dt)
     }
-    #[bench(name = "mlx/quantized/qvm_b8", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qvm_b8(dt: DType) -> BenchSetup {
         qmb_gs(mt_qvm_b8::kernel_ir_for(dt), 1, 4096, 4096, 8, 64, [4096, 1, 1], dt)
     }
 
     // qmm (batched matvec, M=4): grid [N, M, 1].
-    #[bench(name = "mlx/quantized/qmm_b3", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qmm_b3(dt: DType) -> BenchSetup {
-        qmb_gs(mt_qmm_b3::kernel_ir_for(dt), 4, 4096, 4096, 3, 64, [4096, 4, 1], dt)
+        qmb_gs(mt_qmm_odd_b3::kernel_ir_for(dt), 4, 4096, 4096, 3, 64, [4096, 4, 1], dt)
     }
-    #[bench(name = "mlx/quantized/qmm_b4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qmm_b4(dt: DType) -> BenchSetup {
         qmb_gs(mt_qmm_b4::kernel_ir_for(dt), 4, 4096, 4096, 4, 64, [4096, 4, 1], dt)
     }
-    #[bench(name = "mlx/quantized/qmm_b5", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qmm_b5(dt: DType) -> BenchSetup {
-        qmb_gs(mt_qmm_b5::kernel_ir_for(dt), 4, 4096, 4096, 5, 64, [4096, 4, 1], dt)
+        qmb_gs(mt_qmm_odd_b5::kernel_ir_for(dt), 4, 4096, 4096, 5, 64, [4096, 4, 1], dt)
     }
-    #[bench(name = "mlx/quantized/qmm_b6", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qmm_b6(dt: DType) -> BenchSetup {
-        qmb_gs(mt_qmm_b6::kernel_ir_for(dt), 4, 4096, 4096, 6, 64, [4096, 4, 1], dt)
+        qmb_gs(mt_qmm_odd_b6::kernel_ir_for(dt), 4, 4096, 4096, 6, 64, [4096, 4, 1], dt)
     }
-    #[bench(name = "mlx/quantized/qmm_b8", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qmm_b8(dt: DType) -> BenchSetup {
         qmb_gs(mt_qmm_b8::kernel_ir_for(dt), 4, 4096, 4096, 8, 64, [4096, 4, 1], dt)
     }
@@ -6724,22 +6738,22 @@ pub mod kernel_benches {
             .constexpr("k", k as u32)
             .constexpr("n", n as u32)
             .constexpr("gs_per_row", gspr as u32)
-            .with_shape_label(format!("m{m} n{n} k{k} {}", crate::bench_types::dtype_label(dt)))
+            .with_shape_label(format!("m{m} n{n} k{k} {}", crate::utils::dtype_label(dt)))
             .grid_3d((n / 32) as u32, (m / 32) as u32, 1, [128, 1, 1])
             .bytes_moved(bytes as u64)
             // qmm_mma out[m,n] = x[m,k] · dequant(w)[k,n]: 2 MACs per (m, n, k).
             .flops(2 * (m as u64) * (n as u64) * (k as u64))
     }
 
-    #[bench(name = "mlx/quantized/qmm_mma_b3", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qmm_mma_b3(dt: DType) -> BenchSetup {
         qmm_mma_b(mt_qmm_mma_b3::kernel_ir_for(dt), 4096, 4096, 3, 64, dt)
     }
-    #[bench(name = "mlx/quantized/qmm_mma_b5", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qmm_mma_b5(dt: DType) -> BenchSetup {
         qmm_mma_b(mt_qmm_mma_b5::kernel_ir_for(dt), 4096, 4096, 5, 64, dt)
     }
-    #[bench(name = "mlx/quantized/qmm_mma_b6", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_qmm_mma_b6(dt: DType) -> BenchSetup {
         qmm_mma_b(mt_qmm_mma_b6::kernel_ir_for(dt), 4096, 4096, 6, 64, dt)
     }

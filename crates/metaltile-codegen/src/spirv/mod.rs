@@ -1823,10 +1823,6 @@ impl GlslGenerator {
             Rsqrt => format!("mt_rsqrt({arg})"),
             // Block-scaled quant decode — preamble helpers; pure arithmetic
             // ports of the CUDA preamble.
-            DecodeE2m1 => format!("mt_decode_e2m1(uint({arg}))"),
-            DecodeE4m3 => format!("mt_decode_e4m3(uint({arg}))"),
-            DecodeE5m2 => format!("mt_decode_e5m2(uint({arg}))"),
-            DecodeInt8 => format!("mt_decode_int8(uint({arg}))"),
             _ => format!("{}({arg})", self.profile.unary_intrinsic(op)),
         }
     }

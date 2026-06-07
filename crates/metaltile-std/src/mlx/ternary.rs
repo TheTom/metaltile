@@ -56,7 +56,7 @@ pub mod kernel_benches {
     use metaltile::{bench, test::*};
 
     use super::mt_select;
-    use crate::bench_types::{InputDomain, dtype_tol, input_buffer, mlx_tname};
+    use crate::utils::{InputDomain, dtype_tol, input_buffer, mlx_tname};
 
     // MLX `metal/ternary.metal` `v_Select<tn>` (`ternary_v`, 1 element/thread):
     //   a=cond (device const bool*) [[buffer(0)]], b=on_true [[buffer(1)]],
@@ -70,7 +70,7 @@ pub mod kernel_benches {
     // repeating mix of 0 and nonzero u8 bytes (so both select branches are
     // exercised), and on_true/on_false use the `Signed` pattern. Both kernels see
     // identical cond/on_true/on_false bytes, so the A/B is exact.
-    #[bench(name = "mlx/select", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_select(dt: DType) -> BenchSetup {
         let n = 64 * 1024 * 1024usize;
         let tn = mlx_tname(dt);

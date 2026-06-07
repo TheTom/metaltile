@@ -166,7 +166,7 @@ pub fn mt_mxfp4_moe_gather_qmm_bm16_mpp<T>(
                     let dst = w_row * 16u32 + pack_col * 8u32;
                     for _j in range(0u32, 8u32, 1u32) {
                         let nib = (packed >> (_j * 4u32)) & 15u32;
-                        threadgroup_store("ws", dst + _j, e2m1_decode(nib) * scale);
+                        threadgroup_store("ws", dst + _j, mt_decode_e2m1(nib) * scale);
                     }
                 }
                 threadgroup_barrier();
@@ -291,11 +291,11 @@ pub fn mt_nvfp4_moe_gather_qmm_bm16_mpp<T>(
                     let g = k_off / block_size;
                     let sb_off = sb_expert_base + (n_tile_base + w_row) * groups_per_row + g;
                     // nvfp4: E4M3 micro-scale × global FP32.
-                    let scale = e4m3_decode(load(scales[sb_off]).cast::<u32>()) * global;
+                    let scale = mt_decode_e4m3(load(scales[sb_off]).cast::<u32>()) * global;
                     let dst = w_row * 16u32 + pack_col * 8u32;
                     for _j in range(0u32, 8u32, 1u32) {
                         let nib = (packed >> (_j * 4u32)) & 15u32;
-                        threadgroup_store("ws", dst + _j, e2m1_decode(nib) * scale);
+                        threadgroup_store("ws", dst + _j, mt_decode_e2m1(nib) * scale);
                     }
                 }
                 threadgroup_barrier();
@@ -423,7 +423,7 @@ pub fn mt_fp4_moe_gather_qmm_bm16_mpp<T>(
                     let dst = w_row * 16u32 + pack_col * 8u32;
                     for _j in range(0u32, 8u32, 1u32) {
                         let nib = (packed >> (_j * 4u32)) & 15u32;
-                        threadgroup_store("ws", dst + _j, e2m1_decode(nib) * scale);
+                        threadgroup_store("ws", dst + _j, mt_decode_e2m1(nib) * scale);
                     }
                 }
                 threadgroup_barrier();
@@ -543,7 +543,7 @@ pub fn mt_mxfp8_e4m3_moe_gather_qmm_bm16_mpp<T>(
                 let scale = exp2(load(scales[sb_off]).cast::<f32>() - 127.0f32);
                 let w_dev = w_expert_base_8 + (n_tile_base + w_row) * k_in + kb;
                 for kc in range(0u32, 16u32, 1u32) {
-                    let elem = e4m3_decode(load(w[w_dev + kc]).cast::<u32>());
+                    let elem = mt_decode_e4m3(load(w[w_dev + kc]).cast::<u32>());
                     threadgroup_store("ws", w_row * 16u32 + kc, elem * scale);
                 }
                 threadgroup_barrier();
@@ -660,7 +660,7 @@ pub fn mt_mxfp8_e5m2_moe_gather_qmm_bm16_mpp<T>(
                 let scale = exp2(load(scales[sb_off]).cast::<f32>() - 127.0f32);
                 let w_dev = w_expert_base_8 + (n_tile_base + w_row) * k_in + kb;
                 for kc in range(0u32, 16u32, 1u32) {
-                    let elem = e5m2_decode(load(w[w_dev + kc]).cast::<u32>());
+                    let elem = mt_decode_e5m2(load(w[w_dev + kc]).cast::<u32>());
                     threadgroup_store("ws", w_row * 16u32 + kc, elem * scale);
                 }
                 threadgroup_barrier();
@@ -777,7 +777,7 @@ pub fn mt_fp8_e5m2_moe_gather_qmm_bm16_mpp<T>(
                 let scale = load(scales[sb_off]);
                 let w_dev = w_expert_base_8 + (n_tile_base + w_row) * k_in + kb;
                 for kc in range(0u32, 16u32, 1u32) {
-                    let elem = e5m2_decode(load(w[w_dev + kc]).cast::<u32>());
+                    let elem = mt_decode_e5m2(load(w[w_dev + kc]).cast::<u32>());
                     threadgroup_store("ws", w_row * 16u32 + kc, elem * scale);
                 }
                 threadgroup_barrier();
@@ -895,7 +895,7 @@ pub fn mt_nvfp8_moe_gather_qmm_bm16_mpp<T>(
                 let scale = load(scales[sb_off]);
                 let w_dev = w_expert_base_8 + (n_tile_base + w_row) * k_in + kb;
                 for kc in range(0u32, 16u32, 1u32) {
-                    let elem = e4m3_decode(load(w[w_dev + kc]).cast::<u32>());
+                    let elem = mt_decode_e4m3(load(w[w_dev + kc]).cast::<u32>());
                     threadgroup_store("ws", w_row * 16u32 + kc, elem * scale);
                 }
                 threadgroup_barrier();
@@ -1012,7 +1012,7 @@ pub fn mt_int8_moe_gather_qmm_bm16_mpp<T>(
                 let scale = load(scales[sb_off]);
                 let w_dev = w_expert_base_8 + (n_tile_base + w_row) * k_in + kb;
                 for kc in range(0u32, 16u32, 1u32) {
-                    let elem = int8_decode(load(w[w_dev + kc]).cast::<u32>());
+                    let elem = mt_decode_int8(load(w[w_dev + kc]).cast::<u32>());
                     threadgroup_store("ws", w_row * 16u32 + kc, elem * scale);
                 }
                 threadgroup_barrier();
@@ -1140,7 +1140,7 @@ pub fn mt_nvfp8_f16_moe_gather_qmm_bm16_mpp<T>(
                 let scale = load(scales[sb_off]).cast::<f32>();
                 let w_dev = w_expert_base_8 + (n_tile_base + w_row) * k_in + kb;
                 for kc in range(0u32, 16u32, 1u32) {
-                    let elem = e4m3_decode(load(w[w_dev + kc]).cast::<u32>());
+                    let elem = mt_decode_e4m3(load(w[w_dev + kc]).cast::<u32>());
                     threadgroup_store("ws", w_row * 16u32 + kc, elem * scale);
                 }
                 threadgroup_barrier();
@@ -1268,7 +1268,7 @@ pub fn mt_fp4_f16_moe_gather_qmm_bm16_mpp<T>(
                     let dst = w_row * 16u32 + pack_col * 8u32;
                     for _j in range(0u32, 8u32, 1u32) {
                         let nib = (packed >> (_j * 4u32)) & 15u32;
-                        threadgroup_store("ws", dst + _j, e2m1_decode(nib) * scale);
+                        threadgroup_store("ws", dst + _j, mt_decode_e2m1(nib) * scale);
                     }
                 }
                 threadgroup_barrier();
@@ -1386,7 +1386,7 @@ pub fn mt_fp8_e5m2_f16_moe_gather_qmm_bm16_mpp<T>(
                 let scale = load(scales[sb_off]).cast::<f32>();
                 let w_dev = w_expert_base_8 + (n_tile_base + w_row) * k_in + kb;
                 for kc in range(0u32, 16u32, 1u32) {
-                    let elem = e5m2_decode(load(w[w_dev + kc]).cast::<u32>());
+                    let elem = mt_decode_e5m2(load(w[w_dev + kc]).cast::<u32>());
                     threadgroup_store("ws", w_row * 16u32 + kc, elem * scale);
                 }
                 threadgroup_barrier();
@@ -1913,7 +1913,7 @@ int_moe_gather_qmm_bm16_mpp_e8m0!(mt_mxint6_moe_gather_qmm_bm16_mpp, 6u32, 32u32
 /// MXINT8 MoE gather BGEMM, BM=16 / BN=32 / BK=16 — 8-bit symmetric codes (byte
 /// layout, block 32), E8M0 pow-2 block scale `2^(bits-127)`. Byte-strided
 /// staging like the int8 / mxfp8 kernels (one byte per code); decode is
-/// `int8_decode → val · scale`. Geometry and coop-tensor extents are
+/// `mt_decode_int8 → val · scale`. Geometry and coop-tensor extents are
 /// byte-identical to the int8 kernel.
 ///
 /// Params: `x [m_total, k_in]`, `w [n_experts, n_out, k_in]` (int8 codes, 1
@@ -1999,7 +1999,7 @@ pub fn mt_mxint8_moe_gather_qmm_bm16_mpp<T>(
                 let scale = exp2(load(scales[sb_off]).cast::<f32>() - 127.0f32);
                 let w_dev = w_expert_base_8 + (n_tile_base + w_row) * k_in + kb;
                 for kc in range(0u32, 16u32, 1u32) {
-                    let elem = int8_decode(load(w[w_dev + kc]).cast::<u32>());
+                    let elem = mt_decode_int8(load(w[w_dev + kc]).cast::<u32>());
                     threadgroup_store("ws", w_row * 16u32 + kc, elem * scale);
                 }
                 threadgroup_barrier();
@@ -2033,7 +2033,7 @@ pub fn mt_mxint8_moe_gather_qmm_bm16_mpp<T>(
 /// Symmetric int8 (FP16-scale) MoE gather BGEMM, BM=16 / BN=32 / BK=16 — 8-bit
 /// codes (byte layout, group 64), per-group FP16 scale (no bias). FP16-scale
 /// twin of `mt_int8_moe_gather_qmm_bm16_mpp`; identical byte-strided staging and
-/// `int8_decode`, only the scale tensor is `Tensor<f16>` (native half load →
+/// `mt_decode_int8`, only the scale tensor is `Tensor<f16>` (native half load →
 /// f32). Mirrors `mlx/block_scaled_dequant.rs`'s `mt_int8_f16_dequant`.
 ///
 /// Params: `x [m_total, k_in]`, `w [n_experts, n_out, k_in]` (int8 codes, 1
@@ -2119,7 +2119,7 @@ pub fn mt_int8_f16_moe_gather_qmm_bm16_mpp<T>(
                 let scale = load(scales[sb_off]).cast::<f32>();
                 let w_dev = w_expert_base_8 + (n_tile_base + w_row) * k_in + kb;
                 for kc in range(0u32, 16u32, 1u32) {
-                    let elem = int8_decode(load(w[w_dev + kc]).cast::<u32>());
+                    let elem = mt_decode_int8(load(w[w_dev + kc]).cast::<u32>());
                     threadgroup_store("ws", w_row * 16u32 + kc, elem * scale);
                 }
                 threadgroup_barrier();
@@ -2152,11 +2152,12 @@ pub fn mt_int8_f16_moe_gather_qmm_bm16_mpp<T>(
 
 #[cfg(test)]
 mod tests {
-    use metaltile_codegen::msl::MslGenerator;
-    use metaltile_core::ir::Op;
+    use metaltile::{
+        codegen::msl::MslGenerator,
+        core::{DType, ir::Op},
+    };
 
     use super::*;
-    use crate::bench_types::DType;
 
     /// Every block-scaled MoE kernel builds, drops to `CoopTile*` ops (no raw
     /// inline MSL), and has the 5-tensor / 4-constexpr ABI (nvfp4 adds the
@@ -2719,7 +2720,7 @@ pub mod kernel_benches {
             .with_shape_label(format!(
                 "{} M{m_total} N{n_out} K{k_in} E{n_experts} {}",
                 fmt.name(),
-                crate::bench_types::dtype_label(dt)
+                crate::utils::dtype_label(dt)
             ))
     }
 
@@ -2727,19 +2728,19 @@ pub mod kernel_benches {
     const SHAPE: BlockBenchShape =
         BlockBenchShape { n_experts: 8, m_total: 512, n_out: 4096, k_in: 4096 };
 
-    #[bench(name = "ffai/moe_mpp_block/mxfp4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxfp4(dt: DType) -> BenchSetup {
         block_bench(mt_mxfp4_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt), QFormat::Mxfp4, SHAPE, dt)
     }
-    #[bench(name = "ffai/moe_mpp_block/nvfp4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_nvfp4(dt: DType) -> BenchSetup {
         block_bench(mt_nvfp4_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt), QFormat::Nvfp4, SHAPE, dt)
     }
-    #[bench(name = "ffai/moe_mpp_block/fp4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp4(dt: DType) -> BenchSetup {
         block_bench(mt_fp4_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt), QFormat::Fp4, SHAPE, dt)
     }
-    #[bench(name = "ffai/moe_mpp_block/mxfp8_e4m3", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxfp8_e4m3(dt: DType) -> BenchSetup {
         block_bench(
             mt_mxfp8_e4m3_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt),
@@ -2748,7 +2749,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/moe_mpp_block/mxfp8_e5m2", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxfp8_e5m2(dt: DType) -> BenchSetup {
         block_bench(
             mt_mxfp8_e5m2_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt),
@@ -2757,7 +2758,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/moe_mpp_block/fp8_e5m2", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp8_e5m2(dt: DType) -> BenchSetup {
         block_bench(
             mt_fp8_e5m2_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt),
@@ -2766,12 +2767,12 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/moe_mpp_block/nvfp8", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_nvfp8(dt: DType) -> BenchSetup {
         block_bench(mt_nvfp8_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt), QFormat::Nvfp8, SHAPE, dt)
     }
     // fp8_e4m3 reuses the nvfp8 kernel (8-bit E4M3 + f32 scale, block 32).
-    #[bench(name = "ffai/moe_mpp_block/fp8_e4m3", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp8_e4m3(dt: DType) -> BenchSetup {
         block_bench(
             mt_nvfp8_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt),
@@ -2780,33 +2781,33 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/moe_mpp_block/int8", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int8(dt: DType) -> BenchSetup {
         block_bench(mt_int8_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt), QFormat::Int8, SHAPE, dt)
     }
     // Symmetric sub-byte ints (FP32 group scale) + MXINT (E8M0 block scale) +
     // MXINT8 (8-bit, E8M0). k_in=4096 is a multiple of 32 → word-aligned per width.
-    #[bench(name = "ffai/moe_mpp_block/int2", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int2(dt: DType) -> BenchSetup {
         block_bench(mt_int2_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt), QFormat::Int2, SHAPE, dt)
     }
-    #[bench(name = "ffai/moe_mpp_block/int3", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int3(dt: DType) -> BenchSetup {
         block_bench(mt_int3_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt), QFormat::Int3, SHAPE, dt)
     }
-    #[bench(name = "ffai/moe_mpp_block/int4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int4(dt: DType) -> BenchSetup {
         block_bench(mt_int4_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt), QFormat::Int4, SHAPE, dt)
     }
-    #[bench(name = "ffai/moe_mpp_block/int5", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int5(dt: DType) -> BenchSetup {
         block_bench(mt_int5_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt), QFormat::Int5, SHAPE, dt)
     }
-    #[bench(name = "ffai/moe_mpp_block/int6", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int6(dt: DType) -> BenchSetup {
         block_bench(mt_int6_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt), QFormat::Int6, SHAPE, dt)
     }
-    #[bench(name = "ffai/moe_mpp_block/mxint2", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint2(dt: DType) -> BenchSetup {
         block_bench(
             mt_mxint2_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt),
@@ -2815,7 +2816,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/moe_mpp_block/mxint3", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint3(dt: DType) -> BenchSetup {
         block_bench(
             mt_mxint3_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt),
@@ -2824,7 +2825,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/moe_mpp_block/mxint4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint4(dt: DType) -> BenchSetup {
         block_bench(
             mt_mxint4_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt),
@@ -2833,7 +2834,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/moe_mpp_block/mxint5", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint5(dt: DType) -> BenchSetup {
         block_bench(
             mt_mxint5_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt),
@@ -2842,7 +2843,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/moe_mpp_block/mxint6", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint6(dt: DType) -> BenchSetup {
         block_bench(
             mt_mxint6_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt),
@@ -2851,7 +2852,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/moe_mpp_block/mxint8", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint8(dt: DType) -> BenchSetup {
         block_bench(
             mt_mxint8_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt),
@@ -2862,7 +2863,7 @@ pub mod kernel_benches {
     }
     // FP16-scale twins (f16 scale buffer; codes packing unchanged). fp8_e4m3_f16
     // reuses the nvfp8_f16 kernel (8-bit E4M3 + f16 scale, block 32).
-    #[bench(name = "ffai/moe_mpp_block/nvfp8_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_nvfp8_f16(dt: DType) -> BenchSetup {
         block_bench(
             mt_nvfp8_f16_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt),
@@ -2871,7 +2872,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/moe_mpp_block/fp8_e4m3_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp8_e4m3_f16(dt: DType) -> BenchSetup {
         block_bench(
             mt_nvfp8_f16_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt),
@@ -2880,7 +2881,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/moe_mpp_block/fp4_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp4_f16(dt: DType) -> BenchSetup {
         block_bench(
             mt_fp4_f16_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt),
@@ -2889,7 +2890,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/moe_mpp_block/fp8_e5m2_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp8_e5m2_f16(dt: DType) -> BenchSetup {
         block_bench(
             mt_fp8_e5m2_f16_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt),
@@ -2898,7 +2899,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/moe_mpp_block/int2_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int2_f16(dt: DType) -> BenchSetup {
         block_bench(
             mt_int2_f16_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt),
@@ -2907,7 +2908,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/moe_mpp_block/int3_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int3_f16(dt: DType) -> BenchSetup {
         block_bench(
             mt_int3_f16_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt),
@@ -2916,7 +2917,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/moe_mpp_block/int4_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int4_f16(dt: DType) -> BenchSetup {
         block_bench(
             mt_int4_f16_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt),
@@ -2925,7 +2926,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/moe_mpp_block/int5_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int5_f16(dt: DType) -> BenchSetup {
         block_bench(
             mt_int5_f16_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt),
@@ -2934,7 +2935,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/moe_mpp_block/int6_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int6_f16(dt: DType) -> BenchSetup {
         block_bench(
             mt_int6_f16_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt),
@@ -2943,7 +2944,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/moe_mpp_block/int8_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int8_f16(dt: DType) -> BenchSetup {
         block_bench(
             mt_int8_f16_moe_gather_qmm_bm16_mpp::kernel_ir_for(dt),

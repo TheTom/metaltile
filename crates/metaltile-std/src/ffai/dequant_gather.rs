@@ -41,58 +41,58 @@
 
 use metaltile::kernel;
 
-macro_rules! dequant_gather_kernel {
-    ($name:ident, $bits:literal, $subop:literal) => {
-        #[kernel]
-        pub fn $name<T>(
-            weight: Tensor<u32>,
-            scales: Tensor<T>,
-            biases: Tensor<T>,
-            indices: Tensor<u32>,
-            out: Tensor<T>,
-            #[constexpr] hidden: u32,
-            #[constexpr] group_size: u32,
-        ) {
-            let idx = program_id::<0>();
-            let token = idx / hidden;
-            let d = idx - token * hidden;
-            let token_id = load(indices[token]);
+/// Dequantizing token-gather kernel — variable bit-widths (2, 3, 4, 5, 6, 8).
+///
+/// Produces kernels: `dequant_gather_int2`, `_int3`, `_int4`, `_int5`,
+/// `_int6`, `_int8`.
+///
+/// Uses a straddle-aware two-word bit-stream read that handles every width
+/// uniformly: for even widths the `spill` term is always zero so the second
+/// word load is elided by the `select`; for odd widths (`spill > 0`) the
+/// second word provides the high bits.
+///
+/// Grid: Elementwise, one thread per `(token, d)` output element.
+#[kernel(variants(BITS = [2, 3, 4, 5, 6, 8], suffix = "int{BITS}"))]
+pub fn dequant_gather<T>(
+    weight: Tensor<u32>,
+    scales: Tensor<T>,
+    biases: Tensor<T>,
+    indices: Tensor<u32>,
+    out: Tensor<T>,
+    #[constexpr] hidden: u32,
+    #[constexpr] group_size: u32,
+) {
+    let idx = program_id::<0>();
+    let token = idx / hidden;
+    let d = idx - token * hidden;
+    let token_id = load(indices[token]);
 
-            let groups_per_row = hidden / group_size;
-            let g = d / group_size;
-            let u32_per_row = hidden * $bits / 32u32;
-            let row_off = token_id * u32_per_row;
+    let groups_per_row = hidden / group_size;
+    let g = d / group_size;
+    let u32_per_row = hidden * BITS / 32u32;
+    let row_off = token_id * u32_per_row;
 
-            let bit_off = d * $bits;
-            let word_idx = bit_off / 32u32;
-            let bit_in_w = bit_off & 31u32;
+    let bit_off = d * BITS;
+    let word_idx = bit_off / 32u32;
+    let bit_in_w = bit_off & 31u32;
 
-            let bits_in_w0 = 32u32 - bit_in_w;
-            let lo_bits = select(bits_in_w0 >= $bits, $bits, bits_in_w0);
-            let spill = $bits - lo_bits;
+    let bits_in_w0 = 32u32 - bit_in_w;
+    let lo_bits = select(bits_in_w0 >= BITS, BITS, bits_in_w0);
+    let spill = BITS - lo_bits;
 
-            let w0 = load(weight[row_off + word_idx]);
-            let w1_idx = select(spill > 0u32, word_idx + 1u32, word_idx);
-            let w1 = load(weight[row_off + w1_idx]);
+    let w0 = load(weight[row_off + word_idx]);
+    let w1_idx = select(spill > 0u32, word_idx + 1u32, word_idx);
+    let w1 = load(weight[row_off + w1_idx]);
 
-            let lo = (w0 >> bit_in_w) & ((1u32 << lo_bits) - 1u32);
-            let hi = (w1 & ((1u32 << spill) - 1u32)) << lo_bits;
-            let q = lo | hi;
+    let lo = (w0 >> bit_in_w) & ((1u32 << lo_bits) - 1u32);
+    let hi = (w1 & ((1u32 << spill) - 1u32)) << lo_bits;
+    let q = lo | hi;
 
-            let scale = load(scales[token_id * groups_per_row + g]).cast::<f32>();
-            let bias = load(biases[token_id * groups_per_row + g]).cast::<f32>();
-            let w_real = q.cast::<f32>() * scale + bias;
-            store(out[idx], w_real.cast::<T>());
-        }
-    };
+    let scale = load(scales[token_id * groups_per_row + g]).cast::<f32>();
+    let bias = load(biases[token_id * groups_per_row + g]).cast::<f32>();
+    let w_real = q.cast::<f32>() * scale + bias;
+    store(out[idx], w_real.cast::<T>());
 }
-
-dequant_gather_kernel!(dequant_gather_int2, 2u32, "int2");
-dequant_gather_kernel!(dequant_gather_int3, 3u32, "int3");
-dequant_gather_kernel!(dequant_gather_int4, 4u32, "int4");
-dequant_gather_kernel!(dequant_gather_int5, 5u32, "int5");
-dequant_gather_kernel!(dequant_gather_int6, 6u32, "int6");
-dequant_gather_kernel!(dequant_gather_int8, 8u32, "int8");
 
 /// New-syntax correctness tests for the `dequant_gather_int{2,3,4,5,6,8}`
 /// quantized-embedding-gather family. Grid3D, one thread per output element
@@ -214,33 +214,19 @@ pub mod kernel_tests {
             .grid_1d(n_tokens * hidden, 256)
     }
 
-    // Pack-strided pow2 widths (codes never span a u32 boundary).
-    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-4, 1e-2, 1e-1])]
-    fn test_dequant_gather_int2(dt: DType) -> TestSetup {
-        gather_setup(dequant_gather_int2::kernel_ir_for(dt), 2, 256, 64, dt)
-    }
-    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-4, 1e-2, 1e-1])]
-    fn test_dequant_gather_int4(dt: DType) -> TestSetup {
-        gather_setup(dequant_gather_int4::kernel_ir_for(dt), 4, 256, 64, dt)
-    }
-    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-4, 1e-2, 1e-1])]
-    fn test_dequant_gather_int8(dt: DType) -> TestSetup {
-        gather_setup(dequant_gather_int8::kernel_ir_for(dt), 8, 256, 64, dt)
+    // Pack-strided pow2 widths (hidden=256, group_size=64).
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-4, 1e-2, 1e-1],
+                  variants(BITS = [2, 4, 8], suffix = "int{BITS}"))]
+    fn test_dequant_gather_pow2(dt: DType) -> TestSetup {
+        gather_setup(dequant_gather_intBITS::kernel_ir_for(dt), BITS, 256, 64, dt)
     }
 
-    // Odd widths (word-spilling `lo | hi` decode). hidden*bits a multiple of 32:
-    //   int3: 64*3 = 192; int5: 64*5 = 320; int6: 64*6 = 384. group_size 32.
-    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-4, 1e-2, 1e-1])]
-    fn test_dequant_gather_int3(dt: DType) -> TestSetup {
-        gather_setup(dequant_gather_int3::kernel_ir_for(dt), 3, 64, 32, dt)
-    }
-    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-4, 1e-2, 1e-1])]
-    fn test_dequant_gather_int5(dt: DType) -> TestSetup {
-        gather_setup(dequant_gather_int5::kernel_ir_for(dt), 5, 64, 32, dt)
-    }
-    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-4, 1e-2, 1e-1])]
-    fn test_dequant_gather_int6(dt: DType) -> TestSetup {
-        gather_setup(dequant_gather_int6::kernel_ir_for(dt), 6, 64, 32, dt)
+    // Odd widths — hidden*BITS must be a multiple of 32 (hidden=64, group_size=32).
+    //   int3: 64×3=192; int5: 64×5=320; int6: 64×6=384.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-4, 1e-2, 1e-1],
+                  variants(BITS = [3, 5, 6], suffix = "int{BITS}"))]
+    fn test_dequant_gather_odd(dt: DType) -> TestSetup {
+        gather_setup(dequant_gather_intBITS::kernel_ir_for(dt), BITS, 64, 32, dt)
     }
 }
 
@@ -271,28 +257,9 @@ pub mod kernel_benches {
             .bytes_moved((n_tokens * hidden * dt.size_bytes()) as u64)
     }
 
-    #[bench(name = "ffai/dequant_gather/int2", dtypes = [f32, f16, bf16])]
-    fn bench_dequant_gather_int2(dt: DType) -> BenchSetup {
-        gb(dequant_gather_int2::kernel_ir_for(dt), 2, 4096, 64, dt)
-    }
-    #[bench(name = "ffai/dequant_gather/int3", dtypes = [f32, f16, bf16])]
-    fn bench_dequant_gather_int3(dt: DType) -> BenchSetup {
-        gb(dequant_gather_int3::kernel_ir_for(dt), 3, 4096, 64, dt)
-    }
-    #[bench(name = "ffai/dequant_gather/int4", dtypes = [f32, f16, bf16])]
-    fn bench_dequant_gather_int4(dt: DType) -> BenchSetup {
-        gb(dequant_gather_int4::kernel_ir_for(dt), 4, 4096, 64, dt)
-    }
-    #[bench(name = "ffai/dequant_gather/int5", dtypes = [f32, f16, bf16])]
-    fn bench_dequant_gather_int5(dt: DType) -> BenchSetup {
-        gb(dequant_gather_int5::kernel_ir_for(dt), 5, 4096, 64, dt)
-    }
-    #[bench(name = "ffai/dequant_gather/int6", dtypes = [f32, f16, bf16])]
-    fn bench_dequant_gather_int6(dt: DType) -> BenchSetup {
-        gb(dequant_gather_int6::kernel_ir_for(dt), 6, 4096, 64, dt)
-    }
-    #[bench(name = "ffai/dequant_gather/int8", dtypes = [f32, f16, bf16])]
-    fn bench_dequant_gather_int8(dt: DType) -> BenchSetup {
-        gb(dequant_gather_int8::kernel_ir_for(dt), 8, 4096, 64, dt)
+    #[bench(dtypes = [f32, f16, bf16],
+            variants(BITS = [2, 3, 4, 5, 6, 8], suffix = "int{BITS}"))]
+    fn bench_dequant_gather(dt: DType) -> BenchSetup {
+        gb(dequant_gather_intBITS::kernel_ir_for(dt), BITS, 4096, 64, dt)
     }
 }

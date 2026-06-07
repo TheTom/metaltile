@@ -30,166 +30,149 @@
 use metaltile::kernel;
 
 // ── SSD forward step with (dA, dBx) tape capture ────────────────────────────
-#[rustfmt::skip]
-macro_rules! ssm_step_record {
-    ($name:ident, $dh:literal, $ds:literal, $h:literal, $g:literal, $n_per_t:literal, $subop:literal) => {
-        #[kernel]
-        pub fn $name<T>(
-            x: Tensor<T>,
-            a_log: Tensor<T>,
-            b: Tensor<T>,
-            c: Tensor<T>,
-            d: Tensor<T>,
-            dt: Tensor<T>,
-            state_in: Tensor<T>,
-            mask: Tensor<u32>,
-            mut y: Tensor<T>,
-            mut state_out: Tensor<T>,
-            mut da_log: Tensor<T>,
-            mut dbx_log: Tensor<T>,
-            #[constexpr] t_total: u32,
-            #[constexpr] has_mask: u32,
-        ) {
-            let ds_lane = program_id::<0>();
-            let d_idx = program_id::<1>();
-            let n = program_id::<2>();
-            let h_idx = n - (n / $h) * $h;
-            let b_idx = n / $h;
-            let g_idx = h_idx / ($h / $g);
-            let state_base = (n * $dh + d_idx) * $ds;
+//
+// Variants:
+//   d16_64_4_2   — Small unit-test cell: Dh=16, Ds=64, H=4, G=2
+//   d128_128_32_2 — Production cell (Jamba / Nemotron): Dh=128, Ds=128, H=32, G=2
 
-            stack_alloc("state", $n_per_t, "f32");
-            for i in range(0u32, $n_per_t, 1u32) {
-                let v = load(state_in[state_base + $n_per_t * ds_lane + i]).cast::<f32>();
-                stack_store("state", i, v);
-            }
+#[kernel(variants(
+    DH = [16u32, 128u32, 64u32],
+    DS = [64u32, 128u32, 128u32],
+    H = [4u32, 32u32, 64u32],
+    G = [2u32, 2u32, 8u32],
+    NPT = [2, 4, 4],
+    suffix = "d{DH}_{DS}_{H}_{G}"
+))]
+pub fn ssm_step_record<T>(
+    x: Tensor<T>,
+    a_log: Tensor<T>,
+    b: Tensor<T>,
+    c: Tensor<T>,
+    d: Tensor<T>,
+    dt: Tensor<T>,
+    state_in: Tensor<T>,
+    mask: Tensor<u32>,
+    mut y: Tensor<T>,
+    mut state_out: Tensor<T>,
+    mut da_log: Tensor<T>,
+    mut dbx_log: Tensor<T>,
+    #[constexpr] t_total: u32,
+    #[constexpr] has_mask: u32,
+) {
+    let ds_lane = program_id::<0>();
+    let d_idx = program_id::<1>();
+    let n = program_id::<2>();
+    let h_idx = n - (n / H) * H;
+    let b_idx = n / H;
+    let g_idx = h_idx / (H / G);
+    let state_base = (n * DH + d_idx) * DS;
 
-            // A = -exp(A_log[h]).
-            let a_neg = 0.0f32 - exp(load(a_log[h_idx]).cast::<f32>());
+    stack_alloc("state", NPT, "f32");
+    for i in range(0u32, NPT, 1u32) {
+        let v = load(state_in[state_base + NPT * ds_lane + i]).cast::<f32>();
+        stack_store("state", i, v);
+    }
 
-            for t in range(0u32, t_total, 1u32) {
-                let bt = b_idx * t_total + t;
-                let bt_h = bt * $h + h_idx;
-                let bt_g = bt * $g + g_idx;
-                let active = select(has_mask == 0u32, 1u32, load(mask[bt]));
+    // A = -exp(A_log[h]).
+    let a_neg = 0.0f32 - exp(load(a_log[h_idx]).cast::<f32>());
 
-                let dt_raw = load(dt[bt_h]).cast::<f32>();
-                // Masked step: dA=1, dt_eff=0 → identity recurrence.
-                let dt_eff = select(active > 0u32, dt_raw, 0.0f32);
-                let d_a = select(active > 0u32, exp(a_neg * dt_raw), 1.0f32);
+    for t in range(0u32, t_total, 1u32) {
+        let bt = b_idx * t_total + t;
+        let bt_h = bt * H + h_idx;
+        let bt_g = bt * G + g_idx;
+        let active = select(has_mask == 0u32, 1u32, load(mask[bt]));
 
-                // Capture dA (same scalar in every Ds slot for this lane).
-                for i in range(0u32, $n_per_t, 1u32) {
-                    store(da_log[bt_h * $ds + $n_per_t * ds_lane + i], d_a.cast::<T>());
-                }
+        let dt_raw = load(dt[bt_h]).cast::<f32>();
+        // Masked step: dA=1, dt_eff=0 → identity recurrence.
+        let dt_eff = select(active > 0u32, dt_raw, 0.0f32);
+        let d_a = select(active > 0u32, exp(a_neg * dt_raw), 1.0f32);
 
-                let x_v = load(x[bt_h * $dh + d_idx]).cast::<f32>();
-                let dbx_base = (bt_h * $dh + d_idx) * $ds;
-                let mut y_acc = 0.0f32;
-                for i in range(0u32, $n_per_t, 1u32) {
-                    let s_idx = $n_per_t * ds_lane + i;
-                    let b_v = load(b[bt_g * $ds + s_idx]).cast::<f32>();
-                    let dbx = x_v * dt_eff * b_v;
-                    store(dbx_log[dbx_base + s_idx], dbx.cast::<T>());
-                    let st = d_a * stack_load("state", i) + dbx;
-                    stack_store("state", i, st);
-                    y_acc = y_acc + st * load(c[bt_g * $ds + s_idx]).cast::<f32>();
-                }
-                let y_sum = simd_sum(y_acc);
-                if ds_lane == 0u32 {
-                    let y_d = y_sum + x_v * load(d[h_idx]).cast::<f32>();
-                    store(y[bt_h * $dh + d_idx], y_d.cast::<T>());
-                }
-            }
-
-            for i in range(0u32, $n_per_t, 1u32) {
-                let st = stack_load("state", i);
-                store(state_out[state_base + $n_per_t * ds_lane + i], st.cast::<T>());
-            }
+        // Capture dA (same scalar in every Ds slot for this lane).
+        for i in range(0u32, NPT, 1u32) {
+            store(da_log[bt_h * DS + NPT * ds_lane + i], d_a.cast::<T>());
         }
-    };
+
+        let x_v = load(x[bt_h * DH + d_idx]).cast::<f32>();
+        let dbx_base = (bt_h * DH + d_idx) * DS;
+        let mut y_acc = 0.0f32;
+        for i in range(0u32, NPT, 1u32) {
+            let s_idx = NPT * ds_lane + i;
+            let b_v = load(b[bt_g * DS + s_idx]).cast::<f32>();
+            let dbx = x_v * dt_eff * b_v;
+            store(dbx_log[dbx_base + s_idx], dbx.cast::<T>());
+            let st = d_a * stack_load("state", i) + dbx;
+            stack_store("state", i, st);
+            y_acc = y_acc + st * load(c[bt_g * DS + s_idx]).cast::<f32>();
+        }
+        let y_sum = simd_sum(y_acc);
+        if ds_lane == 0u32 {
+            let y_d = y_sum + x_v * load(d[h_idx]).cast::<f32>();
+            store(y[bt_h * DH + d_idx], y_d.cast::<T>());
+        }
+    }
+
+    for i in range(0u32, NPT, 1u32) {
+        let st = stack_load("state", i);
+        store(state_out[state_base + NPT * ds_lane + i], st.cast::<T>());
+    }
 }
 
 // ── Tape replay: re-fold the first k log entries onto a snapshot ────────────
-#[rustfmt::skip]
-macro_rules! ssm_replay {
-    ($name:ident, $dh:literal, $ds:literal, $h:literal, $n_per_t:literal, $subop:literal) => {
-        #[kernel]
-        pub fn $name<T>(
-            state_snapshot: Tensor<T>,
-            da_log: Tensor<T>,
-            dbx_log: Tensor<T>,
-            mask: Tensor<u32>,
-            mut state_after_k: Tensor<T>,
-            #[constexpr] k_steps: u32,
-            #[constexpr] t_total: u32,
-            #[constexpr] has_mask: u32,
-        ) {
-            let ds_lane = program_id::<0>();
-            let d_idx = program_id::<1>();
-            let n = program_id::<2>();
-            let h_idx = n - (n / $h) * $h;
-            let b_idx = n / $h;
-            let state_base = (n * $dh + d_idx) * $ds;
+//
+// Variants mirror the record kernel above (G not needed here).
 
-            stack_alloc("state", $n_per_t, "f32");
-            for i in range(0u32, $n_per_t, 1u32) {
-                let v = load(state_snapshot[state_base + $n_per_t * ds_lane + i]).cast::<f32>();
-                stack_store("state", i, v);
-            }
+#[kernel(variants(
+    DH = [16u32, 128u32, 64u32],
+    DS = [64u32, 128u32, 128u32],
+    H = [4u32, 32u32, 64u32],
+    NPT = [2, 4, 4],
+    suffix = "d{DH}_{DS}_{H}"
+))]
+pub fn ssm_replay<T>(
+    state_snapshot: Tensor<T>,
+    da_log: Tensor<T>,
+    dbx_log: Tensor<T>,
+    mask: Tensor<u32>,
+    mut state_after_k: Tensor<T>,
+    #[constexpr] k_steps: u32,
+    #[constexpr] t_total: u32,
+    #[constexpr] has_mask: u32,
+) {
+    let ds_lane = program_id::<0>();
+    let d_idx = program_id::<1>();
+    let n = program_id::<2>();
+    let h_idx = n - (n / H) * H;
+    let b_idx = n / H;
+    let state_base = (n * DH + d_idx) * DS;
 
-            for t in range(0u32, k_steps, 1u32) {
-                let bt = b_idx * t_total + t;
-                let bt_h = bt * $h + h_idx;
-                let active = select(has_mask == 0u32, 1u32, load(mask[bt]));
-                let dbx_base = (bt_h * $dh + d_idx) * $ds;
-                for i in range(0u32, $n_per_t, 1u32) {
-                    let s_idx = $n_per_t * ds_lane + i;
-                    let old = stack_load("state", i);
-                    let d_a = load(da_log[bt_h * $ds + s_idx]).cast::<f32>();
-                    let dbx = load(dbx_log[dbx_base + s_idx]).cast::<f32>();
-                    let new_val = d_a * old + dbx;
-                    // Masked steps were recorded as dA=1, dBx=0 (identity),
-                    // but guard anyway so a stale tape entry can't perturb.
-                    stack_store("state", i, select(active > 0u32, new_val, old));
-                }
-            }
+    stack_alloc("state", NPT, "f32");
+    for i in range(0u32, NPT, 1u32) {
+        let v = load(state_snapshot[state_base + NPT * ds_lane + i]).cast::<f32>();
+        stack_store("state", i, v);
+    }
 
-            for i in range(0u32, $n_per_t, 1u32) {
-                let st = stack_load("state", i);
-                store(state_after_k[state_base + $n_per_t * ds_lane + i], st.cast::<T>());
-            }
+    for t in range(0u32, k_steps, 1u32) {
+        let bt = b_idx * t_total + t;
+        let bt_h = bt * H + h_idx;
+        let active = select(has_mask == 0u32, 1u32, load(mask[bt]));
+        let dbx_base = (bt_h * DH + d_idx) * DS;
+        for i in range(0u32, NPT, 1u32) {
+            let s_idx = NPT * ds_lane + i;
+            let old = stack_load("state", i);
+            let d_a = load(da_log[bt_h * DS + s_idx]).cast::<f32>();
+            let dbx = load(dbx_log[dbx_base + s_idx]).cast::<f32>();
+            let new_val = d_a * old + dbx;
+            // Masked steps were recorded as dA=1, dBx=0 (identity),
+            // but guard anyway so a stale tape entry can't perturb.
+            stack_store("state", i, select(active > 0u32, new_val, old));
         }
-    };
-}
+    }
 
-// Small unit-test cell: Dh=16, Ds=64, H=4, G=2.
-ssm_step_record!(ssm_step_record_d16_64_4_2, 16u32, 64u32, 4u32, 2u32, 2u32, "record_d16_64_4_2");
-ssm_replay!(ssm_replay_d16_64_4, 16u32, 64u32, 4u32, 2u32, "replay_d16_64_4");
-// Production cell: Dh=128, Ds=128, H=32, G=2 (Jamba / Nemotron class).
-ssm_step_record!(
-    ssm_step_record_d128_128_32_2,
-    128u32,
-    128u32,
-    32u32,
-    2u32,
-    4u32,
-    "record_d128_128_32_2"
-);
-ssm_replay!(ssm_replay_d128_128_32, 128u32, 128u32, 32u32, 4u32, "replay_d128_128_32");
-// Nemotron-Nano-30B Mamba2 cell: Dh=64, Ds=128, H=64, G=8 (n_per_t=Ds/32=4).
-// Used as the BATCHED-PREFILL SSD scan: one dispatch runs the sequential SSD
-// forward over all `t_total` prompt tokens per (head, dh-channel), emitting
-// every per-token y[t] plus the final recurrent state for decode continuity.
-ssm_step_record!(
-    ssm_step_record_d64_128_64_8,
-    64u32,
-    128u32,
-    64u32,
-    8u32,
-    4u32,
-    "record_d64_128_64_8"
-);
+    for i in range(0u32, NPT, 1u32) {
+        let st = stack_load("state", i);
+        store(state_after_k[state_base + NPT * ds_lane + i], st.cast::<T>());
+    }
+}
 
 /// New-syntax correctness for the Mamba 2 SSD tape record + replay kernels on
 /// the small `d16_64_4` cell (Dh=16, Ds=64, H=4, G=2). Oracles are ported
@@ -403,106 +386,6 @@ pub mod kernel_tests {
     }
 }
 
-/// Nemotron-Nano-30B Mamba2 SSD-scan cell (Dh=64, Ds=128, H=64, G=8). This
-/// registers `ssm_step_record_d64_128_64_8` in the test registry so the
-/// batched-prefill path can `lookup` it by name. Same `naive_record` oracle
-/// as the d16 cell, re-parameterised to the Nemotron dims.
-pub mod kernel_tests_nemotron {
-    use metaltile::{test::*, test_kernel};
-
-    use super::ssm_step_record_d64_128_64_8;
-    use crate::utils::{pack_f32, unpack_f32};
-
-    const DH: usize = 64;
-    const DS: usize = 128;
-    const H: usize = 64;
-    const G: usize = 8;
-
-    fn u32_bytes(v: &[u32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
-
-    #[allow(clippy::too_many_arguments)]
-    fn naive_record(
-        x: &[f32], a_log: &[f32], bmat: &[f32], cmat: &[f32], dvec: &[f32],
-        dt: &[f32], state_in: &[f32], batch: usize, t_total: usize,
-    ) -> (Vec<f32>, Vec<f32>) {
-        let mut y = vec![0.0_f32; batch * t_total * H * DH];
-        let mut state = state_in.to_vec();
-        for n in 0..batch * H {
-            let b = n / H;
-            let h = n % H;
-            let g = h / (H / G);
-            let a_neg = -a_log[h].exp();
-            for t in 0..t_total {
-                let bt = b * t_total + t;
-                let bt_h = bt * H + h;
-                let bt_g = bt * G + g;
-                let dt_v = dt[bt_h];
-                let d_a = (a_neg * dt_v).exp();
-                for dh in 0..DH {
-                    let x_v = x[bt_h * DH + dh];
-                    let mut y_acc = 0.0_f32;
-                    for ds in 0..DS {
-                        let dbx = x_v * dt_v * bmat[bt_g * DS + ds];
-                        let s0 = (n * DH + dh) * DS + ds;
-                        state[s0] = d_a * state[s0] + dbx;
-                        y_acc += state[s0] * cmat[bt_g * DS + ds];
-                    }
-                    y[bt_h * DH + dh] = y_acc + x_v * dvec[h];
-                }
-            }
-        }
-        (y, state)
-    }
-
-    fn src(n: usize, seed: u64, scale: f32) -> Vec<f32> {
-        let mut s = seed;
-        (0..n).map(|_| {
-            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
-            (s % 20_000) as f32 / 20_000.0 * scale - scale * 0.5
-        }).collect()
-    }
-
-    fn record_setup(dt: DType) -> TestSetup {
-        let (batch, t) = (1usize, 3usize);
-        let n_total = batch * H;
-        let x = src(batch * t * H * DH, 0x1, 1.0);
-        let a_log = src(H, 0x2, 1.0);
-        let bmat = src(batch * t * G * DS, 0x3, 1.0);
-        let cmat = src(batch * t * G * DS, 0x4, 1.0);
-        let dvec = src(H, 0x5, 0.5);
-        let dtv: Vec<f32> = src(batch * t * H, 0x6, 0.1).iter().map(|v| 0.2 + v).collect();
-        let state_in = src(n_total * DH * DS, 0x7, 0.3);
-
-        let r = |xs: &[f32]| unpack_f32(&pack_f32(xs, dt), dt);
-        let (y_exp, s_exp) = naive_record(
-            &r(&x), &r(&a_log), &r(&bmat), &r(&cmat), &r(&dvec), &r(&dtv), &r(&state_in), batch, t,
-        );
-
-        TestSetup::new(ssm_step_record_d64_128_64_8::kernel_ir_for(dt))
-            .mode(KernelMode::Grid3D)
-            .input(TestBuffer::from_vec("x", pack_f32(&x, dt), dt))
-            .input(TestBuffer::from_vec("a_log", pack_f32(&a_log, dt), dt))
-            .input(TestBuffer::from_vec("b", pack_f32(&bmat, dt), dt))
-            .input(TestBuffer::from_vec("c", pack_f32(&cmat, dt), dt))
-            .input(TestBuffer::from_vec("d", pack_f32(&dvec, dt), dt))
-            .input(TestBuffer::from_vec("dt", pack_f32(&dtv, dt), dt))
-            .input(TestBuffer::from_vec("state_in", pack_f32(&state_in, dt), dt))
-            .input(TestBuffer::from_vec("mask", u32_bytes(&vec![1u32; batch * t]), DType::U32))
-            .input(TestBuffer::zeros("y", batch * t * H * DH, dt))
-            .input(TestBuffer::zeros("state_out", n_total * DH * DS, dt))
-            .input(TestBuffer::zeros("da_log", batch * t * H * DS, dt))
-            .input(TestBuffer::zeros("dbx_log", batch * t * H * DH * DS, dt))
-            .constexpr("t_total", t as u32)
-            .constexpr("has_mask", 0u32)
-            .expect(TestBuffer::from_vec("y", pack_f32(&y_exp, dt), dt))
-            .expect(TestBuffer::from_vec("state_out", pack_f32(&s_exp, dt), dt))
-            .grid_3d(1, DH as u32, (batch * H) as u32, [32, 1, 1])
-    }
-
-    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 5e-3, 2e-2])]
-    fn test_ssm_step_record_d64_128_64_8(dt: DType) -> TestSetup { record_setup(dt) }
-}
-
 pub mod kernel_benches {
     use metaltile::{bench, test::*};
 
@@ -527,7 +410,7 @@ pub mod kernel_benches {
     fn u32_bytes(v: &[u32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
 
     // Sequential SSD forward with (dA, dBx) tape capture over `t_total` steps.
-    #[bench(name = "ffai/ssm_record", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_ssm_record(dt: DType) -> BenchSetup {
         let (batch, t) = (1usize, 8usize);
         let n_total = batch * H;
@@ -552,7 +435,7 @@ pub mod kernel_benches {
     }
 
     // Re-fold the first `k_steps` tape entries onto a recurrent-state snapshot.
-    #[bench(name = "ffai/ssm_replay", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_ssm_replay(dt: DType) -> BenchSetup {
         let (batch, t, k_steps) = (1usize, 8usize, 8usize);
         let n_total = batch * H;
@@ -572,7 +455,7 @@ pub mod kernel_benches {
 
     // Production cell (Dh=128, Ds=128, H=32, G=2): sequential SSD forward
     // with (dA, dBx) tape capture over `t_total` steps.
-    #[bench(name = "ffai/ssm_record_d128_128_32", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_ssm_record_d128_128_32(dt: DType) -> BenchSetup {
         let (batch, t) = (1usize, 8usize);
         let n_total = batch * P_H;
@@ -598,7 +481,7 @@ pub mod kernel_benches {
 
     // Production cell (Dh=128, Ds=128, H=32): re-fold the first `k_steps`
     // tape entries onto a recurrent-state snapshot.
-    #[bench(name = "ffai/ssm_replay_d128_128_32", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_ssm_replay_d128_128_32(dt: DType) -> BenchSetup {
         let (batch, t, k_steps) = (1usize, 8usize, 8usize);
         let n_total = batch * P_H;

@@ -53,7 +53,7 @@ pub fn mt_mxfp4_qmm<T>(
             let p_off = pack_idx * 8u32;
             for i in range(0u32, 8u32, 1u32) {
                 let nib = (packed >> (i * 4u32)) & 0xFu32;
-                let val = e2m1_decode(nib);
+                let val = mt_decode_e2m1(nib);
                 acc = acc + (val * scale) * load(x[x_row_off + p_off + i]).cast::<f32>();
             }
         }
@@ -91,12 +91,12 @@ pub fn mt_nvfp4_qmm<T>(
         let pack_idx = p_iter * lsize + tid;
         if pack_idx < n_packs_per_row {
             let blk = pack_idx / packs_per_block;
-            let scale = e4m3_decode(load(scales[row_block_off + blk]).cast::<u32>()) * global;
+            let scale = mt_decode_e4m3(load(scales[row_block_off + blk]).cast::<u32>()) * global;
             let packed = load(weight[row_pack_off + pack_idx]);
             let p_off = pack_idx * 8u32;
             for i in range(0u32, 8u32, 1u32) {
                 let nib = (packed >> (i * 4u32)) & 0xFu32;
-                let val = e2m1_decode(nib);
+                let val = mt_decode_e2m1(nib);
                 acc = acc + (val * scale) * load(x[x_row_off + p_off + i]).cast::<f32>();
             }
         }
@@ -130,7 +130,7 @@ pub fn mt_mxfp8_e4m3_qmm<T>(
     for it in range(0u32, iters, 1u32) {
         let c = it * lsize + tid;
         if c < in_dim {
-            let elem = e4m3_decode(load(weight[row_off + c]).cast::<u32>());
+            let elem = mt_decode_e4m3(load(weight[row_off + c]).cast::<u32>());
             let sbits = load(scales[row_block_off + c / block_size]).cast::<f32>();
             let scale = exp2(sbits - 127.0f32);
             acc = acc + (elem * scale) * load(x[x_row_off + c]).cast::<f32>();
@@ -165,7 +165,7 @@ pub fn mt_mxfp8_e5m2_qmm<T>(
     for it in range(0u32, iters, 1u32) {
         let c = it * lsize + tid;
         if c < in_dim {
-            let elem = e5m2_decode(load(weight[row_off + c]).cast::<u32>());
+            let elem = mt_decode_e5m2(load(weight[row_off + c]).cast::<u32>());
             let sbits = load(scales[row_block_off + c / block_size]).cast::<f32>();
             let scale = exp2(sbits - 127.0f32);
             acc = acc + (elem * scale) * load(x[x_row_off + c]).cast::<f32>();
@@ -200,7 +200,7 @@ pub fn mt_nvfp8_qmm<T>(
     for it in range(0u32, iters, 1u32) {
         let c = it * lsize + tid;
         if c < in_dim {
-            let elem = e4m3_decode(load(weight[row_off + c]).cast::<u32>());
+            let elem = mt_decode_e4m3(load(weight[row_off + c]).cast::<u32>());
             let scale = load(scales[row_block_off + c / block_size]);
             acc = acc + (elem * scale) * load(x[x_row_off + c]).cast::<f32>();
         }
@@ -248,7 +248,7 @@ pub fn mt_fp4_qmm<T>(
             let p_off = pack_idx * 8u32;
             for i in range(0u32, 8u32, 1u32) {
                 let nib = (packed >> (i * 4u32)) & 0xFu32;
-                let val = e2m1_decode(nib);
+                let val = mt_decode_e2m1(nib);
                 acc = acc + (val * scale) * load(x[x_row_off + p_off + i]).cast::<f32>();
             }
         }
@@ -282,7 +282,7 @@ pub fn mt_fp8_e5m2_qmm<T>(
     for it in range(0u32, iters, 1u32) {
         let c = it * lsize + tid;
         if c < in_dim {
-            let elem = e5m2_decode(load(weight[row_off + c]).cast::<u32>());
+            let elem = mt_decode_e5m2(load(weight[row_off + c]).cast::<u32>());
             let scale = load(scales[row_block_off + c / block_size]);
             acc = acc + (elem * scale) * load(x[x_row_off + c]).cast::<f32>();
         }
@@ -317,7 +317,7 @@ pub fn mt_int8_qmm<T>(
     for it in range(0u32, iters, 1u32) {
         let c = it * lsize + tid;
         if c < in_dim {
-            let elem = int8_decode(load(weight[row_off + c]).cast::<u32>());
+            let elem = mt_decode_int8(load(weight[row_off + c]).cast::<u32>());
             let scale = load(scales[row_block_off + c / block_size]);
             acc = acc + (elem * scale) * load(x[x_row_off + c]).cast::<f32>();
         }
@@ -478,7 +478,7 @@ pub fn mt_mxint8_qmm<T>(
     for it in range(0u32, iters, 1u32) {
         let c = it * lsize + tid;
         if c < in_dim {
-            let elem = int8_decode(load(weight[row_off + c]).cast::<u32>());
+            let elem = mt_decode_int8(load(weight[row_off + c]).cast::<u32>());
             let sbits = load(scales[row_block_off + c / block_size]).cast::<f32>();
             let scale = exp2(sbits - 127.0f32);
             acc = acc + (elem * scale) * load(x[x_row_off + c]).cast::<f32>();
@@ -523,7 +523,7 @@ pub fn mt_nvfp8_f16_qmm<T>(
     for it in range(0u32, iters, 1u32) {
         let c = it * lsize + tid;
         if c < in_dim {
-            let elem = e4m3_decode(load(weight[row_off + c]).cast::<u32>());
+            let elem = mt_decode_e4m3(load(weight[row_off + c]).cast::<u32>());
             let scale = load(scales[row_block_off + c / block_size]).cast::<f32>();
             acc = acc + (elem * scale) * load(x[x_row_off + c]).cast::<f32>();
         }
@@ -566,7 +566,7 @@ pub fn mt_fp4_f16_qmm<T>(
             let p_off = pack_idx * 8u32;
             for i in range(0u32, 8u32, 1u32) {
                 let nib = (packed >> (i * 4u32)) & 0xFu32;
-                let val = e2m1_decode(nib);
+                let val = mt_decode_e2m1(nib);
                 acc = acc + (val * scale) * load(x[x_row_off + p_off + i]).cast::<f32>();
             }
         }
@@ -601,7 +601,7 @@ pub fn mt_fp8_e5m2_f16_qmm<T>(
     for it in range(0u32, iters, 1u32) {
         let c = it * lsize + tid;
         if c < in_dim {
-            let elem = e5m2_decode(load(weight[row_off + c]).cast::<u32>());
+            let elem = mt_decode_e5m2(load(weight[row_off + c]).cast::<u32>());
             let scale = load(scales[row_block_off + c / block_size]).cast::<f32>();
             acc = acc + (elem * scale) * load(x[x_row_off + c]).cast::<f32>();
         }
@@ -694,7 +694,7 @@ pub fn mt_int8_f16_qmm<T>(
     for it in range(0u32, iters, 1u32) {
         let c = it * lsize + tid;
         if c < in_dim {
-            let elem = int8_decode(load(weight[row_off + c]).cast::<u32>());
+            let elem = mt_decode_int8(load(weight[row_off + c]).cast::<u32>());
             let scale = load(scales[row_block_off + c / block_size]).cast::<f32>();
             acc = acc + (elem * scale) * load(x[x_row_off + c]).cast::<f32>();
         }
@@ -988,125 +988,125 @@ pub mod kernel_benches {
             .with_shape_label(format!("{} m={m} n={out_dim} k={in_dim}", fmt.name()))
     }
 
-    #[bench(name = "ffai/block_scaled_qmm/mxfp4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxfp4_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_mxfp4_qmm::kernel_ir_for(dt), QFormat::Mxfp4, 32, 4096, 4096, dt)
     }
-    #[bench(name = "ffai/block_scaled_qmm/nvfp4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_nvfp4_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_nvfp4_qmm::kernel_ir_for(dt), QFormat::Nvfp4, 32, 4096, 4096, dt)
     }
-    #[bench(name = "ffai/block_scaled_qmm/mxfp8_e4m3", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxfp8_e4m3_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_mxfp8_e4m3_qmm::kernel_ir_for(dt), QFormat::Mxfp8E4, 32, 4096, 4096, dt)
     }
-    #[bench(name = "ffai/block_scaled_qmm/mxfp8_e5m2", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxfp8_e5m2_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_mxfp8_e5m2_qmm::kernel_ir_for(dt), QFormat::Mxfp8E5, 32, 4096, 4096, dt)
     }
-    #[bench(name = "ffai/block_scaled_qmm/nvfp8", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_nvfp8_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_nvfp8_qmm::kernel_ir_for(dt), QFormat::Nvfp8, 32, 4096, 4096, dt)
     }
-    #[bench(name = "ffai/block_scaled_qmm/fp4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp4_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_fp4_qmm::kernel_ir_for(dt), QFormat::Fp4, 32, 4096, 4096, dt)
     }
-    #[bench(name = "ffai/block_scaled_qmm/fp8_e4m3", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp8_e4m3_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_nvfp8_qmm::kernel_ir_for(dt), QFormat::Fp8E4m3, 32, 4096, 4096, dt)
     }
-    #[bench(name = "ffai/block_scaled_qmm/fp8_e5m2", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp8_e5m2_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_fp8_e5m2_qmm::kernel_ir_for(dt), QFormat::Fp8E5m2, 32, 4096, 4096, dt)
     }
-    #[bench(name = "ffai/block_scaled_qmm/int8", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int8_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_int8_qmm::kernel_ir_for(dt), QFormat::Int8, 32, 4096, 4096, dt)
     }
     // Symmetric sub-byte ints (FP32 group scale) + MXINT (E8M0 block scale).
-    #[bench(name = "ffai/block_scaled_qmm/int2", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int2_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_int2_qmm::kernel_ir_for(dt), QFormat::Int2, 32, 4096, 4096, dt)
     }
-    #[bench(name = "ffai/block_scaled_qmm/int3", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int3_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_int3_qmm::kernel_ir_for(dt), QFormat::Int3, 32, 4096, 4096, dt)
     }
-    #[bench(name = "ffai/block_scaled_qmm/int4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int4_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_int4_qmm::kernel_ir_for(dt), QFormat::Int4, 32, 4096, 4096, dt)
     }
-    #[bench(name = "ffai/block_scaled_qmm/int5", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int5_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_int5_qmm::kernel_ir_for(dt), QFormat::Int5, 32, 4096, 4096, dt)
     }
-    #[bench(name = "ffai/block_scaled_qmm/int6", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int6_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_int6_qmm::kernel_ir_for(dt), QFormat::Int6, 32, 4096, 4096, dt)
     }
-    #[bench(name = "ffai/block_scaled_qmm/mxint2", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint2_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_mxint2_qmm::kernel_ir_for(dt), QFormat::Mxint2, 32, 4096, 4096, dt)
     }
-    #[bench(name = "ffai/block_scaled_qmm/mxint3", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint3_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_mxint3_qmm::kernel_ir_for(dt), QFormat::Mxint3, 32, 4096, 4096, dt)
     }
-    #[bench(name = "ffai/block_scaled_qmm/mxint4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint4_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_mxint4_qmm::kernel_ir_for(dt), QFormat::Mxint4, 32, 4096, 4096, dt)
     }
-    #[bench(name = "ffai/block_scaled_qmm/mxint5", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint5_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_mxint5_qmm::kernel_ir_for(dt), QFormat::Mxint5, 32, 4096, 4096, dt)
     }
-    #[bench(name = "ffai/block_scaled_qmm/mxint6", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint6_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_mxint6_qmm::kernel_ir_for(dt), QFormat::Mxint6, 32, 4096, 4096, dt)
     }
-    #[bench(name = "ffai/block_scaled_qmm/mxint8", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint8_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_mxint8_qmm::kernel_ir_for(dt), QFormat::Mxint8, 32, 4096, 4096, dt)
     }
     // FP16-scale twins. `fp8_e4m3_f16` reuses the `nvfp8_f16` kernel.
-    #[bench(name = "ffai/block_scaled_qmm/nvfp8_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_nvfp8_f16_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_nvfp8_f16_qmm::kernel_ir_for(dt), QFormat::Nvfp8F16, 32, 4096, 4096, dt)
     }
-    #[bench(name = "ffai/block_scaled_qmm/fp8_e4m3_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp8_e4m3_f16_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_nvfp8_f16_qmm::kernel_ir_for(dt), QFormat::Fp8E4m3F16, 32, 4096, 4096, dt)
     }
-    #[bench(name = "ffai/block_scaled_qmm/fp4_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp4_f16_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_fp4_f16_qmm::kernel_ir_for(dt), QFormat::Fp4F16, 32, 4096, 4096, dt)
     }
-    #[bench(name = "ffai/block_scaled_qmm/fp8_e5m2_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp8_e5m2_f16_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_fp8_e5m2_f16_qmm::kernel_ir_for(dt), QFormat::Fp8E5m2F16, 32, 4096, 4096, dt)
     }
-    #[bench(name = "ffai/block_scaled_qmm/int2_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int2_f16_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_int2_f16_qmm::kernel_ir_for(dt), QFormat::Int2F16, 32, 4096, 4096, dt)
     }
-    #[bench(name = "ffai/block_scaled_qmm/int3_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int3_f16_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_int3_f16_qmm::kernel_ir_for(dt), QFormat::Int3F16, 32, 4096, 4096, dt)
     }
-    #[bench(name = "ffai/block_scaled_qmm/int4_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int4_f16_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_int4_f16_qmm::kernel_ir_for(dt), QFormat::Int4F16, 32, 4096, 4096, dt)
     }
-    #[bench(name = "ffai/block_scaled_qmm/int5_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int5_f16_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_int5_f16_qmm::kernel_ir_for(dt), QFormat::Int5F16, 32, 4096, 4096, dt)
     }
-    #[bench(name = "ffai/block_scaled_qmm/int6_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int6_f16_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_int6_f16_qmm::kernel_ir_for(dt), QFormat::Int6F16, 32, 4096, 4096, dt)
     }
-    #[bench(name = "ffai/block_scaled_qmm/int8_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int8_f16_qmm(dt: DType) -> BenchSetup {
         qmm_bench(mt_int8_f16_qmm::kernel_ir_for(dt), QFormat::Int8F16, 32, 4096, 4096, dt)
     }

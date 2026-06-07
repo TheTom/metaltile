@@ -32,65 +32,65 @@
 use metaltile::kernel;
 
 #[rustfmt::skip]
-macro_rules! aura_value_kernel {
-    ($name:ident, $bits:literal, $subop:literal) => {
-        #[kernel]
-        pub fn $name<T>(
-            weights: Tensor<T>,
-            packed: Tensor<u32>,
-            norms: Tensor<T>,
-            codebook: Tensor<T>,
-            mut output: Tensor<T>,
-            #[constexpr] dim: u32,
-            #[constexpr] packed_width: u32,
-            #[constexpr] tokens: u32,
-            #[constexpr] repeat_count: u32,
-            #[constexpr] sparse_threshold: f32,
-        ) {
-            let d = program_id::<0>();
-            let head_idx = program_id::<1>();
-            let kv_head = head_idx / repeat_count;
-            let mask = (1u32 << $bits) - 1u32;
+/// AURA quantized value-aggregation kernel — variable bit-widths (2, 3, 4, 6, 8).
+///
+/// Produces kernels: `aura_value_int2`, `aura_value_int3`, `aura_value_int4`,
+/// `aura_value_int6`, `aura_value_int8`.
+///
+/// For each (dim, head) thread: unpacks the `BITS`-wide code at position `d`
+/// from the LSB-first bit-stream, fetches the codebook centroid, and accumulates
+/// `w * norm * centroid` over all tokens above `sparse_threshold`.
+///
+/// Grid: Grid3D, `[dim, n_heads, 1]`.
+#[kernel(variants(BITS = [2, 3, 4, 6, 8], suffix = "int{BITS}"))]
+pub fn aura_value<T>(
+    weights: Tensor<T>,
+    packed: Tensor<u32>,
+    norms: Tensor<T>,
+    codebook: Tensor<T>,
+    mut output: Tensor<T>,
+    #[constexpr] dim: u32,
+    #[constexpr] packed_width: u32,
+    #[constexpr] tokens: u32,
+    #[constexpr] repeat_count: u32,
+    #[constexpr] sparse_threshold: f32,
+) {
+    let d = program_id::<0>();
+    let head_idx = program_id::<1>();
+    let kv_head = head_idx / repeat_count;
+    let mask = (1u32 << BITS) - 1u32;
 
-            // Pre-compute the bit-stream coordinates for this thread's
-            // dim slot.  Same for every token — only the base packed
-            // pointer changes per t.
-            let bit_offset = d * $bits;
-            let word_idx = bit_offset / 32u32;
-            let shift = bit_offset & 31u32;
-            let bits_in_w0 = 32u32 - shift;
-            let lo_bits = select(bits_in_w0 >= $bits, $bits, bits_in_w0);
-            let spill = $bits - lo_bits;
+    // Pre-compute the bit-stream coordinates for this thread's
+    // dim slot.  Same for every token — only the base packed
+    // pointer changes per t.
+    let bit_offset = d * BITS;
+    let word_idx = bit_offset / 32u32;
+    let shift = bit_offset & 31u32;
+    let bits_in_w0 = 32u32 - shift;
+    let lo_bits = select(bits_in_w0 >= BITS, BITS, bits_in_w0);
+    let spill = BITS - lo_bits;
 
-            let mut acc = 0.0f32;
-            for t in range(0u32, tokens, 1u32) {
-                let w = load(weights[head_idx * tokens + t]).cast::<f32>();
-                if w >= sparse_threshold {
-                    let norm_val = load(norms[kv_head * tokens + t]).cast::<f32>();
-                    let packed_row = (kv_head * tokens + t) * packed_width;
+    let mut acc = 0.0f32;
+    for t in range(0u32, tokens, 1u32) {
+        let w = load(weights[head_idx * tokens + t]).cast::<f32>();
+        if w >= sparse_threshold {
+            let norm_val = load(norms[kv_head * tokens + t]).cast::<f32>();
+            let packed_row = (kv_head * tokens + t) * packed_width;
 
-                    let w0 = load(packed[packed_row + word_idx]);
-                    let w1_idx = select(spill > 0u32, word_idx + 1u32, word_idx);
-                    let w1 = load(packed[packed_row + w1_idx]);
-                    let lo = (w0 >> shift) & ((1u32 << lo_bits) - 1u32);
-                    let hi = (w1 & ((1u32 << spill) - 1u32)) << lo_bits;
-                    let value = (lo | hi) & mask;
+            let w0 = load(packed[packed_row + word_idx]);
+            let w1_idx = select(spill > 0u32, word_idx + 1u32, word_idx);
+            let w1 = load(packed[packed_row + w1_idx]);
+            let lo = (w0 >> shift) & ((1u32 << lo_bits) - 1u32);
+            let hi = (w1 & ((1u32 << spill) - 1u32)) << lo_bits;
+            let value = (lo | hi) & mask;
 
-                    let centroid = load(codebook[value]).cast::<f32>();
-                    acc = acc + w * norm_val * centroid;
-                }
-            }
-
-            store(output[head_idx * dim + d], acc.cast::<T>());
+            let centroid = load(codebook[value]).cast::<f32>();
+            acc = acc + w * norm_val * centroid;
         }
-    };
-}
+    }
 
-aura_value_kernel!(aura_value_int2, 2u32, "value_int2");
-aura_value_kernel!(aura_value_int3, 3u32, "value_int3");
-aura_value_kernel!(aura_value_int4, 4u32, "value_int4");
-aura_value_kernel!(aura_value_int6, 6u32, "value_int6");
-aura_value_kernel!(aura_value_int8, 8u32, "value_int8");
+    store(output[head_idx * dim + d], acc.cast::<T>());
+}
 
 pub mod kernel_tests {
     use metaltile::{test::*, test_kernel};
@@ -197,13 +197,7 @@ pub mod kernel_tests {
 pub mod kernel_benches {
     use metaltile::{bench, test::*};
 
-    use super::{
-        aura_value_int2,
-        aura_value_int3,
-        aura_value_int4,
-        aura_value_int6,
-        aura_value_int8,
-    };
+    use super::*;
 
     fn setup(
         s: BenchSetup,
@@ -233,28 +227,9 @@ pub mod kernel_benches {
             .grid_3d(dim as u32, q_heads as u32, 1, [1, 1, 1])
     }
 
-    #[bench(name = "ffai/aura_value_int2", dtypes = [f32, f16, bf16])]
-    fn bench_int2(dt: DType) -> BenchSetup {
-        setup(BenchSetup::new(aura_value_int2::kernel_ir_for(dt)), 128, 2, 32, 8, 4096, dt)
-    }
-
-    #[bench(name = "ffai/aura_value_int3", dtypes = [f32, f16, bf16])]
-    fn bench_int3(dt: DType) -> BenchSetup {
-        setup(BenchSetup::new(aura_value_int3::kernel_ir_for(dt)), 128, 3, 32, 8, 4096, dt)
-    }
-
-    #[bench(name = "ffai/aura_value_int4", dtypes = [f32, f16, bf16])]
-    fn bench_int4(dt: DType) -> BenchSetup {
-        setup(BenchSetup::new(aura_value_int4::kernel_ir_for(dt)), 128, 4, 32, 8, 4096, dt)
-    }
-
-    #[bench(name = "ffai/aura_value_int6", dtypes = [f32, f16, bf16])]
-    fn bench_int6(dt: DType) -> BenchSetup {
-        setup(BenchSetup::new(aura_value_int6::kernel_ir_for(dt)), 128, 6, 32, 8, 4096, dt)
-    }
-
-    #[bench(name = "ffai/aura_value_int8", dtypes = [f32, f16, bf16])]
-    fn bench_int8(dt: DType) -> BenchSetup {
-        setup(BenchSetup::new(aura_value_int8::kernel_ir_for(dt)), 128, 8, 32, 8, 4096, dt)
+    #[bench(dtypes = [f32, f16, bf16],
+            variants(BITS = [2, 3, 4, 6, 8], suffix = "int{BITS}"))]
+    fn bench_aura_value(dt: DType) -> BenchSetup {
+        setup(BenchSetup::new(aura_value_intBITS::kernel_ir_for(dt)), 128, BITS, 32, 8, 4096, dt)
     }
 }

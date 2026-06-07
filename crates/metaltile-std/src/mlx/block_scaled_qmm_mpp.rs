@@ -85,7 +85,7 @@ pub fn mt_mxfp4_qmm_mma_mpp<T>(
         let scale = exp2(load(scales[sb_base + k_off / block_size]).cast::<f32>() - 127.0f32);
         for _ni in range(0u32, 8u32, 1u32) {
             let nib = (packed >> (_ni * 4u32)) & 15u32;
-            threadgroup_store("Ws", x_ws_base + _ni, e2m1_decode(nib) * scale);
+            threadgroup_store("Ws", x_ws_base + _ni, mt_decode_e2m1(nib) * scale);
         }
         threadgroup_barrier();
         coop_tile_load_a("gemm", "Xs", true, coop_stage(T), 36u32, 16u32, xs_sg_off);
@@ -164,10 +164,11 @@ pub fn mt_nvfp4_qmm_mma_mpp<T>(
         }
         let packed = load(w[w_pack_row_base + kb / 8u32 + x_k_quad]);
         let k_off = kb + x_k_quad * 8u32;
-        let scale = e4m3_decode(load(scales[sb_base + k_off / block_size]).cast::<u32>()) * global;
+        let scale =
+            mt_decode_e4m3(load(scales[sb_base + k_off / block_size]).cast::<u32>()) * global;
         for _ni in range(0u32, 8u32, 1u32) {
             let nib = (packed >> (_ni * 4u32)) & 15u32;
-            threadgroup_store("Ws", x_ws_base + _ni, e2m1_decode(nib) * scale);
+            threadgroup_store("Ws", x_ws_base + _ni, mt_decode_e2m1(nib) * scale);
         }
         threadgroup_barrier();
         coop_tile_load_a("gemm", "Xs", true, coop_stage(T), 36u32, 16u32, xs_sg_off);
@@ -248,7 +249,7 @@ pub fn mt_fp4_qmm_mma_mpp<T>(
         let scale = load(scales[sb_base + k_off / block_size]);
         for _ni in range(0u32, 8u32, 1u32) {
             let nib = (packed >> (_ni * 4u32)) & 15u32;
-            threadgroup_store("Ws", x_ws_base + _ni, e2m1_decode(nib) * scale);
+            threadgroup_store("Ws", x_ws_base + _ni, mt_decode_e2m1(nib) * scale);
         }
         threadgroup_barrier();
         coop_tile_load_a("gemm", "Xs", true, coop_stage(T), 36u32, 16u32, xs_sg_off);
@@ -328,7 +329,7 @@ pub fn mt_mxfp8_e4m3_qmm_mma_mpp<T>(
         let k_off = kb + x_k_base;
         let scale = exp2(load(scales[sb_base + k_off / block_size]).cast::<f32>() - 127.0f32);
         for _i in range(0u32, 8u32, 1u32) {
-            let elem = e4m3_decode(load(w[w_row_base + k_off + _i]).cast::<u32>());
+            let elem = mt_decode_e4m3(load(w[w_row_base + k_off + _i]).cast::<u32>());
             threadgroup_store("Ws", x_ws_base + _i, elem * scale);
         }
         threadgroup_barrier();
@@ -407,7 +408,7 @@ pub fn mt_mxfp8_e5m2_qmm_mma_mpp<T>(
         let k_off = kb + x_k_base;
         let scale = exp2(load(scales[sb_base + k_off / block_size]).cast::<f32>() - 127.0f32);
         for _i in range(0u32, 8u32, 1u32) {
-            let elem = e5m2_decode(load(w[w_row_base + k_off + _i]).cast::<u32>());
+            let elem = mt_decode_e5m2(load(w[w_row_base + k_off + _i]).cast::<u32>());
             threadgroup_store("Ws", x_ws_base + _i, elem * scale);
         }
         threadgroup_barrier();
@@ -486,7 +487,7 @@ pub fn mt_fp8_e5m2_qmm_mma_mpp<T>(
         let k_off = kb + x_k_base;
         let scale = load(scales[sb_base + k_off / block_size]);
         for _i in range(0u32, 8u32, 1u32) {
-            let elem = e5m2_decode(load(w[w_row_base + k_off + _i]).cast::<u32>());
+            let elem = mt_decode_e5m2(load(w[w_row_base + k_off + _i]).cast::<u32>());
             threadgroup_store("Ws", x_ws_base + _i, elem * scale);
         }
         threadgroup_barrier();
@@ -566,7 +567,7 @@ pub fn mt_nvfp8_qmm_mma_mpp<T>(
         let k_off = kb + x_k_base;
         let scale = load(scales[sb_base + k_off / block_size]);
         for _i in range(0u32, 8u32, 1u32) {
-            let elem = e4m3_decode(load(w[w_row_base + k_off + _i]).cast::<u32>());
+            let elem = mt_decode_e4m3(load(w[w_row_base + k_off + _i]).cast::<u32>());
             threadgroup_store("Ws", x_ws_base + _i, elem * scale);
         }
         threadgroup_barrier();
@@ -645,7 +646,7 @@ pub fn mt_int8_qmm_mma_mpp<T>(
         let k_off = kb + x_k_base;
         let scale = load(scales[sb_base + k_off / block_size]);
         for _i in range(0u32, 8u32, 1u32) {
-            let elem = int8_decode(load(w[w_row_base + k_off + _i]).cast::<u32>());
+            let elem = mt_decode_int8(load(w[w_row_base + k_off + _i]).cast::<u32>());
             threadgroup_store("Ws", x_ws_base + _i, elem * scale);
         }
         threadgroup_barrier();
@@ -895,7 +896,7 @@ int_qmm_mma_mpp_e8m0!(mt_mxint6_qmm_mma_mpp, 6u32, 32u32, 64.0f32);
 
 /// MXINT8 MPP matmul — 8-bit symmetric codes (byte layout, block 32), E8M0
 /// pow-2 block scale `2^(bits-127)`. Byte-strided staging like the 8-bit float
-/// formats (one byte per code); decode is `int8_decode → val · scale`. Geometry
+/// formats (one byte per code); decode is `mt_decode_int8 → val · scale`. Geometry
 /// and coop-tensor extents are byte-identical to the int8 / mxfp8 kernels.
 #[kernel]
 pub fn mt_mxint8_qmm_mma_mpp<T>(
@@ -953,7 +954,7 @@ pub fn mt_mxint8_qmm_mma_mpp<T>(
         let k_off = kb + x_k_base;
         let scale = exp2(load(scales[sb_base + k_off / block_size]).cast::<f32>() - 127.0f32);
         for _i in range(0u32, 8u32, 1u32) {
-            let elem = int8_decode(load(w[w_row_base + k_off + _i]).cast::<u32>());
+            let elem = mt_decode_int8(load(w[w_row_base + k_off + _i]).cast::<u32>());
             threadgroup_store("Ws", x_ws_base + _i, elem * scale);
         }
         threadgroup_barrier();
@@ -1045,7 +1046,7 @@ pub fn mt_nvfp8_f16_qmm_mma_mpp<T>(
         let k_off = kb + x_k_base;
         let scale = load(scales[sb_base + k_off / block_size]).cast::<f32>();
         for _i in range(0u32, 8u32, 1u32) {
-            let elem = e4m3_decode(load(w[w_row_base + k_off + _i]).cast::<u32>());
+            let elem = mt_decode_e4m3(load(w[w_row_base + k_off + _i]).cast::<u32>());
             threadgroup_store("Ws", x_ws_base + _i, elem * scale);
         }
         threadgroup_barrier();
@@ -1128,7 +1129,7 @@ pub fn mt_fp4_f16_qmm_mma_mpp<T>(
         let scale = load(scales[sb_base + k_off / block_size]).cast::<f32>();
         for _ni in range(0u32, 8u32, 1u32) {
             let nib = (packed >> (_ni * 4u32)) & 15u32;
-            threadgroup_store("Ws", x_ws_base + _ni, e2m1_decode(nib) * scale);
+            threadgroup_store("Ws", x_ws_base + _ni, mt_decode_e2m1(nib) * scale);
         }
         threadgroup_barrier();
         coop_tile_load_a("gemm", "Xs", true, coop_stage(T), 36u32, 16u32, xs_sg_off);
@@ -1207,7 +1208,7 @@ pub fn mt_fp8_e5m2_f16_qmm_mma_mpp<T>(
         let k_off = kb + x_k_base;
         let scale = load(scales[sb_base + k_off / block_size]).cast::<f32>();
         for _i in range(0u32, 8u32, 1u32) {
-            let elem = e5m2_decode(load(w[w_row_base + k_off + _i]).cast::<u32>());
+            let elem = mt_decode_e5m2(load(w[w_row_base + k_off + _i]).cast::<u32>());
             threadgroup_store("Ws", x_ws_base + _i, elem * scale);
         }
         threadgroup_barrier();
@@ -1391,7 +1392,7 @@ pub fn mt_int8_f16_qmm_mma_mpp<T>(
         let k_off = kb + x_k_base;
         let scale = load(scales[sb_base + k_off / block_size]).cast::<f32>();
         for _i in range(0u32, 8u32, 1u32) {
-            let elem = int8_decode(load(w[w_row_base + k_off + _i]).cast::<u32>());
+            let elem = mt_decode_int8(load(w[w_row_base + k_off + _i]).cast::<u32>());
             threadgroup_store("Ws", x_ws_base + _i, elem * scale);
         }
         threadgroup_barrier();
@@ -1675,19 +1676,19 @@ pub mod kernel_benches {
             .with_shape_label(format!("{} m={m} n={n} k={k}", fmt.name()))
     }
 
-    #[bench(name = "mlx/block_scaled_qmm_mpp/mxfp4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxfp4(dt: DType) -> BenchSetup {
         mpp_bench(mt_mxfp4_qmm_mma_mpp::kernel_ir_for(dt), QFormat::Mxfp4, 128, 4096, 4096, dt)
     }
-    #[bench(name = "mlx/block_scaled_qmm_mpp/nvfp4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_nvfp4(dt: DType) -> BenchSetup {
         mpp_bench(mt_nvfp4_qmm_mma_mpp::kernel_ir_for(dt), QFormat::Nvfp4, 128, 4096, 4096, dt)
     }
-    #[bench(name = "mlx/block_scaled_qmm_mpp/fp4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp4(dt: DType) -> BenchSetup {
         mpp_bench(mt_fp4_qmm_mma_mpp::kernel_ir_for(dt), QFormat::Fp4, 128, 4096, 4096, dt)
     }
-    #[bench(name = "mlx/block_scaled_qmm_mpp/mxfp8_e4m3", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxfp8_e4m3(dt: DType) -> BenchSetup {
         mpp_bench(
             mt_mxfp8_e4m3_qmm_mma_mpp::kernel_ir_for(dt),
@@ -1698,7 +1699,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "mlx/block_scaled_qmm_mpp/mxfp8_e5m2", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxfp8_e5m2(dt: DType) -> BenchSetup {
         mpp_bench(
             mt_mxfp8_e5m2_qmm_mma_mpp::kernel_ir_for(dt),
@@ -1709,67 +1710,67 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "mlx/block_scaled_qmm_mpp/fp8_e5m2", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp8_e5m2(dt: DType) -> BenchSetup {
         mpp_bench(mt_fp8_e5m2_qmm_mma_mpp::kernel_ir_for(dt), QFormat::Fp8E5m2, 128, 4096, 4096, dt)
     }
-    #[bench(name = "mlx/block_scaled_qmm_mpp/nvfp8", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_nvfp8(dt: DType) -> BenchSetup {
         mpp_bench(mt_nvfp8_qmm_mma_mpp::kernel_ir_for(dt), QFormat::Nvfp8, 128, 4096, 4096, dt)
     }
-    #[bench(name = "mlx/block_scaled_qmm_mpp/int8", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int8(dt: DType) -> BenchSetup {
         mpp_bench(mt_int8_qmm_mma_mpp::kernel_ir_for(dt), QFormat::Int8, 128, 4096, 4096, dt)
     }
     // Symmetric sub-byte ints (FP32 group scale) + MXINT (E8M0 block scale) +
     // MXINT8 (8-bit, E8M0). k=4096 is a multiple of 32 → word-aligned per width.
-    #[bench(name = "mlx/block_scaled_qmm_mpp/int2", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int2(dt: DType) -> BenchSetup {
         mpp_bench(mt_int2_qmm_mma_mpp::kernel_ir_for(dt), QFormat::Int2, 128, 4096, 4096, dt)
     }
-    #[bench(name = "mlx/block_scaled_qmm_mpp/int3", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int3(dt: DType) -> BenchSetup {
         mpp_bench(mt_int3_qmm_mma_mpp::kernel_ir_for(dt), QFormat::Int3, 128, 4096, 4096, dt)
     }
-    #[bench(name = "mlx/block_scaled_qmm_mpp/int4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int4(dt: DType) -> BenchSetup {
         mpp_bench(mt_int4_qmm_mma_mpp::kernel_ir_for(dt), QFormat::Int4, 128, 4096, 4096, dt)
     }
-    #[bench(name = "mlx/block_scaled_qmm_mpp/int5", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int5(dt: DType) -> BenchSetup {
         mpp_bench(mt_int5_qmm_mma_mpp::kernel_ir_for(dt), QFormat::Int5, 128, 4096, 4096, dt)
     }
-    #[bench(name = "mlx/block_scaled_qmm_mpp/int6", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int6(dt: DType) -> BenchSetup {
         mpp_bench(mt_int6_qmm_mma_mpp::kernel_ir_for(dt), QFormat::Int6, 128, 4096, 4096, dt)
     }
-    #[bench(name = "mlx/block_scaled_qmm_mpp/mxint2", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint2(dt: DType) -> BenchSetup {
         mpp_bench(mt_mxint2_qmm_mma_mpp::kernel_ir_for(dt), QFormat::Mxint2, 128, 4096, 4096, dt)
     }
-    #[bench(name = "mlx/block_scaled_qmm_mpp/mxint3", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint3(dt: DType) -> BenchSetup {
         mpp_bench(mt_mxint3_qmm_mma_mpp::kernel_ir_for(dt), QFormat::Mxint3, 128, 4096, 4096, dt)
     }
-    #[bench(name = "mlx/block_scaled_qmm_mpp/mxint4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint4(dt: DType) -> BenchSetup {
         mpp_bench(mt_mxint4_qmm_mma_mpp::kernel_ir_for(dt), QFormat::Mxint4, 128, 4096, 4096, dt)
     }
-    #[bench(name = "mlx/block_scaled_qmm_mpp/mxint5", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint5(dt: DType) -> BenchSetup {
         mpp_bench(mt_mxint5_qmm_mma_mpp::kernel_ir_for(dt), QFormat::Mxint5, 128, 4096, 4096, dt)
     }
-    #[bench(name = "mlx/block_scaled_qmm_mpp/mxint6", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint6(dt: DType) -> BenchSetup {
         mpp_bench(mt_mxint6_qmm_mma_mpp::kernel_ir_for(dt), QFormat::Mxint6, 128, 4096, 4096, dt)
     }
-    #[bench(name = "mlx/block_scaled_qmm_mpp/mxint8", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint8(dt: DType) -> BenchSetup {
         mpp_bench(mt_mxint8_qmm_mma_mpp::kernel_ir_for(dt), QFormat::Mxint8, 128, 4096, 4096, dt)
     }
     // FP16-scale twins — same element packing as their FP32 twins, scale → f16.
     // fp8_e4m3_f16 reuses the nvfp8_f16 kernel (8-bit E4M3 + f16 scale).
-    #[bench(name = "mlx/block_scaled_qmm_mpp/nvfp8_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_nvfp8_f16(dt: DType) -> BenchSetup {
         mpp_bench(
             mt_nvfp8_f16_qmm_mma_mpp::kernel_ir_for(dt),
@@ -1780,7 +1781,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "mlx/block_scaled_qmm_mpp/fp8_e4m3_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp8_e4m3_f16(dt: DType) -> BenchSetup {
         mpp_bench(
             mt_nvfp8_f16_qmm_mma_mpp::kernel_ir_for(dt),
@@ -1791,11 +1792,11 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "mlx/block_scaled_qmm_mpp/fp4_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp4_f16(dt: DType) -> BenchSetup {
         mpp_bench(mt_fp4_f16_qmm_mma_mpp::kernel_ir_for(dt), QFormat::Fp4F16, 128, 4096, 4096, dt)
     }
-    #[bench(name = "mlx/block_scaled_qmm_mpp/fp8_e5m2_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp8_e5m2_f16(dt: DType) -> BenchSetup {
         mpp_bench(
             mt_fp8_e5m2_f16_qmm_mma_mpp::kernel_ir_for(dt),
@@ -1806,27 +1807,27 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "mlx/block_scaled_qmm_mpp/int2_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int2_f16(dt: DType) -> BenchSetup {
         mpp_bench(mt_int2_f16_qmm_mma_mpp::kernel_ir_for(dt), QFormat::Int2F16, 128, 4096, 4096, dt)
     }
-    #[bench(name = "mlx/block_scaled_qmm_mpp/int3_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int3_f16(dt: DType) -> BenchSetup {
         mpp_bench(mt_int3_f16_qmm_mma_mpp::kernel_ir_for(dt), QFormat::Int3F16, 128, 4096, 4096, dt)
     }
-    #[bench(name = "mlx/block_scaled_qmm_mpp/int4_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int4_f16(dt: DType) -> BenchSetup {
         mpp_bench(mt_int4_f16_qmm_mma_mpp::kernel_ir_for(dt), QFormat::Int4F16, 128, 4096, 4096, dt)
     }
-    #[bench(name = "mlx/block_scaled_qmm_mpp/int5_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int5_f16(dt: DType) -> BenchSetup {
         mpp_bench(mt_int5_f16_qmm_mma_mpp::kernel_ir_for(dt), QFormat::Int5F16, 128, 4096, 4096, dt)
     }
-    #[bench(name = "mlx/block_scaled_qmm_mpp/int6_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int6_f16(dt: DType) -> BenchSetup {
         mpp_bench(mt_int6_f16_qmm_mma_mpp::kernel_ir_for(dt), QFormat::Int6F16, 128, 4096, 4096, dt)
     }
-    #[bench(name = "mlx/block_scaled_qmm_mpp/int8_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int8_f16(dt: DType) -> BenchSetup {
         mpp_bench(mt_int8_f16_qmm_mma_mpp::kernel_ir_for(dt), QFormat::Int8F16, 128, 4096, 4096, dt)
     }

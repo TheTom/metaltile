@@ -139,7 +139,7 @@ pub fn mt_fp4_qmm_mma<T>(
         // unwritten (zeros / stale garbage) — while f16/bf16 happened to mask it.
         for _ci in range(0u32, 8u32, 1u32) {
             let nibble = (pack >> (_ci * 4u32)) & 15u32;
-            let val = s * e2m1_decode(nibble);
+            let val = s * mt_decode_e2m1(nibble);
             threadgroup_store("ws", ws_base + _ci, val.cast::<T>());
         }
         threadgroup_barrier();
@@ -667,18 +667,18 @@ pub mod kernel_benches {
             .constexpr("k", k as u32)
             .constexpr("n", n as u32)
             .constexpr("gs_per_row", gspr as u32)
-            .with_shape_label(format!("m{m} n{n} k{k} {}", crate::bench_types::dtype_label(dt)))
+            .with_shape_label(format!("m{m} n{n} k{k} {}", crate::utils::dtype_label(dt)))
             .grid_3d((n / 32) as u32, (m / 32) as u32, 1, [128, 1, 1])
             .bytes_moved(bytes as u64)
             // fp-qmm out[m,n] = x[m,k] · dequant(w)[k,n]: 2 MACs per (m, n, k).
             .flops(2 * (m as u64) * (n as u64) * (k as u64))
     }
 
-    #[bench(name = "mlx/fp_quantized/fp4_qmm_mma", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp4_qmm_mma(dt: DType) -> BenchSetup {
         fpb(mt_fp4_qmm_mma::kernel_ir_for(dt), 32, 4096, 4096, 4, dt)
     }
-    #[bench(name = "mlx/fp_quantized/fp8_e4m3_qmm_mma", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp8_e4m3_qmm_mma(dt: DType) -> BenchSetup {
         fpb(mt_fp8_e4m3_qmm_mma::kernel_ir_for(dt), 32, 4096, 4096, 8, dt)
     }

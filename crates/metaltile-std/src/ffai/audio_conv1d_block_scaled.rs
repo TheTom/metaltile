@@ -74,7 +74,7 @@ pub fn mt_mxfp4_audio_conv1d<T>(
             let col = col_ic + kx;
             let nib = (load(weight[w_row_pack + col / 8u32]) >> ((col % 8u32) * 4u32)) & 0xFu32;
             let scale = exp2(load(scales[w_row_blk + col / block_size]).cast::<f32>() - 127.0f32);
-            let wt = e2m1_decode(nib) * scale;
+            let wt = mt_decode_e2m1(nib) * scale;
             acc = acc + x_m * wt;
         }
     }
@@ -126,8 +126,8 @@ pub fn mt_nvfp4_audio_conv1d<T>(
             let col = col_ic + kx;
             let nib = (load(weight[w_row_pack + col / 8u32]) >> ((col % 8u32) * 4u32)) & 0xFu32;
             let scale =
-                e4m3_decode(load(scales[w_row_blk + col / block_size]).cast::<u32>()) * global;
-            let wt = e2m1_decode(nib) * scale;
+                mt_decode_e4m3(load(scales[w_row_blk + col / block_size]).cast::<u32>()) * global;
+            let wt = mt_decode_e2m1(nib) * scale;
             acc = acc + x_m * wt;
         }
     }
@@ -178,7 +178,7 @@ pub fn mt_fp4_audio_conv1d<T>(
             let col = col_ic + kx;
             let nib = (load(weight[w_row_pack + col / 8u32]) >> ((col % 8u32) * 4u32)) & 0xFu32;
             let scale = load(scales[w_row_blk + col / block_size]);
-            let wt = e2m1_decode(nib) * scale;
+            let wt = mt_decode_e2m1(nib) * scale;
             acc = acc + x_m * wt;
         }
     }
@@ -226,7 +226,7 @@ pub fn mt_mxfp8_e4m3_audio_conv1d<T>(
             let x = load(input[in_ic_base + ix]).cast::<f32>();
             let x_m = select(valid, x, 0.0f32);
             let col = col_ic + kx;
-            let elem = e4m3_decode(load(weight[w_row + col]).cast::<u32>());
+            let elem = mt_decode_e4m3(load(weight[w_row + col]).cast::<u32>());
             let scale = exp2(load(scales[w_row_blk + col / block_size]).cast::<f32>() - 127.0f32);
             let wt = elem * scale;
             acc = acc + x_m * wt;
@@ -276,7 +276,7 @@ pub fn mt_mxfp8_e5m2_audio_conv1d<T>(
             let x = load(input[in_ic_base + ix]).cast::<f32>();
             let x_m = select(valid, x, 0.0f32);
             let col = col_ic + kx;
-            let elem = e5m2_decode(load(weight[w_row + col]).cast::<u32>());
+            let elem = mt_decode_e5m2(load(weight[w_row + col]).cast::<u32>());
             let scale = exp2(load(scales[w_row_blk + col / block_size]).cast::<f32>() - 127.0f32);
             let wt = elem * scale;
             acc = acc + x_m * wt;
@@ -326,7 +326,7 @@ pub fn mt_fp8_e5m2_audio_conv1d<T>(
             let x = load(input[in_ic_base + ix]).cast::<f32>();
             let x_m = select(valid, x, 0.0f32);
             let col = col_ic + kx;
-            let elem = e5m2_decode(load(weight[w_row + col]).cast::<u32>());
+            let elem = mt_decode_e5m2(load(weight[w_row + col]).cast::<u32>());
             let scale = load(scales[w_row_blk + col / block_size]);
             let wt = elem * scale;
             acc = acc + x_m * wt;
@@ -377,7 +377,7 @@ pub fn mt_nvfp8_audio_conv1d<T>(
             let x = load(input[in_ic_base + ix]).cast::<f32>();
             let x_m = select(valid, x, 0.0f32);
             let col = col_ic + kx;
-            let elem = e4m3_decode(load(weight[w_row + col]).cast::<u32>());
+            let elem = mt_decode_e4m3(load(weight[w_row + col]).cast::<u32>());
             let scale = load(scales[w_row_blk + col / block_size]);
             let wt = elem * scale;
             acc = acc + x_m * wt;
@@ -427,7 +427,7 @@ pub fn mt_int8_audio_conv1d<T>(
             let x = load(input[in_ic_base + ix]).cast::<f32>();
             let x_m = select(valid, x, 0.0f32);
             let col = col_ic + kx;
-            let elem = int8_decode(load(weight[w_row + col]).cast::<u32>());
+            let elem = mt_decode_int8(load(weight[w_row + col]).cast::<u32>());
             let scale = load(scales[w_row_blk + col / block_size]);
             let wt = elem * scale;
             acc = acc + x_m * wt;
@@ -600,7 +600,7 @@ int_audio_conv1d_e8m0!(mt_mxint6_audio_conv1d, 6u32, 32u32, 64.0f32);
 
 /// MXINT8 quantized-weight conv1d — 8-bit symmetric codes (byte layout, block
 /// 32), E8M0 pow-2 block scale `2^(bits-127)`. Byte-addressed like the int8 /
-/// mxfp8 kernels (one code per byte), decode is `int8_decode → elem · scale`.
+/// mxfp8 kernels (one code per byte), decode is `mt_decode_int8 → elem · scale`.
 #[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn mt_mxint8_audio_conv1d<T>(
@@ -641,7 +641,7 @@ pub fn mt_mxint8_audio_conv1d<T>(
             let x = load(input[in_ic_base + ix]).cast::<f32>();
             let x_m = select(valid, x, 0.0f32);
             let col = col_ic + kx;
-            let elem = int8_decode(load(weight[w_row + col]).cast::<u32>());
+            let elem = mt_decode_int8(load(weight[w_row + col]).cast::<u32>());
             let scale = exp2(load(scales[w_row_blk + col / block_size]).cast::<f32>() - 127.0f32);
             let wt = elem * scale;
             acc = acc + x_m * wt;
@@ -702,7 +702,7 @@ pub fn mt_nvfp8_f16_audio_conv1d<T>(
             let x = load(input[in_ic_base + ix]).cast::<f32>();
             let x_m = select(valid, x, 0.0f32);
             let col = col_ic + kx;
-            let elem = e4m3_decode(load(weight[w_row + col]).cast::<u32>());
+            let elem = mt_decode_e4m3(load(weight[w_row + col]).cast::<u32>());
             let scale = load(scales[w_row_blk + col / block_size]).cast::<f32>();
             let wt = elem * scale;
             acc = acc + x_m * wt;
@@ -756,7 +756,7 @@ pub fn mt_fp4_f16_audio_conv1d<T>(
             let col = col_ic + kx;
             let nib = (load(weight[w_row_pack + col / 8u32]) >> ((col % 8u32) * 4u32)) & 0xFu32;
             let scale = load(scales[w_row_blk + col / block_size]).cast::<f32>();
-            let wt = e2m1_decode(nib) * scale;
+            let wt = mt_decode_e2m1(nib) * scale;
             acc = acc + x_m * wt;
         }
     }
@@ -805,7 +805,7 @@ pub fn mt_fp8_e5m2_f16_audio_conv1d<T>(
             let x = load(input[in_ic_base + ix]).cast::<f32>();
             let x_m = select(valid, x, 0.0f32);
             let col = col_ic + kx;
-            let elem = e5m2_decode(load(weight[w_row + col]).cast::<u32>());
+            let elem = mt_decode_e5m2(load(weight[w_row + col]).cast::<u32>());
             let scale = load(scales[w_row_blk + col / block_size]).cast::<f32>();
             let wt = elem * scale;
             acc = acc + x_m * wt;
@@ -891,7 +891,7 @@ int_audio_conv1d_f16!(mt_int6_f16_audio_conv1d, 6u32, 32u32, 64.0f32);
 
 /// int8 (FP16 scale) quantized-weight conv1d — 8-bit symmetric codes (byte
 /// layout, group 64), per-group FP16 scale. Byte-addressed like the int8 kernel;
-/// decode is `int8_decode → elem · scale`.
+/// decode is `mt_decode_int8 → elem · scale`.
 #[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn mt_int8_f16_audio_conv1d<T>(
@@ -932,7 +932,7 @@ pub fn mt_int8_f16_audio_conv1d<T>(
             let x = load(input[in_ic_base + ix]).cast::<f32>();
             let x_m = select(valid, x, 0.0f32);
             let col = col_ic + kx;
-            let elem = int8_decode(load(weight[w_row + col]).cast::<u32>());
+            let elem = mt_decode_int8(load(weight[w_row + col]).cast::<u32>());
             let scale = load(scales[w_row_blk + col / block_size]).cast::<f32>();
             let wt = elem * scale;
             acc = acc + x_m * wt;
@@ -1583,187 +1583,58 @@ pub mod kernel_benches {
     }
 
     macro_rules! conv1d_bench_fmt {
-        ($fn:ident, $kernel:path, $fmt:expr, $name:literal) => {
-            #[bench(name = $name, dtypes = [f32, f16, bf16])]
+        ($fn:ident, $kernel:path, $fmt:expr) => {
+            #[bench(dtypes = [f32, f16, bf16])]
             fn $fn(dt: DType) -> BenchSetup {
                 conv1d_bench($kernel(dt), $fmt, 1, 128, 1024, 128, 8, 2, 1, dt)
             }
         };
     }
-    conv1d_bench_fmt!(
-        bench_mxfp4,
-        mt_mxfp4_audio_conv1d::kernel_ir_for,
-        QFormat::Mxfp4,
-        "ffai/audio_conv1d_block/mxfp4"
-    );
-    conv1d_bench_fmt!(
-        bench_nvfp4,
-        mt_nvfp4_audio_conv1d::kernel_ir_for,
-        QFormat::Nvfp4,
-        "ffai/audio_conv1d_block/nvfp4"
-    );
-    conv1d_bench_fmt!(
-        bench_fp4,
-        mt_fp4_audio_conv1d::kernel_ir_for,
-        QFormat::Fp4,
-        "ffai/audio_conv1d_block/fp4"
-    );
+    conv1d_bench_fmt!(bench_mxfp4, mt_mxfp4_audio_conv1d::kernel_ir_for, QFormat::Mxfp4);
+    conv1d_bench_fmt!(bench_nvfp4, mt_nvfp4_audio_conv1d::kernel_ir_for, QFormat::Nvfp4);
+    conv1d_bench_fmt!(bench_fp4, mt_fp4_audio_conv1d::kernel_ir_for, QFormat::Fp4);
     conv1d_bench_fmt!(
         bench_mxfp8_e4m3,
         mt_mxfp8_e4m3_audio_conv1d::kernel_ir_for,
-        QFormat::Mxfp8E4,
-        "ffai/audio_conv1d_block/mxfp8_e4m3"
+        QFormat::Mxfp8E4
     );
     conv1d_bench_fmt!(
         bench_mxfp8_e5m2,
         mt_mxfp8_e5m2_audio_conv1d::kernel_ir_for,
-        QFormat::Mxfp8E5,
-        "ffai/audio_conv1d_block/mxfp8_e5m2"
+        QFormat::Mxfp8E5
     );
-    conv1d_bench_fmt!(
-        bench_fp8_e5m2,
-        mt_fp8_e5m2_audio_conv1d::kernel_ir_for,
-        QFormat::Fp8E5m2,
-        "ffai/audio_conv1d_block/fp8_e5m2"
-    );
-    conv1d_bench_fmt!(
-        bench_nvfp8,
-        mt_nvfp8_audio_conv1d::kernel_ir_for,
-        QFormat::Nvfp8,
-        "ffai/audio_conv1d_block/nvfp8"
-    );
-    conv1d_bench_fmt!(
-        bench_int8,
-        mt_int8_audio_conv1d::kernel_ir_for,
-        QFormat::Int8,
-        "ffai/audio_conv1d_block/int8"
-    );
+    conv1d_bench_fmt!(bench_fp8_e5m2, mt_fp8_e5m2_audio_conv1d::kernel_ir_for, QFormat::Fp8E5m2);
+    conv1d_bench_fmt!(bench_nvfp8, mt_nvfp8_audio_conv1d::kernel_ir_for, QFormat::Nvfp8);
+    conv1d_bench_fmt!(bench_int8, mt_int8_audio_conv1d::kernel_ir_for, QFormat::Int8);
     // Symmetric sub-byte ints (FP32 group scale) + MXINT (E8M0 block scale).
-    conv1d_bench_fmt!(
-        bench_int2,
-        mt_int2_audio_conv1d::kernel_ir_for,
-        QFormat::Int2,
-        "ffai/audio_conv1d_block/int2"
-    );
-    conv1d_bench_fmt!(
-        bench_int3,
-        mt_int3_audio_conv1d::kernel_ir_for,
-        QFormat::Int3,
-        "ffai/audio_conv1d_block/int3"
-    );
-    conv1d_bench_fmt!(
-        bench_int4,
-        mt_int4_audio_conv1d::kernel_ir_for,
-        QFormat::Int4,
-        "ffai/audio_conv1d_block/int4"
-    );
-    conv1d_bench_fmt!(
-        bench_int5,
-        mt_int5_audio_conv1d::kernel_ir_for,
-        QFormat::Int5,
-        "ffai/audio_conv1d_block/int5"
-    );
-    conv1d_bench_fmt!(
-        bench_int6,
-        mt_int6_audio_conv1d::kernel_ir_for,
-        QFormat::Int6,
-        "ffai/audio_conv1d_block/int6"
-    );
-    conv1d_bench_fmt!(
-        bench_mxint2,
-        mt_mxint2_audio_conv1d::kernel_ir_for,
-        QFormat::Mxint2,
-        "ffai/audio_conv1d_block/mxint2"
-    );
-    conv1d_bench_fmt!(
-        bench_mxint3,
-        mt_mxint3_audio_conv1d::kernel_ir_for,
-        QFormat::Mxint3,
-        "ffai/audio_conv1d_block/mxint3"
-    );
-    conv1d_bench_fmt!(
-        bench_mxint4,
-        mt_mxint4_audio_conv1d::kernel_ir_for,
-        QFormat::Mxint4,
-        "ffai/audio_conv1d_block/mxint4"
-    );
-    conv1d_bench_fmt!(
-        bench_mxint5,
-        mt_mxint5_audio_conv1d::kernel_ir_for,
-        QFormat::Mxint5,
-        "ffai/audio_conv1d_block/mxint5"
-    );
-    conv1d_bench_fmt!(
-        bench_mxint6,
-        mt_mxint6_audio_conv1d::kernel_ir_for,
-        QFormat::Mxint6,
-        "ffai/audio_conv1d_block/mxint6"
-    );
-    conv1d_bench_fmt!(
-        bench_mxint8,
-        mt_mxint8_audio_conv1d::kernel_ir_for,
-        QFormat::Mxint8,
-        "ffai/audio_conv1d_block/mxint8"
-    );
+    conv1d_bench_fmt!(bench_int2, mt_int2_audio_conv1d::kernel_ir_for, QFormat::Int2);
+    conv1d_bench_fmt!(bench_int3, mt_int3_audio_conv1d::kernel_ir_for, QFormat::Int3);
+    conv1d_bench_fmt!(bench_int4, mt_int4_audio_conv1d::kernel_ir_for, QFormat::Int4);
+    conv1d_bench_fmt!(bench_int5, mt_int5_audio_conv1d::kernel_ir_for, QFormat::Int5);
+    conv1d_bench_fmt!(bench_int6, mt_int6_audio_conv1d::kernel_ir_for, QFormat::Int6);
+    conv1d_bench_fmt!(bench_mxint2, mt_mxint2_audio_conv1d::kernel_ir_for, QFormat::Mxint2);
+    conv1d_bench_fmt!(bench_mxint3, mt_mxint3_audio_conv1d::kernel_ir_for, QFormat::Mxint3);
+    conv1d_bench_fmt!(bench_mxint4, mt_mxint4_audio_conv1d::kernel_ir_for, QFormat::Mxint4);
+    conv1d_bench_fmt!(bench_mxint5, mt_mxint5_audio_conv1d::kernel_ir_for, QFormat::Mxint5);
+    conv1d_bench_fmt!(bench_mxint6, mt_mxint6_audio_conv1d::kernel_ir_for, QFormat::Mxint6);
+    conv1d_bench_fmt!(bench_mxint8, mt_mxint8_audio_conv1d::kernel_ir_for, QFormat::Mxint8);
     // FP16-scale twins (f16 group/block scale). `fp8_e4m3_f16` reuses nvfp8_f16.
-    conv1d_bench_fmt!(
-        bench_nvfp8_f16,
-        mt_nvfp8_f16_audio_conv1d::kernel_ir_for,
-        QFormat::Nvfp8F16,
-        "ffai/audio_conv1d_block/nvfp8_f16"
-    );
+    conv1d_bench_fmt!(bench_nvfp8_f16, mt_nvfp8_f16_audio_conv1d::kernel_ir_for, QFormat::Nvfp8F16);
     conv1d_bench_fmt!(
         bench_fp8_e4m3_f16,
         mt_nvfp8_f16_audio_conv1d::kernel_ir_for,
-        QFormat::Fp8E4m3F16,
-        "ffai/audio_conv1d_block/fp8_e4m3_f16"
+        QFormat::Fp8E4m3F16
     );
-    conv1d_bench_fmt!(
-        bench_fp4_f16,
-        mt_fp4_f16_audio_conv1d::kernel_ir_for,
-        QFormat::Fp4F16,
-        "ffai/audio_conv1d_block/fp4_f16"
-    );
+    conv1d_bench_fmt!(bench_fp4_f16, mt_fp4_f16_audio_conv1d::kernel_ir_for, QFormat::Fp4F16);
     conv1d_bench_fmt!(
         bench_fp8_e5m2_f16,
         mt_fp8_e5m2_f16_audio_conv1d::kernel_ir_for,
-        QFormat::Fp8E5m2F16,
-        "ffai/audio_conv1d_block/fp8_e5m2_f16"
+        QFormat::Fp8E5m2F16
     );
-    conv1d_bench_fmt!(
-        bench_int2_f16,
-        mt_int2_f16_audio_conv1d::kernel_ir_for,
-        QFormat::Int2F16,
-        "ffai/audio_conv1d_block/int2_f16"
-    );
-    conv1d_bench_fmt!(
-        bench_int3_f16,
-        mt_int3_f16_audio_conv1d::kernel_ir_for,
-        QFormat::Int3F16,
-        "ffai/audio_conv1d_block/int3_f16"
-    );
-    conv1d_bench_fmt!(
-        bench_int4_f16,
-        mt_int4_f16_audio_conv1d::kernel_ir_for,
-        QFormat::Int4F16,
-        "ffai/audio_conv1d_block/int4_f16"
-    );
-    conv1d_bench_fmt!(
-        bench_int5_f16,
-        mt_int5_f16_audio_conv1d::kernel_ir_for,
-        QFormat::Int5F16,
-        "ffai/audio_conv1d_block/int5_f16"
-    );
-    conv1d_bench_fmt!(
-        bench_int6_f16,
-        mt_int6_f16_audio_conv1d::kernel_ir_for,
-        QFormat::Int6F16,
-        "ffai/audio_conv1d_block/int6_f16"
-    );
-    conv1d_bench_fmt!(
-        bench_int8_f16,
-        mt_int8_f16_audio_conv1d::kernel_ir_for,
-        QFormat::Int8F16,
-        "ffai/audio_conv1d_block/int8_f16"
-    );
+    conv1d_bench_fmt!(bench_int2_f16, mt_int2_f16_audio_conv1d::kernel_ir_for, QFormat::Int2F16);
+    conv1d_bench_fmt!(bench_int3_f16, mt_int3_f16_audio_conv1d::kernel_ir_for, QFormat::Int3F16);
+    conv1d_bench_fmt!(bench_int4_f16, mt_int4_f16_audio_conv1d::kernel_ir_for, QFormat::Int4F16);
+    conv1d_bench_fmt!(bench_int5_f16, mt_int5_f16_audio_conv1d::kernel_ir_for, QFormat::Int5F16);
+    conv1d_bench_fmt!(bench_int6_f16, mt_int6_f16_audio_conv1d::kernel_ir_for, QFormat::Int6F16);
+    conv1d_bench_fmt!(bench_int8_f16, mt_int8_f16_audio_conv1d::kernel_ir_for, QFormat::Int8F16);
 }

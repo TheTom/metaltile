@@ -163,8 +163,10 @@ pub fn mt_fp_qmm_nax<T>(
 
 #[cfg(test)]
 mod tests {
-    use metaltile_codegen::msl::MslGenerator;
-    use metaltile_core::{dtype::DType, ir::Op};
+    use metaltile::{
+        codegen::msl::MslGenerator,
+        core::{dtype::DType, ir::Op},
+    };
 
     use super::*;
 
@@ -254,7 +256,7 @@ pub mod kernel_benches {
     use super::mt_fp_qmm_nax;
     use crate::mlx::fp_quantized_mma::kernel_benches::fpb;
 
-    #[bench(name = "mlx/fp_quantized/fp_qmm_nax", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp_qmm_nax(dt: DType) -> BenchSetup {
         fpb(mt_fp_qmm_nax::kernel_ir_for(dt), 32, 4096, 4096, 4, dt)
     }

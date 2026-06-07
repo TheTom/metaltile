@@ -1294,11 +1294,12 @@ pub fn sdpa_decode_batched_q8<T>(
 
 #[cfg(test)]
 mod tests {
-    use metaltile_codegen::msl::MslGenerator;
-    use metaltile_core::ir::KernelMode;
+    use metaltile::{
+        codegen::msl::MslGenerator,
+        core::{DType, ir::KernelMode},
+    };
 
     use super::sdpa_decode_batched_q2;
-    use crate::bench_types::DType;
 
     fn msl_for(dt: DType) -> String {
         let mut k = sdpa_decode_batched_q2::kernel_ir_for(dt);
@@ -1619,12 +1620,12 @@ pub mod kernel_benches {
             .flops(4 * (n_q_heads as u64) * (n_kv as u64) * (head_dim as u64) * (batch_q as u64))
     }
 
-    #[bench(name = "ffai/sdpa_decode_batched_q2", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_q2(dt: DType) -> BenchSetup { setup(sdpa_decode_batched_q2::kernel_ir_for(dt), 2, dt) }
 
-    #[bench(name = "ffai/sdpa_decode_batched_q4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_q4(dt: DType) -> BenchSetup { setup(sdpa_decode_batched_q4::kernel_ir_for(dt), 4, dt) }
 
-    #[bench(name = "ffai/sdpa_decode_batched_q8", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_q8(dt: DType) -> BenchSetup { setup(sdpa_decode_batched_q8::kernel_ir_for(dt), 8, dt) }
 }

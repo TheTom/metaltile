@@ -116,7 +116,7 @@ pub mod kernel_benches {
     use metaltile::{bench, test::*};
 
     use super::mt_layer_norm;
-    use crate::bench_types::{InputDomain, dtype_tol, input_buffer, mlx_tname};
+    use crate::utils::{InputDomain, dtype_tol, input_buffer, mlx_tname};
 
     // MLX `layer_norm_looped*` buffer order: `x`[[buffer(0)]], `w`[[buffer(1)]],
     // `b`[[buffer(2)]], `out`[[buffer(3)]], `eps`(float)[[buffer(4)]],
@@ -130,7 +130,7 @@ pub mod kernel_benches {
     // tpg=1024 (= n/4 = MT tpg for n=4096; legacy RowNorm `mlx_tpg: 1024`).
     // `layer_norm_looped` zero-inits its threadgroup array explicitly, so the
     // larger tpg is safe here (unlike softmax/logsumexp).
-    #[bench(name = "mlx/layer_norm", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_layer_norm(dt: DType) -> BenchSetup {
         let (rows, n) = (4096usize, 4096usize);
         let tn = mlx_tname(dt);

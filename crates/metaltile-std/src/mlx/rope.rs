@@ -105,7 +105,7 @@ pub mod kernel_benches {
     use metaltile::{bench, test::*};
 
     use super::mt_rope;
-    use crate::bench_types::{InputDomain, dtype_tol, input_buffer, mlx_tname};
+    use crate::utils::{InputDomain, dtype_tol, input_buffer, mlx_tname};
 
     // Attaches the MLX `metal/rope.metal` `rope_<tn>` reference (the non-freqs,
     // 32-bit-index `rope<T, int32_t>` instantiation, `instantiate_rope_g`).
@@ -150,7 +150,7 @@ pub mod kernel_benches {
     // `inp` is seeded `Signed` (period-8 `[-3..3]`, nan-free) and shared by name
     // so MT and the reference rotate identical data; tol floor 0.01 is the
     // legacy rope tolerance (MT folds in f32, MLX uses `fast::cos/sin`).
-    #[bench(name = "mlx/rope", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_rope(dt: DType) -> BenchSetup {
         let (n_heads, seq_len, head_dim, theta_base) = (32u32, 512u32, 128u32, 10000.0f32);
         let grid_x = head_dim / 2; // 64

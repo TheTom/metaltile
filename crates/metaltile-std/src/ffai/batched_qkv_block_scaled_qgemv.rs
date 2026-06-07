@@ -59,7 +59,7 @@ pub fn mt_mxfp4_batched_qkv_qgemv<T>(
                     let packed = load(w_q[row_pack_off + pack_idx]);
                     let p_off = pack_idx * 8u32;
                     for i in range(0u32, 8u32, 1u32) {
-                        let val = e2m1_decode((packed >> (i * 4u32)) & 0xFu32);
+                        let val = mt_decode_e2m1((packed >> (i * 4u32)) & 0xFu32);
                         acc = acc + (val * scale) * load(x[p_off + i]).cast::<f32>();
                     }
                 }
@@ -76,7 +76,7 @@ pub fn mt_mxfp4_batched_qkv_qgemv<T>(
                     let packed = load(w_k[row_pack_off + pack_idx]);
                     let p_off = pack_idx * 8u32;
                     for i in range(0u32, 8u32, 1u32) {
-                        let val = e2m1_decode((packed >> (i * 4u32)) & 0xFu32);
+                        let val = mt_decode_e2m1((packed >> (i * 4u32)) & 0xFu32);
                         acc = acc + (val * scale) * load(x[p_off + i]).cast::<f32>();
                     }
                 }
@@ -93,7 +93,7 @@ pub fn mt_mxfp4_batched_qkv_qgemv<T>(
                     let packed = load(w_v[row_pack_off + pack_idx]);
                     let p_off = pack_idx * 8u32;
                     for i in range(0u32, 8u32, 1u32) {
-                        let val = e2m1_decode((packed >> (i * 4u32)) & 0xFu32);
+                        let val = mt_decode_e2m1((packed >> (i * 4u32)) & 0xFu32);
                         acc = acc + (val * scale) * load(x[p_off + i]).cast::<f32>();
                     }
                 }
@@ -154,11 +154,11 @@ pub fn mt_nvfp4_batched_qkv_qgemv<T>(
                 if pack_idx < n_packs {
                     let blk = pack_idx / packs_per_block;
                     let scale =
-                        e4m3_decode(load(scales_q[row_block_off + blk]).cast::<u32>()) * global;
+                        mt_decode_e4m3(load(scales_q[row_block_off + blk]).cast::<u32>()) * global;
                     let packed = load(w_q[row_pack_off + pack_idx]);
                     let p_off = pack_idx * 8u32;
                     for i in range(0u32, 8u32, 1u32) {
-                        let val = e2m1_decode((packed >> (i * 4u32)) & 0xFu32);
+                        let val = mt_decode_e2m1((packed >> (i * 4u32)) & 0xFu32);
                         acc = acc + (val * scale) * load(x[p_off + i]).cast::<f32>();
                     }
                 }
@@ -172,11 +172,11 @@ pub fn mt_nvfp4_batched_qkv_qgemv<T>(
                 if pack_idx < n_packs {
                     let blk = pack_idx / packs_per_block;
                     let scale =
-                        e4m3_decode(load(scales_k[row_block_off + blk]).cast::<u32>()) * global;
+                        mt_decode_e4m3(load(scales_k[row_block_off + blk]).cast::<u32>()) * global;
                     let packed = load(w_k[row_pack_off + pack_idx]);
                     let p_off = pack_idx * 8u32;
                     for i in range(0u32, 8u32, 1u32) {
-                        let val = e2m1_decode((packed >> (i * 4u32)) & 0xFu32);
+                        let val = mt_decode_e2m1((packed >> (i * 4u32)) & 0xFu32);
                         acc = acc + (val * scale) * load(x[p_off + i]).cast::<f32>();
                     }
                 }
@@ -190,11 +190,11 @@ pub fn mt_nvfp4_batched_qkv_qgemv<T>(
                 if pack_idx < n_packs {
                     let blk = pack_idx / packs_per_block;
                     let scale =
-                        e4m3_decode(load(scales_v[row_block_off + blk]).cast::<u32>()) * global;
+                        mt_decode_e4m3(load(scales_v[row_block_off + blk]).cast::<u32>()) * global;
                     let packed = load(w_v[row_pack_off + pack_idx]);
                     let p_off = pack_idx * 8u32;
                     for i in range(0u32, 8u32, 1u32) {
-                        let val = e2m1_decode((packed >> (i * 4u32)) & 0xFu32);
+                        let val = mt_decode_e2m1((packed >> (i * 4u32)) & 0xFu32);
                         acc = acc + (val * scale) * load(x[p_off + i]).cast::<f32>();
                     }
                 }
@@ -250,7 +250,7 @@ pub fn mt_mxfp8_e4m3_batched_qkv_qgemv<T>(
             for it in range(0u32, iters, 1u32) {
                 let c = it * lsize + tid;
                 if c < in_dim {
-                    let elem = e4m3_decode(load(w_q[row_off + c]).cast::<u32>());
+                    let elem = mt_decode_e4m3(load(w_q[row_off + c]).cast::<u32>());
                     let scale = exp2(
                         load(scales_q[row_block_off + c / block_size]).cast::<f32>() - 127.0f32,
                     );
@@ -264,7 +264,7 @@ pub fn mt_mxfp8_e4m3_batched_qkv_qgemv<T>(
             for it in range(0u32, iters, 1u32) {
                 let c = it * lsize + tid;
                 if c < in_dim {
-                    let elem = e4m3_decode(load(w_k[row_off + c]).cast::<u32>());
+                    let elem = mt_decode_e4m3(load(w_k[row_off + c]).cast::<u32>());
                     let scale = exp2(
                         load(scales_k[row_block_off + c / block_size]).cast::<f32>() - 127.0f32,
                     );
@@ -278,7 +278,7 @@ pub fn mt_mxfp8_e4m3_batched_qkv_qgemv<T>(
             for it in range(0u32, iters, 1u32) {
                 let c = it * lsize + tid;
                 if c < in_dim {
-                    let elem = e4m3_decode(load(w_v[row_off + c]).cast::<u32>());
+                    let elem = mt_decode_e4m3(load(w_v[row_off + c]).cast::<u32>());
                     let scale = exp2(
                         load(scales_v[row_block_off + c / block_size]).cast::<f32>() - 127.0f32,
                     );
@@ -336,7 +336,7 @@ pub fn mt_mxfp8_e5m2_batched_qkv_qgemv<T>(
             for it in range(0u32, iters, 1u32) {
                 let c = it * lsize + tid;
                 if c < in_dim {
-                    let elem = e5m2_decode(load(w_q[row_off + c]).cast::<u32>());
+                    let elem = mt_decode_e5m2(load(w_q[row_off + c]).cast::<u32>());
                     let scale = exp2(
                         load(scales_q[row_block_off + c / block_size]).cast::<f32>() - 127.0f32,
                     );
@@ -350,7 +350,7 @@ pub fn mt_mxfp8_e5m2_batched_qkv_qgemv<T>(
             for it in range(0u32, iters, 1u32) {
                 let c = it * lsize + tid;
                 if c < in_dim {
-                    let elem = e5m2_decode(load(w_k[row_off + c]).cast::<u32>());
+                    let elem = mt_decode_e5m2(load(w_k[row_off + c]).cast::<u32>());
                     let scale = exp2(
                         load(scales_k[row_block_off + c / block_size]).cast::<f32>() - 127.0f32,
                     );
@@ -364,7 +364,7 @@ pub fn mt_mxfp8_e5m2_batched_qkv_qgemv<T>(
             for it in range(0u32, iters, 1u32) {
                 let c = it * lsize + tid;
                 if c < in_dim {
-                    let elem = e5m2_decode(load(w_v[row_off + c]).cast::<u32>());
+                    let elem = mt_decode_e5m2(load(w_v[row_off + c]).cast::<u32>());
                     let scale = exp2(
                         load(scales_v[row_block_off + c / block_size]).cast::<f32>() - 127.0f32,
                     );
@@ -422,7 +422,7 @@ pub fn mt_nvfp8_batched_qkv_qgemv<T>(
             for it in range(0u32, iters, 1u32) {
                 let c = it * lsize + tid;
                 if c < in_dim {
-                    let elem = e4m3_decode(load(w_q[row_off + c]).cast::<u32>());
+                    let elem = mt_decode_e4m3(load(w_q[row_off + c]).cast::<u32>());
                     let scale = load(scales_q[row_block_off + c / block_size]);
                     acc = acc + (elem * scale) * load(x[c]).cast::<f32>();
                 }
@@ -434,7 +434,7 @@ pub fn mt_nvfp8_batched_qkv_qgemv<T>(
             for it in range(0u32, iters, 1u32) {
                 let c = it * lsize + tid;
                 if c < in_dim {
-                    let elem = e4m3_decode(load(w_k[row_off + c]).cast::<u32>());
+                    let elem = mt_decode_e4m3(load(w_k[row_off + c]).cast::<u32>());
                     let scale = load(scales_k[row_block_off + c / block_size]);
                     acc = acc + (elem * scale) * load(x[c]).cast::<f32>();
                 }
@@ -446,7 +446,7 @@ pub fn mt_nvfp8_batched_qkv_qgemv<T>(
             for it in range(0u32, iters, 1u32) {
                 let c = it * lsize + tid;
                 if c < in_dim {
-                    let elem = e4m3_decode(load(w_v[row_off + c]).cast::<u32>());
+                    let elem = mt_decode_e4m3(load(w_v[row_off + c]).cast::<u32>());
                     let scale = load(scales_v[row_block_off + c / block_size]);
                     acc = acc + (elem * scale) * load(x[c]).cast::<f32>();
                 }
@@ -515,7 +515,7 @@ pub fn mt_fp4_batched_qkv_qgemv<T>(
                     let packed = load(w_q[row_pack_off + pack_idx]);
                     let p_off = pack_idx * 8u32;
                     for i in range(0u32, 8u32, 1u32) {
-                        let val = e2m1_decode((packed >> (i * 4u32)) & 0xFu32);
+                        let val = mt_decode_e2m1((packed >> (i * 4u32)) & 0xFu32);
                         acc = acc + (val * scale) * load(x[p_off + i]).cast::<f32>();
                     }
                 }
@@ -532,7 +532,7 @@ pub fn mt_fp4_batched_qkv_qgemv<T>(
                     let packed = load(w_k[row_pack_off + pack_idx]);
                     let p_off = pack_idx * 8u32;
                     for i in range(0u32, 8u32, 1u32) {
-                        let val = e2m1_decode((packed >> (i * 4u32)) & 0xFu32);
+                        let val = mt_decode_e2m1((packed >> (i * 4u32)) & 0xFu32);
                         acc = acc + (val * scale) * load(x[p_off + i]).cast::<f32>();
                     }
                 }
@@ -549,7 +549,7 @@ pub fn mt_fp4_batched_qkv_qgemv<T>(
                     let packed = load(w_v[row_pack_off + pack_idx]);
                     let p_off = pack_idx * 8u32;
                     for i in range(0u32, 8u32, 1u32) {
-                        let val = e2m1_decode((packed >> (i * 4u32)) & 0xFu32);
+                        let val = mt_decode_e2m1((packed >> (i * 4u32)) & 0xFu32);
                         acc = acc + (val * scale) * load(x[p_off + i]).cast::<f32>();
                     }
                 }
@@ -605,7 +605,7 @@ pub fn mt_fp8_e5m2_batched_qkv_qgemv<T>(
             for it in range(0u32, iters, 1u32) {
                 let c = it * lsize + tid;
                 if c < in_dim {
-                    let elem = e5m2_decode(load(w_q[row_off + c]).cast::<u32>());
+                    let elem = mt_decode_e5m2(load(w_q[row_off + c]).cast::<u32>());
                     let scale = load(scales_q[row_block_off + c / block_size]);
                     acc = acc + (elem * scale) * load(x[c]).cast::<f32>();
                 }
@@ -617,7 +617,7 @@ pub fn mt_fp8_e5m2_batched_qkv_qgemv<T>(
             for it in range(0u32, iters, 1u32) {
                 let c = it * lsize + tid;
                 if c < in_dim {
-                    let elem = e5m2_decode(load(w_k[row_off + c]).cast::<u32>());
+                    let elem = mt_decode_e5m2(load(w_k[row_off + c]).cast::<u32>());
                     let scale = load(scales_k[row_block_off + c / block_size]);
                     acc = acc + (elem * scale) * load(x[c]).cast::<f32>();
                 }
@@ -629,7 +629,7 @@ pub fn mt_fp8_e5m2_batched_qkv_qgemv<T>(
             for it in range(0u32, iters, 1u32) {
                 let c = it * lsize + tid;
                 if c < in_dim {
-                    let elem = e5m2_decode(load(w_v[row_off + c]).cast::<u32>());
+                    let elem = mt_decode_e5m2(load(w_v[row_off + c]).cast::<u32>());
                     let scale = load(scales_v[row_block_off + c / block_size]);
                     acc = acc + (elem * scale) * load(x[c]).cast::<f32>();
                 }
@@ -686,7 +686,7 @@ pub fn mt_int8_batched_qkv_qgemv<T>(
             for it in range(0u32, iters, 1u32) {
                 let c = it * lsize + tid;
                 if c < in_dim {
-                    let elem = int8_decode(load(w_q[row_off + c]).cast::<u32>());
+                    let elem = mt_decode_int8(load(w_q[row_off + c]).cast::<u32>());
                     let scale = load(scales_q[row_block_off + c / block_size]);
                     acc = acc + (elem * scale) * load(x[c]).cast::<f32>();
                 }
@@ -698,7 +698,7 @@ pub fn mt_int8_batched_qkv_qgemv<T>(
             for it in range(0u32, iters, 1u32) {
                 let c = it * lsize + tid;
                 if c < in_dim {
-                    let elem = int8_decode(load(w_k[row_off + c]).cast::<u32>());
+                    let elem = mt_decode_int8(load(w_k[row_off + c]).cast::<u32>());
                     let scale = load(scales_k[row_block_off + c / block_size]);
                     acc = acc + (elem * scale) * load(x[c]).cast::<f32>();
                 }
@@ -710,7 +710,7 @@ pub fn mt_int8_batched_qkv_qgemv<T>(
             for it in range(0u32, iters, 1u32) {
                 let c = it * lsize + tid;
                 if c < in_dim {
-                    let elem = int8_decode(load(w_v[row_off + c]).cast::<u32>());
+                    let elem = mt_decode_int8(load(w_v[row_off + c]).cast::<u32>());
                     let scale = load(scales_v[row_block_off + c / block_size]);
                     acc = acc + (elem * scale) * load(x[c]).cast::<f32>();
                 }
@@ -1033,7 +1033,7 @@ int_batched_qkv_qgemv_e8m0!(mt_mxint6_batched_qkv_qgemv, 6u32, 32u32, 64.0f32);
 
 /// MXINT8 batched Q/K/V GEMV — 8-bit symmetric codes (byte layout, block 32),
 /// E8M0 pow-2 block scale `2^(bits-127)`. Element-strided like the 8-bit float
-/// formats (one byte per code), decode is `int8_decode → val · scale`. The
+/// formats (one byte per code), decode is `mt_decode_int8 → val · scale`. The
 /// three weight matrices are separate u8 buffers selected by `program_id::<2>()`.
 #[kernel]
 pub fn mt_mxint8_batched_qkv_qgemv<T>(
@@ -1063,7 +1063,7 @@ pub fn mt_mxint8_batched_qkv_qgemv<T>(
             for it in range(0u32, iters, 1u32) {
                 let c = it * lsize + tid;
                 if c < in_dim {
-                    let elem = int8_decode(load(w_q[row_off + c]).cast::<u32>());
+                    let elem = mt_decode_int8(load(w_q[row_off + c]).cast::<u32>());
                     let scale = exp2(
                         load(scales_q[row_block_off + c / block_size]).cast::<f32>() - 127.0f32,
                     );
@@ -1077,7 +1077,7 @@ pub fn mt_mxint8_batched_qkv_qgemv<T>(
             for it in range(0u32, iters, 1u32) {
                 let c = it * lsize + tid;
                 if c < in_dim {
-                    let elem = int8_decode(load(w_k[row_off + c]).cast::<u32>());
+                    let elem = mt_decode_int8(load(w_k[row_off + c]).cast::<u32>());
                     let scale = exp2(
                         load(scales_k[row_block_off + c / block_size]).cast::<f32>() - 127.0f32,
                     );
@@ -1091,7 +1091,7 @@ pub fn mt_mxint8_batched_qkv_qgemv<T>(
             for it in range(0u32, iters, 1u32) {
                 let c = it * lsize + tid;
                 if c < in_dim {
-                    let elem = int8_decode(load(w_v[row_off + c]).cast::<u32>());
+                    let elem = mt_decode_int8(load(w_v[row_off + c]).cast::<u32>());
                     let scale = exp2(
                         load(scales_v[row_block_off + c / block_size]).cast::<f32>() - 127.0f32,
                     );
@@ -1161,7 +1161,7 @@ pub fn mt_nvfp8_f16_batched_qkv_qgemv<T>(
             for it in range(0u32, iters, 1u32) {
                 let c = it * lsize + tid;
                 if c < in_dim {
-                    let elem = e4m3_decode(load(w_q[row_off + c]).cast::<u32>());
+                    let elem = mt_decode_e4m3(load(w_q[row_off + c]).cast::<u32>());
                     let scale = load(scales_q[row_block_off + c / block_size]).cast::<f32>();
                     acc = acc + (elem * scale) * load(x[c]).cast::<f32>();
                 }
@@ -1173,7 +1173,7 @@ pub fn mt_nvfp8_f16_batched_qkv_qgemv<T>(
             for it in range(0u32, iters, 1u32) {
                 let c = it * lsize + tid;
                 if c < in_dim {
-                    let elem = e4m3_decode(load(w_k[row_off + c]).cast::<u32>());
+                    let elem = mt_decode_e4m3(load(w_k[row_off + c]).cast::<u32>());
                     let scale = load(scales_k[row_block_off + c / block_size]).cast::<f32>();
                     acc = acc + (elem * scale) * load(x[c]).cast::<f32>();
                 }
@@ -1185,7 +1185,7 @@ pub fn mt_nvfp8_f16_batched_qkv_qgemv<T>(
             for it in range(0u32, iters, 1u32) {
                 let c = it * lsize + tid;
                 if c < in_dim {
-                    let elem = e4m3_decode(load(w_v[row_off + c]).cast::<u32>());
+                    let elem = mt_decode_e4m3(load(w_v[row_off + c]).cast::<u32>());
                     let scale = load(scales_v[row_block_off + c / block_size]).cast::<f32>();
                     acc = acc + (elem * scale) * load(x[c]).cast::<f32>();
                 }
@@ -1250,7 +1250,7 @@ pub fn mt_fp4_f16_batched_qkv_qgemv<T>(
                     let packed = load(w_q[row_pack_off + pack_idx]);
                     let p_off = pack_idx * 8u32;
                     for i in range(0u32, 8u32, 1u32) {
-                        let val = e2m1_decode((packed >> (i * 4u32)) & 0xFu32);
+                        let val = mt_decode_e2m1((packed >> (i * 4u32)) & 0xFu32);
                         acc = acc + (val * scale) * load(x[p_off + i]).cast::<f32>();
                     }
                 }
@@ -1267,7 +1267,7 @@ pub fn mt_fp4_f16_batched_qkv_qgemv<T>(
                     let packed = load(w_k[row_pack_off + pack_idx]);
                     let p_off = pack_idx * 8u32;
                     for i in range(0u32, 8u32, 1u32) {
-                        let val = e2m1_decode((packed >> (i * 4u32)) & 0xFu32);
+                        let val = mt_decode_e2m1((packed >> (i * 4u32)) & 0xFu32);
                         acc = acc + (val * scale) * load(x[p_off + i]).cast::<f32>();
                     }
                 }
@@ -1284,7 +1284,7 @@ pub fn mt_fp4_f16_batched_qkv_qgemv<T>(
                     let packed = load(w_v[row_pack_off + pack_idx]);
                     let p_off = pack_idx * 8u32;
                     for i in range(0u32, 8u32, 1u32) {
-                        let val = e2m1_decode((packed >> (i * 4u32)) & 0xFu32);
+                        let val = mt_decode_e2m1((packed >> (i * 4u32)) & 0xFu32);
                         acc = acc + (val * scale) * load(x[p_off + i]).cast::<f32>();
                     }
                 }
@@ -1342,7 +1342,7 @@ pub fn mt_fp8_e5m2_f16_batched_qkv_qgemv<T>(
             for it in range(0u32, iters, 1u32) {
                 let c = it * lsize + tid;
                 if c < in_dim {
-                    let elem = e5m2_decode(load(w_q[row_off + c]).cast::<u32>());
+                    let elem = mt_decode_e5m2(load(w_q[row_off + c]).cast::<u32>());
                     let scale = load(scales_q[row_block_off + c / block_size]).cast::<f32>();
                     acc = acc + (elem * scale) * load(x[c]).cast::<f32>();
                 }
@@ -1354,7 +1354,7 @@ pub fn mt_fp8_e5m2_f16_batched_qkv_qgemv<T>(
             for it in range(0u32, iters, 1u32) {
                 let c = it * lsize + tid;
                 if c < in_dim {
-                    let elem = e5m2_decode(load(w_k[row_off + c]).cast::<u32>());
+                    let elem = mt_decode_e5m2(load(w_k[row_off + c]).cast::<u32>());
                     let scale = load(scales_k[row_block_off + c / block_size]).cast::<f32>();
                     acc = acc + (elem * scale) * load(x[c]).cast::<f32>();
                 }
@@ -1366,7 +1366,7 @@ pub fn mt_fp8_e5m2_f16_batched_qkv_qgemv<T>(
             for it in range(0u32, iters, 1u32) {
                 let c = it * lsize + tid;
                 if c < in_dim {
-                    let elem = e5m2_decode(load(w_v[row_off + c]).cast::<u32>());
+                    let elem = mt_decode_e5m2(load(w_v[row_off + c]).cast::<u32>());
                     let scale = load(scales_v[row_block_off + c / block_size]).cast::<f32>();
                     acc = acc + (elem * scale) * load(x[c]).cast::<f32>();
                 }
@@ -1562,7 +1562,7 @@ pub fn mt_int8_f16_batched_qkv_qgemv<T>(
             for it in range(0u32, iters, 1u32) {
                 let c = it * lsize + tid;
                 if c < in_dim {
-                    let elem = int8_decode(load(w_q[row_off + c]).cast::<u32>());
+                    let elem = mt_decode_int8(load(w_q[row_off + c]).cast::<u32>());
                     let scale = load(scales_q[row_block_off + c / block_size]).cast::<f32>();
                     acc = acc + (elem * scale) * load(x[c]).cast::<f32>();
                 }
@@ -1574,7 +1574,7 @@ pub fn mt_int8_f16_batched_qkv_qgemv<T>(
             for it in range(0u32, iters, 1u32) {
                 let c = it * lsize + tid;
                 if c < in_dim {
-                    let elem = int8_decode(load(w_k[row_off + c]).cast::<u32>());
+                    let elem = mt_decode_int8(load(w_k[row_off + c]).cast::<u32>());
                     let scale = load(scales_k[row_block_off + c / block_size]).cast::<f32>();
                     acc = acc + (elem * scale) * load(x[c]).cast::<f32>();
                 }
@@ -1586,7 +1586,7 @@ pub fn mt_int8_f16_batched_qkv_qgemv<T>(
             for it in range(0u32, iters, 1u32) {
                 let c = it * lsize + tid;
                 if c < in_dim {
-                    let elem = int8_decode(load(w_v[row_off + c]).cast::<u32>());
+                    let elem = mt_decode_int8(load(w_v[row_off + c]).cast::<u32>());
                     let scale = load(scales_v[row_block_off + c / block_size]).cast::<f32>();
                     acc = acc + (elem * scale) * load(x[c]).cast::<f32>();
                 }
@@ -2072,7 +2072,7 @@ pub mod kernel_benches {
             .with_shape_label(format!("{} q={out_q} k={out_k} v={out_v} in={in_dim}", fmt.name()))
     }
 
-    #[bench(name = "ffai/batched_qkv_block_qgemv/mxfp4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxfp4_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_mxfp4_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2084,7 +2084,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/batched_qkv_block_qgemv/nvfp4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_nvfp4_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_nvfp4_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2096,7 +2096,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/batched_qkv_block_qgemv/mxfp8_e4m3", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxfp8_e4m3_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_mxfp8_e4m3_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2108,7 +2108,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/batched_qkv_block_qgemv/mxfp8_e5m2", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxfp8_e5m2_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_mxfp8_e5m2_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2120,7 +2120,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/batched_qkv_block_qgemv/nvfp8", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_nvfp8_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_nvfp8_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2132,7 +2132,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/batched_qkv_block_qgemv/fp4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp4_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_fp4_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2144,7 +2144,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/batched_qkv_block_qgemv/fp8_e4m3", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp8_e4m3_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_nvfp8_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2156,7 +2156,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/batched_qkv_block_qgemv/fp8_e5m2", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp8_e5m2_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_fp8_e5m2_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2168,7 +2168,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/batched_qkv_block_qgemv/int8", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int8_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_int8_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2181,7 +2181,7 @@ pub mod kernel_benches {
         )
     }
     // Symmetric sub-byte ints (FP32 group scale) + MXINT (E8M0 block scale).
-    #[bench(name = "ffai/batched_qkv_block_qgemv/int2", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int2_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_int2_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2193,7 +2193,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/batched_qkv_block_qgemv/int3", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int3_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_int3_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2205,7 +2205,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/batched_qkv_block_qgemv/int4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int4_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_int4_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2217,7 +2217,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/batched_qkv_block_qgemv/int5", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int5_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_int5_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2229,7 +2229,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/batched_qkv_block_qgemv/int6", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int6_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_int6_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2241,7 +2241,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/batched_qkv_block_qgemv/mxint2", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint2_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_mxint2_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2253,7 +2253,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/batched_qkv_block_qgemv/mxint3", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint3_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_mxint3_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2265,7 +2265,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/batched_qkv_block_qgemv/mxint4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint4_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_mxint4_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2277,7 +2277,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/batched_qkv_block_qgemv/mxint5", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint5_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_mxint5_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2289,7 +2289,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/batched_qkv_block_qgemv/mxint6", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint6_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_mxint6_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2301,7 +2301,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/batched_qkv_block_qgemv/mxint8", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint8_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_mxint8_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2315,7 +2315,7 @@ pub mod kernel_benches {
     }
     // FP16-scale twins. fp8_e4m3_f16 reuses the nvfp8_f16 kernel (same 8-bit-E4M3
     // + f16-scale shape); the others mirror their FP32 twin's bench one-for-one.
-    #[bench(name = "ffai/batched_qkv_block_qgemv/nvfp8_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_nvfp8_f16_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_nvfp8_f16_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2327,7 +2327,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/batched_qkv_block_qgemv/fp8_e4m3_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp8_e4m3_f16_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_nvfp8_f16_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2339,7 +2339,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/batched_qkv_block_qgemv/fp4_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp4_f16_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_fp4_f16_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2351,7 +2351,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/batched_qkv_block_qgemv/fp8_e5m2_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp8_e5m2_f16_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_fp8_e5m2_f16_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2363,7 +2363,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/batched_qkv_block_qgemv/int2_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int2_f16_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_int2_f16_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2375,7 +2375,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/batched_qkv_block_qgemv/int3_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int3_f16_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_int3_f16_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2387,7 +2387,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/batched_qkv_block_qgemv/int4_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int4_f16_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_int4_f16_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2399,7 +2399,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/batched_qkv_block_qgemv/int5_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int5_f16_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_int5_f16_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2411,7 +2411,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/batched_qkv_block_qgemv/int6_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int6_f16_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_int6_f16_batched_qkv_qgemv::kernel_ir_for(dt),
@@ -2423,7 +2423,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/batched_qkv_block_qgemv/int8_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int8_f16_qkv(dt: DType) -> BenchSetup {
         qkv_bench(
             mt_int8_f16_batched_qkv_qgemv::kernel_ir_for(dt),

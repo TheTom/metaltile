@@ -121,7 +121,7 @@ pub mod kernel_benches {
     use super::ffai_gemm_q4_mpp;
 
     // q_proj-like shape: in=2688, out=4096, 256 tokens.
-    #[bench(name = "ffai/gemm/gemm_q4_mpp", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_gemm_q4_mpp(dt: DType) -> BenchSetup {
         let n_rows = 256usize;
         let out_dim = 4096usize;

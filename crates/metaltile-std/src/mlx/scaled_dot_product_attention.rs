@@ -151,7 +151,7 @@ pub mod kernel_benches {
 
     const HEAD_DIM: usize = 128;
 
-    #[bench(name = "mlx/sdpa/sdpa", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_sdpa(dt: DType) -> BenchSetup {
         let (n_heads, n_kv) = (32usize, 4096usize);
         let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
@@ -167,7 +167,7 @@ pub mod kernel_benches {
             .constexpr("scale", scale)
             .with_shape_label(format!(
                 "h{HEAD_DIM} kv{n_kv} nh{n_heads} {}",
-                crate::bench_types::dtype_label(dt)
+                crate::utils::dtype_label(dt)
             ))
             .grid_3d(n_heads as u32, 1, 1, [1024, 1, 1])
             .bytes_moved(bytes as u64)

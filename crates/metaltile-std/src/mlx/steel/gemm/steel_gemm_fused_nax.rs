@@ -164,7 +164,7 @@ pub mod kernel_benches {
     const TILE: u32 = 32;
     const TPG: u32 = 128;
 
-    #[bench(name = "mlx/steel_gemm/fused_nax", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fused_nax(dt: DType) -> BenchSetup {
         let (m, n, k) = (M as usize, N as usize, K as usize);
         let sz = dt.size_bytes();
@@ -176,7 +176,7 @@ pub mod kernel_benches {
             .buffer(BenchBuffer::zeros("out", m * n, dt).output())
             .constexpr("k", K)
             .constexpr("n", N)
-            .with_shape_label(format!("m{M} n{N} k{K} {}", crate::bench_types::dtype_label(dt)))
+            .with_shape_label(format!("m{M} n{N} k{K} {}", crate::utils::dtype_label(dt)))
             // Reduction grid is threadgroup counts: (n/32, m/32, 1).
             .grid_3d(N / TILE, M / TILE, 1, [TPG, 1, 1])
             .bytes_moved(bytes as u64)
@@ -253,8 +253,10 @@ pub mod kernel_tests {
 
 #[cfg(test)]
 mod tests {
-    use metaltile_codegen::msl::MslGenerator;
-    use metaltile_core::{dtype::DType, ir::Op};
+    use metaltile::{
+        codegen::msl::MslGenerator,
+        core::{dtype::DType, ir::Op},
+    };
 
     use super::*;
 

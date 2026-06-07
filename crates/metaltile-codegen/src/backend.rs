@@ -311,7 +311,6 @@ impl TargetProfile {
                 Sinh => "sinh", Cosh => "cosh",
                 Asinh => "asinh", Acosh => "acosh", Atanh => "atanh",
                 Erf => "erf", ErfInv => "erfinv",
-                DecodeE2m1 | DecodeE4m3 | DecodeE5m2 | DecodeInt8 => "/*decode-helper*/",
             },
             // CUDA *precise* device math (single-precision `f` suffix) — NOT
             // the `__`-prefixed fast-math intrinsics: the CPU oracle is IEEE,
@@ -338,7 +337,6 @@ impl TargetProfile {
                 Sinh => "sinhf", Cosh => "coshf",
                 Asinh => "asinhf", Acosh => "acoshf", Atanh => "atanhf",
                 Erf => "erff", ErfInv => "erfinvf",
-                DecodeE2m1 | DecodeE4m3 | DecodeE5m2 | DecodeInt8 => "/*decode-helper*/",
             },
             Target::Hip => match op {
                 Exp => "expf", Exp2 => "exp2f", Expm1 => "expm1f",
@@ -351,7 +349,6 @@ impl TargetProfile {
                 Sinh => "sinhf", Cosh => "coshf",
                 Asinh => "asinhf", Acosh => "acoshf", Atanh => "atanhf",
                 Erf => "erff", ErfInv => "erfinvf",
-                DecodeE2m1 | DecodeE4m3 | DecodeE5m2 | DecodeInt8 => "/*decode-helper*/",
             },
             // GLSL.std.450 names (the SPIR-V extended-instruction set used
             // by Vulkan compute). `shaderc` lowers these via the standard
@@ -370,7 +367,6 @@ impl TargetProfile {
                 Asinh => "asinh", Acosh => "acosh", Atanh => "atanh",
                 // Software approximations live in the GLSL preamble.
                 Erf => "mt_erf", ErfInv => "mt_erfinv",
-                DecodeE2m1 | DecodeE4m3 | DecodeE5m2 | DecodeInt8 => "/*decode-helper*/",
             },
         }
     }

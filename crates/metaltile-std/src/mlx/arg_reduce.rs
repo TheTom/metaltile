@@ -217,7 +217,7 @@ pub mod kernel_benches {
     use metaltile::{bench, core::ir::Kernel, test::*};
 
     use super::{mt_argmax, mt_argmin};
-    use crate::bench_types::{InputDomain, input_buffer, mlx_tname};
+    use crate::utils::{InputDomain, input_buffer, mlx_tname};
 
     const ARG_REDUCE_N: usize = 256 * 1024;
     // Strict `>`/`<` tie-break: indices must match exactly, so a sub-1 tolerance
@@ -273,8 +273,8 @@ pub mod kernel_benches {
             )
     }
 
-    #[bench(name = "mlx/arg_reduce/argmax", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_argmax(dt: DType) -> BenchSetup { ab(mt_argmax::kernel_ir_for(dt), dt, "argmax") }
-    #[bench(name = "mlx/arg_reduce/argmin", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_argmin(dt: DType) -> BenchSetup { ab(mt_argmin::kernel_ir_for(dt), dt, "argmin") }
 }

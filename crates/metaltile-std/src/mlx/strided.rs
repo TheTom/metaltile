@@ -207,7 +207,7 @@ pub mod kernel_benches {
     use metaltile::{bench, test::*};
 
     use super::{mt_strided_copy, mt_strided_copy_nd};
-    use crate::bench_types::{dtype_tol, mlx_tname};
+    use crate::utils::{dtype_tol, mlx_tname};
 
     fn u8u32(v: &[u32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
 
@@ -237,7 +237,7 @@ pub mod kernel_benches {
     /// `threads_per_grid = groups × tpg`, so dispatching `[dest_cols, rows, 1]`
     /// groups at a `[1,1,1]` tpg gives `grid_dim.x = dest_cols`. `src` is shared
     /// by name with the MT `#[strided]` source.
-    #[bench(name = "mlx/strided_copy/strided_copy", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_strided_copy(dt: DType) -> BenchSetup {
         let (rows, dest_cols, pad) = (1024usize, 4096usize, 128usize);
         let src_cols = dest_cols + pad;
@@ -255,7 +255,7 @@ pub mod kernel_benches {
             .constexpr("cols", dest_cols as u32)
             .with_shape_label(format!(
                 "{rows}×{dest_cols} pad{pad} {}",
-                crate::bench_types::dtype_label(dt)
+                crate::utils::dtype_label(dt)
             ))
             // Grid3D, unguarded: total threads = [rows, dest_cols] exactly.
             // 256-wide threadgroups along the contiguous (col) axis — dest_cols
@@ -292,7 +292,7 @@ pub mod kernel_benches {
     }
 
     /// N-D copy: a 1024×4096 logical transpose out of a 4096×1024 buffer.
-    #[bench(name = "mlx/strided_copy/strided_copy_nd", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_strided_copy_nd(dt: DType) -> BenchSetup {
         let (d0, d1) = (1024usize, 4096usize);
         let n_out = d0 * d1;
@@ -305,7 +305,7 @@ pub mod kernel_benches {
             .constexpr("rank", 2u32)
             .with_shape_label(format!(
                 "{d0}×{d1} transpose {}",
-                crate::bench_types::dtype_label(dt)
+                crate::utils::dtype_label(dt)
             ))
             // Grid3D, unguarded `out[p]` store: total threads must equal
             // n_out exactly. grid_1d sets groups = n_out/tpg; n_out is a

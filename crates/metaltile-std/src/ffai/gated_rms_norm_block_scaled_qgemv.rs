@@ -94,7 +94,7 @@ pub fn mt_mxfp4_gated_rms_norm_qgemv<T>(
             let p_off = pack_idx * 8u32;
             for i in range(0u32, 8u32, 1u32) {
                 let nib = (packed >> (i * 4u32)) & 0xFu32;
-                let val = e2m1_decode(nib);
+                let val = mt_decode_e2m1(nib);
                 let inner = threadgroup_load("tg_inner", p_off + i);
                 acc = acc + (val * scale) * inner;
             }
@@ -163,12 +163,12 @@ pub fn mt_nvfp4_gated_rms_norm_qgemv<T>(
         let pack_idx = p_iter * lsize + tid;
         if pack_idx < n_packs_per_row {
             let blk = pack_idx / packs_per_block;
-            let scale = e4m3_decode(load(scales[row_block_off + blk]).cast::<u32>()) * global;
+            let scale = mt_decode_e4m3(load(scales[row_block_off + blk]).cast::<u32>()) * global;
             let packed = load(weight[row_pack_off + pack_idx]);
             let p_off = pack_idx * 8u32;
             for i in range(0u32, 8u32, 1u32) {
                 let nib = (packed >> (i * 4u32)) & 0xFu32;
-                let val = e2m1_decode(nib);
+                let val = mt_decode_e2m1(nib);
                 let inner = threadgroup_load("tg_inner", p_off + i);
                 acc = acc + (val * scale) * inner;
             }
@@ -233,7 +233,7 @@ pub fn mt_mxfp8_e4m3_gated_rms_norm_qgemv<T>(
     for it in range(0u32, iters, 1u32) {
         let c = it * lsize + tid;
         if c < in_dim {
-            let elem = e4m3_decode(load(weight[row_off + c]).cast::<u32>());
+            let elem = mt_decode_e4m3(load(weight[row_off + c]).cast::<u32>());
             let sbits = load(scales[row_block_off + c / block_size]).cast::<f32>();
             let scale = exp2(sbits - 127.0f32);
             let inner = threadgroup_load("tg_inner", c);
@@ -299,7 +299,7 @@ pub fn mt_mxfp8_e5m2_gated_rms_norm_qgemv<T>(
     for it in range(0u32, iters, 1u32) {
         let c = it * lsize + tid;
         if c < in_dim {
-            let elem = e5m2_decode(load(weight[row_off + c]).cast::<u32>());
+            let elem = mt_decode_e5m2(load(weight[row_off + c]).cast::<u32>());
             let sbits = load(scales[row_block_off + c / block_size]).cast::<f32>();
             let scale = exp2(sbits - 127.0f32);
             let inner = threadgroup_load("tg_inner", c);
@@ -365,7 +365,7 @@ pub fn mt_nvfp8_gated_rms_norm_qgemv<T>(
     for it in range(0u32, iters, 1u32) {
         let c = it * lsize + tid;
         if c < in_dim {
-            let elem = e4m3_decode(load(weight[row_off + c]).cast::<u32>());
+            let elem = mt_decode_e4m3(load(weight[row_off + c]).cast::<u32>());
             let scale = load(scales[row_block_off + c / block_size]);
             let inner = threadgroup_load("tg_inner", c);
             acc = acc + (elem * scale) * inner;
@@ -445,7 +445,7 @@ pub fn mt_fp4_gated_rms_norm_qgemv<T>(
             let p_off = pack_idx * 8u32;
             for i in range(0u32, 8u32, 1u32) {
                 let nib = (packed >> (i * 4u32)) & 0xFu32;
-                let val = e2m1_decode(nib);
+                let val = mt_decode_e2m1(nib);
                 let inner = threadgroup_load("tg_inner", p_off + i);
                 acc = acc + (val * scale) * inner;
             }
@@ -511,7 +511,7 @@ pub fn mt_fp8_e5m2_gated_rms_norm_qgemv<T>(
     for it in range(0u32, iters, 1u32) {
         let c = it * lsize + tid;
         if c < in_dim {
-            let elem = e5m2_decode(load(weight[row_off + c]).cast::<u32>());
+            let elem = mt_decode_e5m2(load(weight[row_off + c]).cast::<u32>());
             let scale = load(scales[row_block_off + c / block_size]);
             let inner = threadgroup_load("tg_inner", c);
             acc = acc + (elem * scale) * inner;
@@ -577,7 +577,7 @@ pub fn mt_int8_gated_rms_norm_qgemv<T>(
     for it in range(0u32, iters, 1u32) {
         let c = it * lsize + tid;
         if c < in_dim {
-            let elem = int8_decode(load(weight[row_off + c]).cast::<u32>());
+            let elem = mt_decode_int8(load(weight[row_off + c]).cast::<u32>());
             let scale = load(scales[row_block_off + c / block_size]);
             let inner = threadgroup_load("tg_inner", c);
             acc = acc + (elem * scale) * inner;
@@ -796,7 +796,7 @@ int_gated_qgemv_e8m0!(mt_mxint6_gated_rms_norm_qgemv, 6u32, 32u32, 64.0f32);
 
 /// MXINT8 fused gated-RMSNorm + GEMV — 8-bit symmetric codes (byte layout,
 /// block 32), E8M0 pow-2 block scale `2^(bits-127)`. Element-strided like the
-/// 8-bit float formats (one byte per code); decode is `int8_decode → val · scale`.
+/// 8-bit float formats (one byte per code); decode is `mt_decode_int8 → val · scale`.
 /// Mirrors `mt_int8_gated_rms_norm_qgemv` with the E8M0 scale axis.
 #[kernel]
 pub fn mt_mxint8_gated_rms_norm_qgemv<T>(
@@ -850,7 +850,7 @@ pub fn mt_mxint8_gated_rms_norm_qgemv<T>(
     for it in range(0u32, iters, 1u32) {
         let c = it * lsize + tid;
         if c < in_dim {
-            let elem = int8_decode(load(weight[row_off + c]).cast::<u32>());
+            let elem = mt_decode_int8(load(weight[row_off + c]).cast::<u32>());
             let sbits = load(scales[row_block_off + c / block_size]).cast::<f32>();
             let scale = exp2(sbits - 127.0f32);
             let inner = threadgroup_load("tg_inner", c);
@@ -929,7 +929,7 @@ pub fn mt_nvfp8_f16_gated_rms_norm_qgemv<T>(
     for it in range(0u32, iters, 1u32) {
         let c = it * lsize + tid;
         if c < in_dim {
-            let elem = e4m3_decode(load(weight[row_off + c]).cast::<u32>());
+            let elem = mt_decode_e4m3(load(weight[row_off + c]).cast::<u32>());
             let scale = load(scales[row_block_off + c / block_size]).cast::<f32>();
             let inner = threadgroup_load("tg_inner", c);
             acc = acc + (elem * scale) * inner;
@@ -1003,7 +1003,7 @@ pub fn mt_fp4_f16_gated_rms_norm_qgemv<T>(
             let p_off = pack_idx * 8u32;
             for i in range(0u32, 8u32, 1u32) {
                 let nib = (packed >> (i * 4u32)) & 0xFu32;
-                let val = e2m1_decode(nib);
+                let val = mt_decode_e2m1(nib);
                 let inner = threadgroup_load("tg_inner", p_off + i);
                 acc = acc + (val * scale) * inner;
             }
@@ -1069,7 +1069,7 @@ pub fn mt_fp8_e5m2_f16_gated_rms_norm_qgemv<T>(
     for it in range(0u32, iters, 1u32) {
         let c = it * lsize + tid;
         if c < in_dim {
-            let elem = e5m2_decode(load(weight[row_off + c]).cast::<u32>());
+            let elem = mt_decode_e5m2(load(weight[row_off + c]).cast::<u32>());
             let scale = load(scales[row_block_off + c / block_size]).cast::<f32>();
             let inner = threadgroup_load("tg_inner", c);
             acc = acc + (elem * scale) * inner;
@@ -1230,7 +1230,7 @@ pub fn mt_int8_f16_gated_rms_norm_qgemv<T>(
     for it in range(0u32, iters, 1u32) {
         let c = it * lsize + tid;
         if c < in_dim {
-            let elem = int8_decode(load(weight[row_off + c]).cast::<u32>());
+            let elem = mt_decode_int8(load(weight[row_off + c]).cast::<u32>());
             let scale = load(scales[row_block_off + c / block_size]).cast::<f32>();
             let inner = threadgroup_load("tg_inner", c);
             acc = acc + (elem * scale) * inner;
@@ -1685,7 +1685,7 @@ pub mod kernel_benches {
             .with_shape_label(format!("{} hv={hv} dv={dv} m={out_dim}", fmt.name()))
     }
 
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/mxfp4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxfp4_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_mxfp4_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1696,7 +1696,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/nvfp4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_nvfp4_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_nvfp4_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1707,7 +1707,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/mxfp8_e4m3", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxfp8_e4m3_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_mxfp8_e4m3_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1718,7 +1718,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/mxfp8_e5m2", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxfp8_e5m2_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_mxfp8_e5m2_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1729,7 +1729,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/nvfp8", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_nvfp8_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_nvfp8_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1740,11 +1740,11 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/fp4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp4_gated(dt: DType) -> BenchSetup {
         gated_bench(mt_fp4_gated_rms_norm_qgemv::kernel_ir_for(dt), QFormat::Fp4, 16, 128, 2048, dt)
     }
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/fp8_e4m3", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp8_e4m3_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_nvfp8_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1755,7 +1755,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/fp8_e5m2", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp8_e5m2_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_fp8_e5m2_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1766,7 +1766,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/int8", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int8_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_int8_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1778,7 +1778,7 @@ pub mod kernel_benches {
         )
     }
     // Symmetric sub-byte ints (FP32 group scale) + MXINT (E8M0 block scale).
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/int2", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int2_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_int2_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1789,7 +1789,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/int3", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int3_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_int3_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1800,7 +1800,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/int4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int4_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_int4_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1811,7 +1811,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/int5", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int5_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_int5_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1822,7 +1822,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/int6", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int6_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_int6_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1833,7 +1833,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/mxint2", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint2_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_mxint2_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1844,7 +1844,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/mxint3", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint3_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_mxint3_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1855,7 +1855,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/mxint4", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint4_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_mxint4_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1866,7 +1866,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/mxint5", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint5_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_mxint5_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1877,7 +1877,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/mxint6", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint6_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_mxint6_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1888,7 +1888,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/mxint8", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_mxint8_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_mxint8_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1900,7 +1900,7 @@ pub mod kernel_benches {
         )
     }
     // FP16-scale twins. fp8_e4m3_f16 reuses the nvfp8_f16 kernel.
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/nvfp8_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_nvfp8_f16_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_nvfp8_f16_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1911,7 +1911,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/fp8_e4m3_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp8_e4m3_f16_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_nvfp8_f16_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1922,7 +1922,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/fp4_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp4_f16_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_fp4_f16_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1933,7 +1933,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/fp8_e5m2_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_fp8_e5m2_f16_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_fp8_e5m2_f16_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1944,7 +1944,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/int2_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int2_f16_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_int2_f16_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1955,7 +1955,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/int3_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int3_f16_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_int3_f16_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1966,7 +1966,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/int4_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int4_f16_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_int4_f16_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1977,7 +1977,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/int5_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int5_f16_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_int5_f16_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1988,7 +1988,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/int6_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int6_f16_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_int6_f16_gated_rms_norm_qgemv::kernel_ir_for(dt),
@@ -1999,7 +1999,7 @@ pub mod kernel_benches {
             dt,
         )
     }
-    #[bench(name = "ffai/gated_rms_norm_block_qgemv/int8_f16", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_int8_f16_gated(dt: DType) -> BenchSetup {
         gated_bench(
             mt_int8_f16_gated_rms_norm_qgemv::kernel_ir_for(dt),

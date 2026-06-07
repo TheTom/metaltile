@@ -14,9 +14,13 @@ mod common;
 use std::collections::BTreeMap;
 
 use common::{Dt, gpu_lock, pack_bytes, pack_u32_bytes, unpack_bytes};
-use metaltile_core::ir::KernelMode;
+use metaltile::core::ir::KernelMode;
 use metaltile_runtime::Context;
 use metaltile_std::ffai::moe_gather_down_q2k::ffai_moe_gather_down_q2k;
+// The Q2_K output-index → (qs byte, 2-bit shift) map is the single shared
+// definition in `quant::gguf`: the kernel, the quantizer, and this oracle all
+// read it, so the layout can't drift apart (getting it wrong was PR #264).
+use metaltile_std::quant::gguf::q2_k_qpos;
 
 const N_SLOTS: usize = 6;
 
@@ -56,13 +60,16 @@ fn reference(
             for k in 0..k_in {
                 let b = k / 256;
                 let in_block = k % 256;
+                // Canonical Q2_K layout — identical mapping to
+                // `gguf_dequant_q2_k` and the kernel under test. Scale index
+                // is `in_block / 16`; the qs byte + 2-bit shift come from
+                // `q2_k_qpos`, NOT the naive 4-consecutive-per-byte order.
                 let sub = in_block / 16;
-                let q_byte_idx = in_block / 4;
-                let word_idx = q_byte_idx / 4;
-                let byte_in_word = q_byte_idx % 4;
+                let (q_byte, shift) = q2_k_qpos(in_block);
+                let word_idx = q_byte / 4;
+                let byte_in_word = q_byte % 4;
                 let word = qs_all[qs_row_base + b * 16 + word_idx];
                 let qs_byte = (word >> (byte_in_word * 8)) & 0xff;
-                let shift = (in_block % 4) * 2;
                 let q_2bit = (qs_byte >> shift) & 0x3;
                 let scale_byte = scales_all[qs_row_base + b * 16 + sub] as u32;
                 let scale_4bit = scale_byte & 0xf;

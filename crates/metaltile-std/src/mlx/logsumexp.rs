@@ -97,7 +97,7 @@ pub mod kernel_benches {
     use metaltile::{bench, test::*};
 
     use super::mt_logsumexp;
-    use crate::bench_types::{InputDomain, dtype_tol, input_buffer, mlx_tname};
+    use crate::utils::{InputDomain, dtype_tol, input_buffer, mlx_tname};
 
     // MLX `looped_logsumexp_*` buffer order: `in`[[buffer(0)]],
     // `out`[[buffer(1)]] (one element per row), `axis_size`(int)[[buffer(2)]].
@@ -108,7 +108,7 @@ pub mod kernel_benches {
     // `looped_softmax_*`: `local_max[32]`/`local_normalizer[32]` are only valid
     // when n_simd==32 (tpg=1024); at MT's tpg=256 the stale slots produce NaN.
     // Pin tpg=1024 (mirrors the legacy RowNorm `mlx_tpg: 1024`).
-    #[bench(name = "mlx/logsumexp", dtypes = [f32, f16, bf16])]
+    #[bench(dtypes = [f32, f16, bf16])]
     fn bench_logsumexp(dt: DType) -> BenchSetup {
         let (rows, n) = (4096usize, 1024usize);
         let tn = mlx_tname(dt);
