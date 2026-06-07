@@ -156,16 +156,32 @@ pub const CUBLAS_COMPUTE_32F: c_int = 68;
 // cublasGemmAlgo_t
 pub const CUBLAS_GEMM_DEFAULT: c_int = -1;
 pub const CUBLAS_GEMM_DEFAULT_TENSOR_OP: c_int = 99;
+// Explicit tensor-op algos: CUBLAS_GEMM_ALGO{N}_TENSOR_OP = 100 + N, N in 0..=15.
+// The DEFAULT (99) heuristic may pick split-K kernels that accumulate via atomics
+// → run-to-run NONdeterministic. Selecting a specific tensor-op algo pins a fixed
+// (non-split-K) kernel, restoring bit-exact reproducibility. Base value below;
+// callers pick the index (default ALGO0_TENSOR_OP = 100).
+pub const CUBLAS_GEMM_ALGO0_TENSOR_OP: c_int = 100;
 
 // cublasMath_t
 pub const CUBLAS_DEFAULT_MATH: c_int = 0;
 pub const CUBLAS_TENSOR_OP_MATH: c_int = 1;
+
+// cublasAtomicsMode_t — when atomics are NOT allowed, cuBLAS will not pick a
+// kernel that accumulates partial products via atomic add (the split-K family),
+// which is the source of run-to-run NONdeterminism in tensor-op GEMMs. Forbidding
+// atomics keeps tensor cores active (unlike PEDANTIC math) and makes the result
+// bit-exact reproducible at a small (or zero) perf cost.
+pub const CUBLAS_ATOMICS_NOT_ALLOWED: c_int = 0;
+pub const CUBLAS_ATOMICS_ALLOWED: c_int = 1;
 
 #[link(name = "cublas")]
 unsafe extern "C" {
     pub fn cublasCreate_v2(handle: *mut cublasHandle_t) -> cublasStatus_t;
     pub fn cublasDestroy_v2(handle: cublasHandle_t) -> cublasStatus_t;
     pub fn cublasSetStream_v2(handle: cublasHandle_t, stream: CUstream) -> cublasStatus_t;
+    /// Allow/forbid atomic-accumulation kernels (split-K). Forbidding → deterministic.
+    pub fn cublasSetAtomicsMode(handle: cublasHandle_t, mode: c_int) -> cublasStatus_t;
     pub fn cublasSetMathMode(handle: cublasHandle_t, mode: c_int) -> cublasStatus_t;
     #[allow(clippy::too_many_arguments)]
     pub fn cublasGemmEx(
@@ -244,6 +260,93 @@ unsafe extern "C" {
         group_count: c_int,
         group_size: *const c_int,
         compute_type: c_int,
+    ) -> cublasStatus_t;
+}
+
+// ── cublasLt — deterministic matmul (REDUCTION_SCHEME_NONE) ──────────────────
+// The legacy `cublasGemmEx` heuristic (and `cublasSetAtomicsMode`/legacy algo
+// selectors) do NOT reliably suppress split-K atomic reductions on sm_121, which
+// makes f16 tensor-op GEMM run-to-run nondeterministic. cublasLt lets us forbid
+// split-K reductions via the preference's REDUCTION_SCHEME_MASK = NONE, so the
+// heuristic only returns deterministic (single-K, no atomic accumulate) algos.
+pub type cublasLtHandle_t = *mut c_void;
+pub type cublasLtMatmulDesc_t = *mut c_void;
+pub type cublasLtMatrixLayout_t = *mut c_void;
+pub type cublasLtMatmulPreference_t = *mut c_void;
+
+// cublasLtMatrixLayoutAttribute_t (batched strided GEMM)
+pub const CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT: c_int = 5;
+pub const CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET: c_int = 6;
+// cublasLtMatmulDescAttributes_t
+pub const CUBLASLT_MATMUL_DESC_TRANSA: c_int = 3;
+pub const CUBLASLT_MATMUL_DESC_TRANSB: c_int = 4;
+// cublasLtMatmulPreferenceAttributes_t
+pub const CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES: c_int = 1;
+pub const CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK: c_int = 3;
+// cublasLtReductionScheme_t
+pub const CUBLASLT_REDUCTION_SCHEME_NONE: u32 = 0;
+
+/// Heuristic result struct: { algo[8 u64], workspaceSize, state, wavesCount, reserved[4] }.
+/// We mirror it as an opaque blob large enough to hold the C struct; only the
+/// leading `algo` (passed back into cublasLtMatmul) and `state`/`workspaceSize`
+/// fields are read. cublasLtMatmulAlgo_t is `{ uint64_t data[8]; }` (64 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct cublasLtMatmulHeuristicResult_t {
+    pub algo: [u64; 8],        // cublasLtMatmulAlgo_t
+    pub workspace_size: usize,
+    pub state: cublasStatus_t,
+    pub waves_count: f32,
+    pub reserved: [c_int; 4],
+}
+impl Default for cublasLtMatmulHeuristicResult_t {
+    fn default() -> Self {
+        cublasLtMatmulHeuristicResult_t {
+            algo: [0; 8], workspace_size: 0, state: 0, waves_count: 0.0, reserved: [0; 4],
+        }
+    }
+}
+
+#[link(name = "cublasLt")]
+unsafe extern "C" {
+    pub fn cublasLtCreate(handle: *mut cublasLtHandle_t) -> cublasStatus_t;
+    pub fn cublasLtDestroy(handle: cublasLtHandle_t) -> cublasStatus_t;
+    pub fn cublasLtMatmulDescCreate(desc: *mut cublasLtMatmulDesc_t, compute_type: c_int, scale_type: c_int) -> cublasStatus_t;
+    pub fn cublasLtMatmulDescDestroy(desc: cublasLtMatmulDesc_t) -> cublasStatus_t;
+    pub fn cublasLtMatmulDescSetAttribute(desc: cublasLtMatmulDesc_t, attr: c_int, buf: *const c_void, size: usize) -> cublasStatus_t;
+    pub fn cublasLtMatrixLayoutCreate(layout: *mut cublasLtMatrixLayout_t, dtype: c_int, rows: u64, cols: u64, ld: i64) -> cublasStatus_t;
+    pub fn cublasLtMatrixLayoutSetAttribute(layout: cublasLtMatrixLayout_t, attr: c_int, buf: *const c_void, size: usize) -> cublasStatus_t;
+    pub fn cublasLtMatrixLayoutDestroy(layout: cublasLtMatrixLayout_t) -> cublasStatus_t;
+    pub fn cublasLtMatmulPreferenceCreate(pref: *mut cublasLtMatmulPreference_t) -> cublasStatus_t;
+    pub fn cublasLtMatmulPreferenceDestroy(pref: cublasLtMatmulPreference_t) -> cublasStatus_t;
+    pub fn cublasLtMatmulPreferenceSetAttribute(pref: cublasLtMatmulPreference_t, attr: c_int, buf: *const c_void, size: usize) -> cublasStatus_t;
+    #[allow(clippy::too_many_arguments)]
+    pub fn cublasLtMatmulAlgoGetHeuristic(
+        handle: cublasLtHandle_t,
+        op_desc: cublasLtMatmulDesc_t,
+        a_desc: cublasLtMatrixLayout_t,
+        b_desc: cublasLtMatrixLayout_t,
+        c_desc: cublasLtMatrixLayout_t,
+        d_desc: cublasLtMatrixLayout_t,
+        pref: cublasLtMatmulPreference_t,
+        requested_algo_count: c_int,
+        results: *mut cublasLtMatmulHeuristicResult_t,
+        return_algo_count: *mut c_int,
+    ) -> cublasStatus_t;
+    #[allow(clippy::too_many_arguments)]
+    pub fn cublasLtMatmul(
+        handle: cublasLtHandle_t,
+        compute_desc: cublasLtMatmulDesc_t,
+        alpha: *const c_void,
+        a: CUdeviceptr, a_desc: cublasLtMatrixLayout_t,
+        b: CUdeviceptr, b_desc: cublasLtMatrixLayout_t,
+        beta: *const c_void,
+        c: CUdeviceptr, c_desc: cublasLtMatrixLayout_t,
+        d: CUdeviceptr, d_desc: cublasLtMatrixLayout_t,
+        algo: *const u64,
+        workspace: CUdeviceptr,
+        workspace_size: usize,
+        stream: CUstream,
     ) -> cublasStatus_t;
 }
 
