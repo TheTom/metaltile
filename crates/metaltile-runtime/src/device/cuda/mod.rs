@@ -244,7 +244,17 @@ pub struct CudaDevice {
     /// (`cublasGemmEx`, bf16/f16 × f32-accumulate). `usize` holds the handle ptr
     /// (so the field is plain-Send); bound to `self.stream` on first use.
     cublas: Mutex<usize>,
+    /// Lazily-created cublasLt handle + a fixed device workspace, used by the
+    /// DETERMINISTIC GEMM path (`gemm_cublaslt`). cublasLt lets us forbid split-K
+    /// reductions (REDUCTION_SCHEME_NONE), which the legacy `cublasGemmEx`
+    /// heuristic / atomics-mode could not on sm_121. `(handle_ptr, workspace_ptr)`
+    /// as `usize` to stay plain-Send; workspace is a single 32 MiB slab.
+    cublaslt: Mutex<(usize, usize)>,
 }
+
+/// Fixed cublasLt workspace size (32 MiB). Large enough for the heuristic to
+/// pick efficient non-split-K tensor-op kernels for the Nemotron prefill GEMMs.
+const CUBLASLT_WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
 
 // The context is current on this struct's lifetime; we keep it single-
 // device, single-context (Phase 1). Send is sound because we never share
@@ -282,7 +292,7 @@ impl CudaDevice {
             let mut stream: CUstream = ptr::null_mut();
             cu_check(cuStreamCreate(&mut stream, CU_STREAM_NON_BLOCKING), "cuStreamCreate")?;
             let pool_enabled = std::env::var("METALTILE_POOL_ALLOC").is_ok();
-            Ok(Some(CudaDevice { ctx, cc_major: major, cc_minor: minor, pool: Mutex::new(HashMap::new()), pooled_bytes: Mutex::new(0), pool_enabled, pinned_free: Mutex::new(HashMap::new()), pinned_inflight: Mutex::new(Vec::new()), stream, capturing: std::sync::atomic::AtomicBool::new(false), cublas: Mutex::new(0) }))
+            Ok(Some(CudaDevice { ctx, cc_major: major, cc_minor: minor, pool: Mutex::new(HashMap::new()), pooled_bytes: Mutex::new(0), pool_enabled, pinned_free: Mutex::new(HashMap::new()), pinned_inflight: Mutex::new(Vec::new()), stream, capturing: std::sync::atomic::AtomicBool::new(false), cublas: Mutex::new(0), cublaslt: Mutex::new((0, 0)) }))
         }
     }
 
@@ -302,10 +312,39 @@ impl CudaDevice {
             unsafe {
                 cublasSetStream_v2(h, self.stream);
                 cublasSetMathMode(h, CUBLAS_TENSOR_OP_MATH);
+                // Determinism: forbid atomic-accumulation (split-K) kernels so
+                // identical inputs give bit-exact identical outputs run-to-run.
+                // The DEFAULT_TENSOR_OP heuristic otherwise selects split-K
+                // variants for some MoE-prefill shapes that reduce via atomics
+                // → logit jitter + argmax flips. Tensor cores stay active.
+                // METALTILE_GEMM_ATOMICS=1 opts back into the nondeterministic
+                // heuristic (for A/B perf measurement only).
+                let atomics = std::env::var("METALTILE_GEMM_ATOMICS").ok().as_deref() == Some("1");
+                cublasSetAtomicsMode(h, if atomics { CUBLAS_ATOMICS_ALLOWED } else { CUBLAS_ATOMICS_NOT_ALLOWED });
             }
             *guard = h as usize;
         }
         Ok(*guard as cublasHandle_t)
+    }
+
+    /// cuBLAS GEMM algorithm selector for the tensor-core GEMM paths.
+    ///
+    /// Determinism is enforced handle-wide via `cublasSetAtomicsMode(..NOT_ALLOWED)`
+    /// (see `cublas_handle`), which forbids the split-K kernels that reduce via
+    /// atomics. With atomics forbidden, the `CUBLAS_GEMM_DEFAULT_TENSOR_OP` (99)
+    /// heuristic is free to pick the best *deterministic* tensor-op kernel, so we
+    /// keep DEFAULT here. `METALTILE_GEMM_ALGO=N` (0..=15) lets you pin a specific
+    /// `CUBLAS_GEMM_ALGO{N}_TENSOR_OP` for experimentation.
+    #[inline]
+    fn gemm_algo() -> c_int {
+        use std::sync::OnceLock;
+        static ALGO: OnceLock<c_int> = OnceLock::new();
+        *ALGO.get_or_init(|| {
+            match std::env::var("METALTILE_GEMM_ALGO").ok().and_then(|s| s.trim().parse::<i32>().ok()) {
+                Some(n) if (0..=15).contains(&n) => CUBLAS_GEMM_ALGO0_TENSOR_OP + n as c_int,
+                _ => CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+            }
+        })
     }
 
     /// Tensor-core GEMM via cuBLAS (Path A escape hatch). Computes the ROW-MAJOR
@@ -329,6 +368,15 @@ impl CudaDevice {
         k: usize,
         dtype: metaltile_core::DType,
     ) -> Result<(), MetalTileError> {
+        // DETERMINISTIC by default: route through cublasLt with split-K reductions
+        // forbidden (REDUCTION_SCHEME_NONE). The legacy cublasGemmEx heuristic
+        // picks split-K atomic-accumulate kernels for some MoE-prefill shapes →
+        // run-to-run logit jitter + argmax flips. `cublasSetAtomicsMode` and the
+        // legacy algo selector do NOT suppress this on sm_121; cublasLt does.
+        // METALTILE_GEMM_NONDET=1 opts back into the legacy path (A/B perf only).
+        if std::env::var("METALTILE_GEMM_NONDET").ok().as_deref() != Some("1") {
+            return self.gemm_cublaslt(x, w, out, m, n, k, dtype);
+        }
         let h = self.cublas_handle()?;
         let cdt = match dtype {
             metaltile_core::DType::F16 => CUDA_R_16F,
@@ -355,11 +403,116 @@ impl CudaDevice {
                 &beta as *const f32 as *const c_void,
                 out, cdt, n as c_int,   // C = out, ldc = n
                 CUBLAS_COMPUTE_32F,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+                Self::gemm_algo(),      // deterministic explicit algo (see gemm_algo)
             )
         };
         if st != CUBLAS_STATUS_SUCCESS {
             return Err(MetalTileError::Dispatch(format!("cublasGemmEx failed: status {st} (m={m} n={n} k={k})")));
+        }
+        Ok(())
+    }
+
+    /// Lazily create the cublasLt handle + fixed device workspace. Returns
+    /// `(handle, workspace_ptr)`.
+    fn cublaslt_ctx(&self) -> Result<(cublasLtHandle_t, CUdeviceptr), MetalTileError> {
+        let mut guard = self.cublaslt.lock().unwrap();
+        if guard.0 == 0 {
+            let mut h: cublasLtHandle_t = ptr::null_mut();
+            let st = unsafe { cublasLtCreate(&mut h) };
+            if st != CUBLAS_STATUS_SUCCESS {
+                return Err(MetalTileError::Dispatch(format!("cublasLtCreate failed: {st}")));
+            }
+            let ws = self.alloc_raw(CUBLASLT_WORKSPACE_BYTES)?;
+            *guard = (h as usize, ws as usize);
+        }
+        Ok((guard.0 as cublasLtHandle_t, guard.1 as CUdeviceptr))
+    }
+
+    /// DETERMINISTIC tensor-core GEMM via cublasLt. Same row-major contract as
+    /// [`gemm_cublas`] (`C[m,n] = X[m,k] · W[n,k]ᵀ`) but forbids split-K
+    /// reductions (`REDUCTION_SCHEME_NONE`) so the heuristic only returns algos
+    /// whose result is bit-exact reproducible run-to-run. This is the fix for the
+    /// MoE-prefill logit jitter that `cublasSetAtomicsMode`/legacy-algo selection
+    /// could not suppress on sm_121. Falls back to an error (caller can retry the
+    /// nondeterministic path) if no deterministic algo is found.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_cublaslt(
+        &self,
+        x: CUdeviceptr,   // [m, k] row-major activation
+        w: CUdeviceptr,   // [n, k] row-major weight
+        out: CUdeviceptr, // [m, n] row-major result
+        m: usize,
+        n: usize,
+        k: usize,
+        dtype: metaltile_core::DType,
+    ) -> Result<(), MetalTileError> {
+        let (lt, workspace) = self.cublaslt_ctx()?;
+        let cdt = match dtype {
+            metaltile_core::DType::F16 => CUDA_R_16F,
+            metaltile_core::DType::BF16 => CUDA_R_16BF,
+            other => return Err(MetalTileError::Dispatch(format!("gemm_cublaslt: unsupported dtype {other:?} (need f16/bf16)"))),
+        };
+        // Col-major identity (same as gemm_cublas): out_cm[n,m] = (W^T)·X.
+        //   op(A)=T, op(B)=N; A=W (rows=k, cols=n, ld=k), B=X (rows=k, cols=m, ld=k),
+        //   D=out (rows=n, cols=m, ld=n).
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        unsafe {
+            let mut desc: cublasLtMatmulDesc_t = ptr::null_mut();
+            let s = cublasLtMatmulDescCreate(&mut desc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+            if s != CUBLAS_STATUS_SUCCESS { return Err(MetalTileError::Dispatch(format!("cublasLtMatmulDescCreate: {s}"))); }
+            let opt = CUBLAS_OP_T;
+            let opn = CUBLAS_OP_N;
+            cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA, &opt as *const c_int as *const c_void, std::mem::size_of::<c_int>());
+            cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSB, &opn as *const c_int as *const c_void, std::mem::size_of::<c_int>());
+
+            // Layouts describe the PHYSICAL (untransposed) storage, col-major.
+            // A=W is [n,k] row-major == [k,n] col-major → rows=k, cols=n, ld=k.
+            // B=X is [m,k] row-major == [k,m] col-major → rows=k, cols=m, ld=k.
+            // D=out is [m,n] row-major == [n,m] col-major → rows=n, cols=m, ld=n.
+            let mut a_l: cublasLtMatrixLayout_t = ptr::null_mut();
+            let mut b_l: cublasLtMatrixLayout_t = ptr::null_mut();
+            let mut d_l: cublasLtMatrixLayout_t = ptr::null_mut();
+            cublasLtMatrixLayoutCreate(&mut a_l, cdt, k as u64, n as u64, k as i64);
+            cublasLtMatrixLayoutCreate(&mut b_l, cdt, k as u64, m as u64, k as i64);
+            cublasLtMatrixLayoutCreate(&mut d_l, cdt, n as u64, m as u64, n as i64);
+
+            let mut pref: cublasLtMatmulPreference_t = ptr::null_mut();
+            cublasLtMatmulPreferenceCreate(&mut pref);
+            let ws_bytes: usize = CUBLASLT_WORKSPACE_BYTES;
+            cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_bytes as *const usize as *const c_void, std::mem::size_of::<usize>());
+            // THE determinism lever: restrict allowed reduction schemes to NONE,
+            // so the heuristic never returns a split-K (atomic-accumulate) algo.
+            let red_mask: u32 = CUBLASLT_REDUCTION_SCHEME_NONE;
+            cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &red_mask as *const u32 as *const c_void, std::mem::size_of::<u32>());
+
+            let mut result = cublasLtMatmulHeuristicResult_t::default();
+            let mut returned: c_int = 0;
+            let hs = cublasLtMatmulAlgoGetHeuristic(lt, desc, a_l, b_l, d_l, d_l, pref, 1, &mut result, &mut returned);
+            if hs != CUBLAS_STATUS_SUCCESS || returned < 1 {
+                cublasLtMatmulPreferenceDestroy(pref);
+                cublasLtMatrixLayoutDestroy(a_l); cublasLtMatrixLayoutDestroy(b_l); cublasLtMatrixLayoutDestroy(d_l);
+                cublasLtMatmulDescDestroy(desc);
+                return Err(MetalTileError::Dispatch(format!("cublasLt: no deterministic algo (m={m} n={n} k={k} status={hs} returned={returned})")));
+            }
+            let mm = cublasLtMatmul(
+                lt, desc,
+                &alpha as *const f32 as *const c_void,
+                w, a_l,
+                x, b_l,
+                &beta as *const f32 as *const c_void,
+                out, d_l,
+                out, d_l,
+                result.algo.as_ptr(),
+                workspace, ws_bytes,
+                self.stream,
+            );
+            cublasLtMatmulPreferenceDestroy(pref);
+            cublasLtMatrixLayoutDestroy(a_l); cublasLtMatrixLayoutDestroy(b_l); cublasLtMatrixLayoutDestroy(d_l);
+            cublasLtMatmulDescDestroy(desc);
+            if mm != CUBLAS_STATUS_SUCCESS {
+                return Err(MetalTileError::Dispatch(format!("cublasLtMatmul failed: status {mm} (m={m} n={n} k={k})")));
+            }
         }
         Ok(())
     }
@@ -380,6 +533,11 @@ impl CudaDevice {
         batch_count: usize,
         dtype: metaltile_core::DType,
     ) -> Result<(), MetalTileError> {
+        // DETERMINISTIC by default via cublasLt (split-K reductions forbidden);
+        // see gemm_cublas. METALTILE_GEMM_NONDET=1 → legacy nondeterministic path.
+        if std::env::var("METALTILE_GEMM_NONDET").ok().as_deref() != Some("1") {
+            return self.gemm_cublaslt_strided_batched(x_base, stride_x, w_base, stride_w, out_base, stride_out, m, n, k, batch_count, dtype);
+        }
         let h = self.cublas_handle()?;
         let cdt = match dtype {
             metaltile_core::DType::F16 => CUDA_R_16F,
@@ -404,11 +562,98 @@ impl CudaDevice {
                 out_base, cdt, n as c_int, stride_out / el,
                 batch_count as c_int,
                 CUBLAS_COMPUTE_32F,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+                Self::gemm_algo(),      // deterministic explicit algo (see gemm_algo)
             )
         };
         if st != CUBLAS_STATUS_SUCCESS {
             return Err(MetalTileError::Dispatch(format!("cublasGemmStridedBatchedEx failed: {st} (m={m} n={n} k={k} batch={batch_count})")));
+        }
+        Ok(())
+    }
+
+    /// DETERMINISTIC strided-batched GEMM via cublasLt (split-K reductions
+    /// forbidden). Same contract/strides (BYTES) as [`gemm_cublas_strided_batched`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_cublaslt_strided_batched(
+        &self,
+        x_base: CUdeviceptr, stride_x: i64,
+        w_base: CUdeviceptr, stride_w: i64,
+        out_base: CUdeviceptr, stride_out: i64,
+        m: usize, n: usize, k: usize,
+        batch_count: usize,
+        dtype: metaltile_core::DType,
+    ) -> Result<(), MetalTileError> {
+        let (lt, workspace) = self.cublaslt_ctx()?;
+        let cdt = match dtype {
+            metaltile_core::DType::F16 => CUDA_R_16F,
+            metaltile_core::DType::BF16 => CUDA_R_16BF,
+            other => return Err(MetalTileError::Dispatch(format!("gemm_cublaslt_strided_batched: unsupported dtype {other:?}"))),
+        };
+        let el = 2i64; // bytes per f16/bf16 element
+        let bc = batch_count as i32;
+        // Strided-batch offsets are in ELEMENTS (same convention as ld).
+        let off_a = stride_w / el; // A = W
+        let off_b = stride_x / el; // B = X
+        let off_d = stride_out / el; // D = out
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        unsafe {
+            let mut desc: cublasLtMatmulDesc_t = ptr::null_mut();
+            let s = cublasLtMatmulDescCreate(&mut desc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+            if s != CUBLAS_STATUS_SUCCESS { return Err(MetalTileError::Dispatch(format!("cublasLtMatmulDescCreate(strided): {s}"))); }
+            let opt = CUBLAS_OP_T; let opn = CUBLAS_OP_N;
+            cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA, &opt as *const c_int as *const c_void, std::mem::size_of::<c_int>());
+            cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSB, &opn as *const c_int as *const c_void, std::mem::size_of::<c_int>());
+
+            // Same per-matrix layouts as gemm_cublaslt, plus batch count + stride.
+            let mut a_l: cublasLtMatrixLayout_t = ptr::null_mut();
+            let mut b_l: cublasLtMatrixLayout_t = ptr::null_mut();
+            let mut d_l: cublasLtMatrixLayout_t = ptr::null_mut();
+            cublasLtMatrixLayoutCreate(&mut a_l, cdt, k as u64, n as u64, k as i64);
+            cublasLtMatrixLayoutCreate(&mut b_l, cdt, k as u64, m as u64, k as i64);
+            cublasLtMatrixLayoutCreate(&mut d_l, cdt, n as u64, m as u64, n as i64);
+            let set_batch = |layout: cublasLtMatrixLayout_t, stride: i64| {
+                cublasLtMatrixLayoutSetAttribute(layout, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &bc as *const i32 as *const c_void, std::mem::size_of::<i32>());
+                cublasLtMatrixLayoutSetAttribute(layout, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride as *const i64 as *const c_void, std::mem::size_of::<i64>());
+            };
+            set_batch(a_l, off_a);
+            set_batch(b_l, off_b);
+            set_batch(d_l, off_d);
+
+            let mut pref: cublasLtMatmulPreference_t = ptr::null_mut();
+            cublasLtMatmulPreferenceCreate(&mut pref);
+            let ws_bytes: usize = CUBLASLT_WORKSPACE_BYTES;
+            cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_bytes as *const usize as *const c_void, std::mem::size_of::<usize>());
+            let red_mask: u32 = CUBLASLT_REDUCTION_SCHEME_NONE;
+            cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &red_mask as *const u32 as *const c_void, std::mem::size_of::<u32>());
+
+            let mut result = cublasLtMatmulHeuristicResult_t::default();
+            let mut returned: c_int = 0;
+            let hs = cublasLtMatmulAlgoGetHeuristic(lt, desc, a_l, b_l, d_l, d_l, pref, 1, &mut result, &mut returned);
+            if hs != CUBLAS_STATUS_SUCCESS || returned < 1 {
+                cublasLtMatmulPreferenceDestroy(pref);
+                cublasLtMatrixLayoutDestroy(a_l); cublasLtMatrixLayoutDestroy(b_l); cublasLtMatrixLayoutDestroy(d_l);
+                cublasLtMatmulDescDestroy(desc);
+                return Err(MetalTileError::Dispatch(format!("cublasLt(strided): no deterministic algo (m={m} n={n} k={k} batch={batch_count} status={hs} returned={returned})")));
+            }
+            let mm = cublasLtMatmul(
+                lt, desc,
+                &alpha as *const f32 as *const c_void,
+                w_base, a_l,
+                x_base, b_l,
+                &beta as *const f32 as *const c_void,
+                out_base, d_l,
+                out_base, d_l,
+                result.algo.as_ptr(),
+                workspace, ws_bytes,
+                self.stream,
+            );
+            cublasLtMatmulPreferenceDestroy(pref);
+            cublasLtMatrixLayoutDestroy(a_l); cublasLtMatrixLayoutDestroy(b_l); cublasLtMatrixLayoutDestroy(d_l);
+            cublasLtMatmulDescDestroy(desc);
+            if mm != CUBLAS_STATUS_SUCCESS {
+                return Err(MetalTileError::Dispatch(format!("cublasLtMatmul(strided) failed: status {mm} (m={m} n={n} k={k} batch={batch_count})")));
+            }
         }
         Ok(())
     }
