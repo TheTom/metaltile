@@ -23,16 +23,29 @@
 //!   out     [m * k]            T     — dense dequantized weight
 //! ```
 //!
-//! ## Dispatch
+//! ## Dispatch (1 thread per u32 WORD → 8 outputs)
 //!
-//! 1D grid, one thread per output value. Thread `i` → row `r = i/k`,
-//! col `c = i%k`; block `b = c/32`, within-block `j = c%32`; word
-//! `w = j/8`, nibble `n = j%8`. Reads one u32 word + one scale.
+//! 1D grid, one thread per packed u32 word. There are `n_words = n_values/8`
+//! words total (8 nibbles/word). Thread `i` owns word `i`: it does ONE word
+//! load + ONE scale load and emits the 8 contiguous output values that word
+//! decodes to. This amortises the global qs traffic 8× (the old 1-thread-per-
+//! value layout had 8 adjacent threads reload the same word) and the scale
+//! traffic 8× as well (one scale serves all 8 outputs of a word; a block's
+//! 4 words still share a scale, but each word now loads it once instead of
+//! once-per-nibble). Memory-bound win on every backend.
+//!
+//! Word `i` → row `r = i/words_per_row`, within-row word `wi = i%words_per_row`
+//! (`words_per_row = (k/32)*4`); block `b = wi/4`, word-in-block `w = wi%4`.
+//! The 8 outputs land at `out[r*k + b*32 + w*8 + n]` for `n` in 0..7, and the
+//! block scale is `scales[blk_off + r*bpr + b]`.
 //!
 //! Signed-nibble reconstruction without a bit_cast/arithmetic-shift
 //! intrinsic: extract the 4-bit field `nib = (word >> (n*4)) & 0xF`,
 //! then `select(nib >= 8, nib - 16, nib)` (the `gguf_dequant_q8_0`
-//! sign trick at 4-bit width).
+//! sign trick at 4-bit width). The constexpr-bounded `range(0,8,1)` loop
+//! unrolls at codegen, so the emitted MSL/PTX is the hand-unrolled 8-store
+//! form — same arithmetic as the per-value kernel, just one shared word/
+//! scale load. Bit-identical to the old kernel's outputs.
 
 use metaltile::kernel;
 
@@ -44,30 +57,37 @@ pub fn ffai_dequant_q4<T>(
     scales: Tensor<f16>,
     out: Tensor<T>,
     #[constexpr] k_in: u32,
-    #[constexpr] n_values: u32,
+    // Number of packed u32 words = n_values / 8 (the dispatch grid is over words,
+    // not values). Bounds the 1-thread-per-word launch.
+    #[constexpr] n_words: u32,
     // Block offset into qs/scales (in 32-value Q4 blocks). Lets a caller dequant
     // a contiguous sub-slab of a larger pool (e.g. one MoE expert's rows) without
     // a separate tensor view: qs offset = blk_off*4 words, scales = blk_off.
     #[constexpr] blk_off: u32,
 ) {
     // Grid3D 1-D launch: program_id::<0>() = global linear thread id (gid_x).
+    // One thread per u32 word; each emits the 8 values that word decodes to.
     let i = program_id::<0>();
-    if i < n_values {
-        let r = i / k_in;
-        let c = i - r * k_in;
+    if i < n_words {
         let bpr = k_in / 32u32;
-        let b = c / 32u32;
-        let j = c - b * 32u32; // within-block 0..31
-        let w = j / 8u32; // word 0..3
-        let n = j - w * 8u32; // nibble 0..7
+        let words_per_row = bpr * 4u32; // 4 packed words per 32-value block
+        let r = i / words_per_row;
+        let wi = i - r * words_per_row; // within-row word index 0..words_per_row-1
+        let b = wi / 4u32; // block within row
+        let w = wi - b * 4u32; // word within block 0..3
         let blk = blk_off + r * bpr + b;
+        // One word load + one scale load, amortised over the 8 outputs below.
         let word = load(qs[blk * 4u32 + w]);
-        let nib = (word >> (n * 4u32)) & 0xfu32;
-        // Sign-extend 4-bit: values 8..15 represent -8..-1 (nib - 16).
-        let q_signed = select(nib >= 8u32, nib - 16u32, nib);
-        let q = q_signed.cast::<i32>().cast::<f32>();
         let d = load(scales[blk]).cast::<f32>();
-        store(out[i], q * d);
+        // Output base for this word's 8 contiguous values.
+        let out_base = r * k_in + b * 32u32 + w * 8u32;
+        for n in range(0u32, 8u32, 1u32) {
+            let nib = (word >> (n * 4u32)) & 0xfu32;
+            // Sign-extend 4-bit: values 8..15 represent -8..-1 (nib - 16).
+            let q_signed = select(nib >= 8u32, nib - 16u32, nib);
+            let q = q_signed.cast::<i32>().cast::<f32>();
+            store(out[out_base + n], q * d);
+        }
     }
 }
 
@@ -137,10 +157,11 @@ pub mod kernel_tests {
             .input(TestBuffer::from_vec("scales", pack_f32(&scales, DType::F16), DType::F16))
             .input(TestBuffer::zeros("out", n, dt))
             .constexpr("k_in", k as u32)
-            .constexpr("n_values", n as u32)
+            .constexpr("n_words", (n / 8) as u32)
             .constexpr("blk_off", 0u32)
             .expect(TestBuffer::from_vec("out", pack_f32(&dequantized, dt), dt))
-            .grid_3d((n as u32).div_ceil(256), 1, 1, [256, 1, 1])
+            // Grid is now over u32 words (1 thread/word → 8 outputs), not values.
+            .grid_3d(((n / 8) as u32).div_ceil(256), 1, 1, [256, 1, 1])
     }
 
     #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-4, 5e-3, 5e-2])]
