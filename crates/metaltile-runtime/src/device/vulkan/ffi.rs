@@ -709,6 +709,12 @@ unsafe extern "C" {
     ) -> VkResult;
     pub fn vkEndCommandBuffer(commandBuffer: VkCommandBuffer) -> VkResult;
     pub fn vkResetCommandBuffer(commandBuffer: VkCommandBuffer, flags: VkFlags) -> VkResult;
+    pub fn vkFreeCommandBuffers(
+        device: VkDevice,
+        commandPool: VkCommandPool,
+        commandBufferCount: u32,
+        pCommandBuffers: *const VkCommandBuffer,
+    );
     pub fn vkCmdBindPipeline(
         commandBuffer: VkCommandBuffer,
         pipelineBindPoint: c_int,
@@ -958,6 +964,12 @@ unsafe extern "C" {
     ) -> VkResult;
     pub fn vkEndCommandBuffer(commandBuffer: VkCommandBuffer) -> VkResult;
     pub fn vkResetCommandBuffer(commandBuffer: VkCommandBuffer, flags: VkFlags) -> VkResult;
+    pub fn vkFreeCommandBuffers(
+        device: VkDevice,
+        commandPool: VkCommandPool,
+        commandBufferCount: u32,
+        pCommandBuffers: *const VkCommandBuffer,
+    );
     pub fn vkCmdBindPipeline(
         commandBuffer: VkCommandBuffer,
         pipelineBindPoint: c_int,

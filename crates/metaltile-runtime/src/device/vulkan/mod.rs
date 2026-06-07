@@ -98,6 +98,30 @@ impl Drop for VulkanBuffer<'_> {
     }
 }
 
+/// A persistent (lifetime-free) device buffer for the resident path. Unlike
+/// `VulkanBuffer<'d>` (borrow-bound to the device, so it cannot escape a
+/// single call), this owns only opaque Vulkan handles + a size, so it can
+/// live in a `'static Arc` inside the ffai-vulkan resident-tensor cache. The
+/// caller frees it via `VulkanDevice::free_raw` and MUST keep the owning
+/// `VulkanDevice` alive while it is live. The analogue of CUDA's raw
+/// `CUdeviceptr` from `alloc_raw`.
+#[derive(Clone, Copy)]
+pub struct VulkanRawBuffer {
+    pub(crate) buffer: VkBuffer_,
+    pub(crate) memory: VkDeviceMemory,
+    pub(crate) size: u64,
+}
+
+impl VulkanRawBuffer {
+    pub fn handle(&self) -> VkBuffer_ { self.buffer }
+    pub fn size(&self) -> u64 { self.size }
+}
+
+// Opaque driver handles; same Send/Sync rationale as VulkanPipeline (the
+// owning VkDevice outlives them via the held device Arc).
+unsafe impl Send for VulkanRawBuffer {}
+unsafe impl Sync for VulkanRawBuffer {}
+
 /// A compiled compute pipeline + its descriptor-set layout + pipeline
 /// layout. Owns the SPIR-V shader module.
 pub struct VulkanPipeline {
@@ -106,7 +130,19 @@ pub struct VulkanPipeline {
     pub set_layout: VkDescriptorSetLayout,
     pub shader_module: VkShaderModule,
     pub push_constant_bytes: u32,
+    /// Binding plan captured at compile time so the resident dispatch path
+    /// (`run_pipeline_bound`) needs no codegen re-run. Empty for pipelines
+    /// built by the legacy `compile()` host-shadow path (it carries its own
+    /// plan); populated by `compile_kernel` for the resident path.
+    pub plan: GlslBindingPlan,
 }
+
+// VkPipeline / VkDescriptorSetLayout / VkShaderModule are opaque driver
+// handles. They are safe to move/share across threads as long as the owning
+// VulkanDevice (hence VkDevice) outlives them, which the ffai-vulkan cache
+// guarantees (it holds the device Arc alongside the cached pipelines).
+unsafe impl Send for VulkanPipeline {}
+unsafe impl Sync for VulkanPipeline {}
 
 /// Top-level Vulkan compute device. Holds the instance, physical device,
 /// logical device, compute queue, descriptor pool, and command pool.
@@ -567,6 +603,7 @@ impl VulkanDevice {
                 set_layout,
                 shader_module,
                 push_constant_bytes: plan.push_constant_bytes,
+                plan: plan.clone(),
             })
         }
     }
@@ -815,6 +852,307 @@ impl VulkanDevice {
 
     /// Query name (best-effort): we don't link the extra "PhysicalDeviceProperties"
     /// FFI in Phase 1, so this is a placeholder.
+
+    // ──────────────────────────────────────────────────────────────────
+    // Resident-buffer + cached-pipeline seam (mirrors CudaDevice::alloc_raw
+    // / launch). The host-shadow `run_kernel` above uploads every param from
+    // host bytes, dispatches, reads back, and frees — re-streaming weights to
+    // VRAM and rebuilding the pipeline on every call. For a real decode loop
+    // (~hundreds of dispatches/token) that PCIe round-trip + recompile is the
+    // dominant cost. This seam lets a higher layer (ffai-vulkan) upload
+    // weights ONCE into a persistent VkBuffer, cache the compiled
+    // VkPipeline per (kernel,dims), and re-dispatch against the resident
+    // buffers — the CUDA-style residency model, ported to Vulkan.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Codegen + compile a kernel into a cacheable [`VulkanPipeline`] for the
+    /// resident path. Mirrors `run_kernel` steps 1-2 (IR -> GLSL + binding plan
+    /// -> SPIR-V -> pipeline) but returns the pipeline with its binding plan
+    /// embedded so the caller can cache it per (kernel,block) and re-dispatch
+    /// via [`run_pipeline_bound`] without recompiling. `block` is the workgroup
+    /// size (`tpg`), exactly as passed to `run_kernel`.
+    ///
+    /// [`run_pipeline_bound`]: VulkanDevice::run_pipeline_bound
+    pub fn compile_kernel(
+        &self,
+        kernel: &Kernel,
+        block: [u32; 3],
+    ) -> Result<VulkanPipeline, MetalTileError> {
+        let cg = GlslGenerator::new().with_local_size_3d(block);
+        let plan = cg.binding_plan(kernel).map_err(MetalTileError::Codegen)?;
+        let glsl = cg.generate(kernel).map_err(MetalTileError::Codegen)?;
+        let mut pipeline = self.compile(&glsl, &plan, &kernel.name)?;
+        pipeline.plan = plan;
+        Ok(pipeline)
+    }
+
+    /// Allocate `len` bytes of host-visible+coherent device memory and return
+    /// a lifetime-free handle the caller owns until it calls [`free_raw`].
+    /// Unlike [`alloc_storage`] (which borrows the device via `VulkanBuffer<'d>`
+    /// so it cannot outlive a single call), `VulkanRawBuffer` carries no borrow
+    /// and can live inside a `'static Arc` — the analogue of CUDA's raw
+    /// `CUdeviceptr` from `alloc_raw`. The caller MUST keep the `VulkanDevice`
+    /// alive while any raw buffer is live (the handles belong to its `VkDevice`).
+    ///
+    /// [`free_raw`]: VulkanDevice::free_raw
+    pub fn alloc_raw(&self, len: usize) -> Result<VulkanRawBuffer, MetalTileError> {
+        let size = (len.max(4)) as u64; // Vulkan rejects 0-byte allocs.
+        let bci = VkBufferCreateInfo {
+            sType: VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            pNext: ptr::null(),
+            flags: 0,
+            size,
+            usage: VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            sharingMode: VK_SHARING_MODE_EXCLUSIVE,
+            queueFamilyIndexCount: 0,
+            pQueueFamilyIndices: ptr::null(),
+        };
+        let mut buffer: VkBuffer_ = VK_NULL_HANDLE;
+        unsafe {
+            vk_check(
+                vkCreateBuffer(self.device, &bci, ptr::null(), &mut buffer),
+                "vkCreateBuffer(raw)",
+            )?;
+            let mut req = VkMemoryRequirements { size: 0, alignment: 0, memoryTypeBits: 0 };
+            vkGetBufferMemoryRequirements(self.device, buffer, &mut req);
+            let mem_type_index = self.find_memory_type(
+                req.memoryTypeBits,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            )?;
+            let ai = VkMemoryAllocateInfo {
+                sType: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                pNext: ptr::null(),
+                allocationSize: req.size,
+                memoryTypeIndex: mem_type_index,
+            };
+            let mut memory: VkDeviceMemory = VK_NULL_HANDLE;
+            vk_check(
+                vkAllocateMemory(self.device, &ai, ptr::null(), &mut memory),
+                "vkAllocateMemory(raw)",
+            )?;
+            vk_check(
+                vkBindBufferMemory(self.device, buffer, memory, 0),
+                "vkBindBufferMemory(raw)",
+            )?;
+            Ok(VulkanRawBuffer { buffer, memory, size })
+        }
+    }
+
+    /// Free a buffer returned by [`alloc_raw`]. Safe on a null/default handle.
+    pub fn free_raw(&self, buf: &VulkanRawBuffer) {
+        unsafe {
+            if buf.buffer != VK_NULL_HANDLE {
+                vkDestroyBuffer(self.device, buf.buffer, ptr::null());
+            }
+            if buf.memory != VK_NULL_HANDLE {
+                vkFreeMemory(self.device, buf.memory, ptr::null());
+            }
+        }
+    }
+
+    /// Copy host bytes into a resident raw buffer (host->device). Host-visible
+    /// coherent memory, so the map+memcpy is the whole transfer.
+    pub fn htod_raw(&self, buf: &VulkanRawBuffer, data: &[u8]) -> Result<(), MetalTileError> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        unsafe {
+            let mut p: *mut c_void = ptr::null_mut();
+            vk_check(
+                vkMapMemory(self.device, buf.memory, 0, VK_WHOLE_SIZE, 0, &mut p),
+                "vkMapMemory(htod_raw)",
+            )?;
+            let n = (buf.size as usize).min(data.len());
+            std::ptr::copy_nonoverlapping(data.as_ptr(), p as *mut u8, n);
+            vkUnmapMemory(self.device, buf.memory);
+        }
+        Ok(())
+    }
+
+    /// Copy a resident raw buffer back to host (device->host).
+    pub fn dtoh_raw(&self, buf: &VulkanRawBuffer, out: &mut [u8]) -> Result<(), MetalTileError> {
+        if out.is_empty() {
+            return Ok(());
+        }
+        unsafe {
+            let mut p: *mut c_void = ptr::null_mut();
+            vk_check(
+                vkMapMemory(self.device, buf.memory, 0, VK_WHOLE_SIZE, 0, &mut p),
+                "vkMapMemory(dtoh_raw)",
+            )?;
+            let n = (buf.size as usize).min(out.len());
+            std::ptr::copy_nonoverlapping(p as *const u8, out.as_mut_ptr(), n);
+            vkUnmapMemory(self.device, buf.memory);
+        }
+        Ok(())
+    }
+
+    /// Dispatch a PRE-COMPILED pipeline against PRE-UPLOADED resident buffers.
+    /// The CUDA-`launch` analogue: no codegen, no compile, no per-param H2D —
+    /// the caller has already done all of that once and cached the
+    /// [`VulkanPipeline`]. `bufs` are the storage buffers in `plan.bindings`
+    /// order (param data + any Strided `_shape`/`_strides` companions);
+    /// `push` is the fully-assembled push-constant payload (constexprs then
+    /// the synthetic `_n_elems`, exactly as `run_kernel` builds it).
+    ///
+    /// Synchronous: submits + `vkQueueWaitIdle`s before returning, so on
+    /// return the resident output buffers hold the results (a later
+    /// `dtoh_raw`, or binding them as the input of the next dispatch, sees
+    /// them). The descriptor pool is reset and the transient command buffer
+    /// freed per call so a long decode loop can't exhaust either.
+    pub fn run_pipeline_bound(
+        &self,
+        pipeline: &VulkanPipeline,
+        bufs: &[&VulkanRawBuffer],
+        push: &[u8],
+        grid: [u32; 3],
+    ) -> Result<(), MetalTileError> {
+        let plan = &pipeline.plan;
+        if bufs.len() != plan.bindings.len() {
+            return Err(MetalTileError::Dispatch(format!(
+                "run_pipeline_bound: {} buffers but plan has {} bindings",
+                bufs.len(),
+                plan.bindings.len()
+            )));
+        }
+
+        // Allocate + update a descriptor set pointing at the resident buffers.
+        let descriptor_set = unsafe {
+            let ai = VkDescriptorSetAllocateInfo {
+                sType: VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                pNext: ptr::null(),
+                descriptorPool: self.descriptor_pool,
+                descriptorSetCount: 1,
+                pSetLayouts: &pipeline.set_layout,
+            };
+            let mut ds: VkDescriptorSet = VK_NULL_HANDLE;
+            vk_check(
+                vkAllocateDescriptorSets(self.device, &ai, &mut ds),
+                "vkAllocateDescriptorSets(bound)",
+            )?;
+            ds
+        };
+        let buf_infos: Vec<VkDescriptorBufferInfo> = bufs
+            .iter()
+            .map(|b| VkDescriptorBufferInfo { buffer: b.buffer, offset: 0, range: b.size })
+            .collect();
+        let writes: Vec<VkWriteDescriptorSet> = plan
+            .bindings
+            .iter()
+            .enumerate()
+            .map(|(i, b)| VkWriteDescriptorSet {
+                sType: VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                pNext: ptr::null(),
+                dstSet: descriptor_set,
+                dstBinding: b.binding,
+                dstArrayElement: 0,
+                descriptorCount: 1,
+                descriptorType: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                pImageInfo: ptr::null(),
+                pBufferInfo: &buf_infos[i],
+                pTexelBufferView: ptr::null(),
+            })
+            .collect();
+        unsafe {
+            vkUpdateDescriptorSets(self.device, writes.len() as u32, writes.as_ptr(), 0, ptr::null());
+        }
+
+        // Record + submit the command buffer.
+        let cb = unsafe {
+            let cb_ai = VkCommandBufferAllocateInfo {
+                sType: VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                pNext: ptr::null(),
+                commandPool: self.command_pool,
+                level: VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                commandBufferCount: 1,
+            };
+            let mut cb: VkCommandBuffer = ptr::null_mut();
+            vk_check(
+                vkAllocateCommandBuffers(self.device, &cb_ai, &mut cb),
+                "vkAllocateCommandBuffers(bound)",
+            )?;
+            let begin = VkCommandBufferBeginInfo {
+                sType: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                pNext: ptr::null(),
+                flags: VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+                pInheritanceInfo: ptr::null(),
+            };
+            vk_check(vkBeginCommandBuffer(cb, &begin), "vkBeginCommandBuffer(bound)")?;
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
+            vkCmdBindDescriptorSets(
+                cb,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeline.layout,
+                0,
+                1,
+                &descriptor_set,
+                0,
+                ptr::null(),
+            );
+            if !push.is_empty() {
+                vkCmdPushConstants(
+                    cb,
+                    pipeline.layout,
+                    VK_SHADER_STAGE_COMPUTE_BIT,
+                    0,
+                    push.len() as u32,
+                    push.as_ptr() as *const c_void,
+                );
+            }
+            vkCmdDispatch(cb, grid[0], grid[1], grid[2]);
+            // Make this dispatch's writes visible to the next dispatch that
+            // binds the same resident buffer as an input (decode chains
+            // hundreds of these against persistent activations).
+            let barrier = VkMemoryBarrier {
+                sType: VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                pNext: ptr::null(),
+                srcAccessMask: VK_ACCESS_SHADER_WRITE_BIT,
+                dstAccessMask: VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+            };
+            vkCmdPipelineBarrier(
+                cb,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0,
+                1,
+                &barrier,
+                0,
+                ptr::null(),
+                0,
+                ptr::null(),
+            );
+            vk_check(vkEndCommandBuffer(cb), "vkEndCommandBuffer(bound)")?;
+            cb
+        };
+
+        unsafe {
+            let submit = VkSubmitInfo {
+                sType: VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                pNext: ptr::null(),
+                waitSemaphoreCount: 0,
+                pWaitSemaphores: ptr::null(),
+                pWaitDstStageMask: ptr::null(),
+                commandBufferCount: 1,
+                pCommandBuffers: &cb,
+                signalSemaphoreCount: 0,
+                pSignalSemaphores: ptr::null(),
+            };
+            vk_check(
+                vkQueueSubmit(self.queue, 1, &submit, VK_NULL_HANDLE),
+                "vkQueueSubmit(bound)",
+            )?;
+            vk_check(vkQueueWaitIdle(self.queue), "vkQueueWaitIdle(bound)")?;
+            // Reclaim the transient command buffer + descriptor set so a long
+            // decode loop (hundreds of dispatches/token) cannot leak handles
+            // or hit OUT_OF_POOL_MEMORY.
+            vkFreeCommandBuffers(self.device, self.command_pool, 1, &cb);
+            vkResetDescriptorPool(self.device, self.descriptor_pool, 0);
+        }
+        Ok(())
+    }
+
     pub fn name(&self) -> &str { "vulkan-device" }
 
     /// Physical handle (for future direct queries via `vkGetPhysicalDeviceProperties`).
