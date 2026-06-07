@@ -950,11 +950,27 @@ impl CudaDevice {
     pub fn upload(&self, data: &[u8]) -> Result<DeviceBuffer<'_>, MetalTileError> {
         let buf = self.alloc(data.len())?;
         if !data.is_empty() {
+            // Enqueue on self.stream (NOT the null stream). Kernels ride self.stream
+            // (CU_STREAM_NON_BLOCKING), which does NOT order against null-stream copies —
+            // so a null-stream HtoD lets the driver run a dependent kernel BEFORE the copy
+            // lands and silently DROP the kernel's 32-bit stores (the kernel no-ops; only
+            // visible when it sparse-writes a pre-seeded buffer, e.g. partial_rope). Observed
+            // on Pascal/WDDM; it is undefined cross-stream ordering on ANY arch (latent on
+            // GB10). Sync after to keep the `data` borrow valid until the copy completes.
             cu_check(
                 unsafe {
-                    cuMemcpyHtoD_v2(buf.ptr, data.as_ptr() as *const c_void, data.len())
+                    cuMemcpyHtoDAsync_v2(
+                        buf.ptr,
+                        data.as_ptr() as *const c_void,
+                        data.len(),
+                        self.stream,
+                    )
                 },
-                "cuMemcpyHtoD",
+                "cuMemcpyHtoDAsync(upload)",
+            )?;
+            cu_check(
+                unsafe { cuStreamSynchronize(self.stream) },
+                "cuStreamSynchronize(upload)",
             )?;
         }
         Ok(buf)
