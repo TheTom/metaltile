@@ -79,6 +79,13 @@ pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES: u32 = 49;
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES: u32 = 51;
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES: u32 = 53;
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR: u32 = 1000141000;
+/// `VkPhysicalDeviceCooperativeMatrixFeaturesKHR` — gates the
+/// `VK_KHR_cooperative_matrix` device feature (coopMatMulAdd fragment
+/// ops). Chained into device creation only when the gated coopmat GEMM
+/// path is active.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR: u32 = 1000506000;
+/// `VK_KHR_cooperative_matrix` device-extension name (NUL-terminated).
+pub const VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME: &[u8] = b"VK_KHR_cooperative_matrix\0";
 /// `VkPipelineShaderStageRequiredSubgroupSizeCreateInfo` — Vulkan 1.3
 /// core (promoted from VK_EXT_subgroup_size_control). Pinned to 32 in
 /// the compute pipeline so `subgroupAdd` etc. reduce within a 32-lane
@@ -317,6 +324,17 @@ pub struct VkPipelineShaderStageRequiredSubgroupSizeCreateInfo {
     pub sType: u32,
     pub pNext: *mut c_void,
     pub requiredSubgroupSize: u32,
+}
+
+/// `VkPhysicalDeviceCooperativeMatrixFeaturesKHR`. Chained into
+/// `vkCreateDevice` to enable `coopMatMulAdd`. `cooperativeMatrix` is the
+/// only bit we set; `cooperativeMatrixRobustBufferAccess` stays off.
+#[repr(C)]
+pub struct VkPhysicalDeviceCooperativeMatrixFeaturesKHR {
+    pub sType: u32,
+    pub pNext: *mut c_void,
+    pub cooperativeMatrix: VkBool32,
+    pub cooperativeMatrixRobustBufferAccess: VkBool32,
 }
 
 #[repr(C)]

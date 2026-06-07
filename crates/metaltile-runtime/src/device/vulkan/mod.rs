@@ -285,6 +285,13 @@ impl VulkanDevice {
             feat12.uniformAndStorageBuffer8BitAccess = VK_TRUE;
             feat12.storagePushConstant8 = VK_TRUE;
             feat12.scalarBlockLayout = VK_TRUE;
+            // Coopmat needs the Vulkan memory model (coopMatMulAdd is a
+            // memory-model op). Gated on MT_VK_COOPMAT; harmless otherwise.
+            let coopmat = std::env::var("MT_VK_COOPMAT").map(|v| v == "1").unwrap_or(false);
+            if coopmat {
+                feat12.vulkanMemoryModel = VK_TRUE;
+                feat12.vulkanMemoryModelDeviceScope = VK_TRUE;
+            }
             feat12.pNext = &mut feat13 as *mut _ as *mut c_void;
             let mut feat11: VkPhysicalDeviceVulkan11Features = std::mem::zeroed();
             feat11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
@@ -292,6 +299,25 @@ impl VulkanDevice {
             feat11.uniformAndStorageBuffer16BitAccess = VK_TRUE;
             feat11.storagePushConstant16 = VK_TRUE;
             feat11.pNext = &mut feat12 as *mut _ as *mut c_void;
+
+            // Gated VK_KHR_cooperative_matrix path (`MT_VK_COOPMAT=1`). The
+            // codegen emits coopMatLoad/MulAdd/Store for SimdGroup-scope
+            // CoopTile GEMMs on RDNA4 (16x16x16 fp16->fp32). coopMatMulAdd
+            // requires the Vulkan memory model + the cooperativeMatrix
+            // feature + the device extension. The subgroup size stays
+            // pinned at 32 (the kernels' staging math assumes 32-lane
+            // subgroups; on wave32 the 16x16 fragment spans 32 lanes).
+            let mut coop_feat: VkPhysicalDeviceCooperativeMatrixFeaturesKHR =
+                std::mem::zeroed();
+            let coop_ext_ptr =
+                VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME.as_ptr() as *const i8;
+            if coopmat {
+                coop_feat.sType =
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+                coop_feat.cooperativeMatrix = VK_TRUE;
+                coop_feat.pNext = feat11.pNext;
+                feat11.pNext = &mut coop_feat as *mut _ as *mut c_void;
+            }
             let dev_ci = VkDeviceCreateInfo {
                 sType: VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
                 pNext: &feat11 as *const _ as *const c_void,
@@ -300,8 +326,12 @@ impl VulkanDevice {
                 pQueueCreateInfos: &queue_ci,
                 enabledLayerCount: 0,
                 ppEnabledLayerNames: ptr::null(),
-                enabledExtensionCount: 0,
-                ppEnabledExtensionNames: ptr::null(),
+                enabledExtensionCount: if coopmat { 1 } else { 0 },
+                ppEnabledExtensionNames: if coopmat {
+                    &coop_ext_ptr
+                } else {
+                    ptr::null()
+                },
                 pEnabledFeatures: ptr::null(),
             };
             let mut device: VkDevice = ptr::null_mut();

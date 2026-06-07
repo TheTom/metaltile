@@ -253,7 +253,22 @@ impl TargetProfile {
             // bm64 / MPP family fits under desktop Vulkan's shared-mem
             // cap (32-48 KB typical, vs 80 KB the per-warp shared layout
             // needs).
-            mma: MmaStrategy::SoftwareLocalC,
+            // Gated coopmat path: `MT_VK_COOPMAT=1` flips the MMA
+            // strategy to real `VK_KHR_cooperative_matrix` fragment ops
+            // (16×16×16 fp16→fp32) for SimdGroup-scope CoopTile kernels
+            // on RDNA4. Default (unset) stays on the bit-exact
+            // SoftwareLocalC scalar path, so the corpus / Paris e2e are
+            // unchanged unless the lever is explicitly pulled. The
+            // SPIR-V emitter branches on `mma`; the runtime requests the
+            // cooperativeMatrix feature + Vulkan memory model (see
+            // `device/vulkan/mod.rs`). subgroupSize stays pinned at 32 —
+            // on RDNA4 wave32 the 16×16 coopmat fragment spans 32 lanes,
+            // and the CoopTile staging math assumes 32-lane subgroups.
+            mma: if std::env::var("MT_VK_COOPMAT").map(|v| v == "1").unwrap_or(false) {
+                MmaStrategy::VkCooperativeMatrix
+            } else {
+                MmaStrategy::SoftwareLocalC
+            },
             // The Vulkan path already uses linear-order `mt_subgroup_add`
             // unconditionally for f32 subgroup sums (see `spirv/mod.rs`).
             // This flag is here for completeness; the SPIR-V emitter

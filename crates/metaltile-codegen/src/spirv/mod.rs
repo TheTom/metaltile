@@ -129,6 +129,14 @@ impl GlslGenerator {
         self.local_size[0] * self.local_size[1] * self.local_size[2]
     }
 
+    /// True when the gated `VK_KHR_cooperative_matrix` codegen path is
+    /// active (set via `MT_VK_COOPMAT=1`, see `TargetProfile::vulkan`).
+    /// All coopmat-specific emission (extensions, fp16 staging tiles,
+    /// fragment MMA) branches on this.
+    fn coopmat_on(&self) -> bool {
+        matches!(self.profile.mma, crate::backend::MmaStrategy::VkCooperativeMatrix)
+    }
+
     fn vname(&self, vid: Option<ValueId>, block: &Block, ov: &Names) -> String {
         match vid {
             Some(v) => {
@@ -244,6 +252,16 @@ impl GlslGenerator {
         // device doesn't support it, we fall back to a software shim that
         // promotes bf16 through f32 (see `mt_bf16_to_f32` helpers).
         writeln!(out, "#extension GL_EXT_bfloat16 : enable").ok();
+        // Real cooperative-matrix path (gated by MmaStrategy::VkCooperativeMatrix
+        // via `MT_VK_COOPMAT=1`). Emits coopMatLoad/coopMatMulAdd/coopMatStore
+        // 16×16×16 fp16→fp32 fragment ops on RDNA4. Requires the Vulkan memory
+        // model + explicit fp16 storage; the runtime requests the matching
+        // device features and pins subgroupSize=64 for these kernels.
+        if self.coopmat_on() {
+            writeln!(out, "#extension GL_KHR_cooperative_matrix : require").ok();
+            writeln!(out, "#extension GL_KHR_memory_scope_semantics : require").ok();
+            writeln!(out, "#extension GL_EXT_control_flow_attributes : require").ok();
+        }
         // GLSL has no `INFINITY` macro (MSL / CUDA both do — and the IR
         // emits the literal directly for mask values like `-INFINITY`).
         // `1.0/0.0` is well-defined as `+inf` under IEEE-754 and is what
@@ -562,14 +580,19 @@ impl GlslGenerator {
                     let pw = matches!(exec_scope, CoopTileScope::SimdGroup);
                     let mul = if pw { n_warps } else { 1 };
                     let nm = ct_ident(name);
-                    writeln!(out, "shared float _CTA_{nm}[{}];", mul * m * k).ok();
-                    writeln!(out, "shared float _CTB_{nm}[{}];", mul * k * n).ok();
+                    // Coopmat staging tiles must be fp16 so `coopMatLoad`
+                    // can read them as `gl_MatrixUseA/B` fragments.
+                    let st_ty = if self.coopmat_on() { "float16_t" } else { "float" };
+                    writeln!(out, "shared {st_ty} _CTA_{nm}[{}];", mul * m * k).ok();
+                    writeln!(out, "shared {st_ty} _CTB_{nm}[{}];", mul * k * n).ok();
                     let cnm = ct_ident(&coop_c_name(name));
                     if seen_c.insert(cnm.clone()) {
                         // Skip the shared C entry for SimdGroup-scope
                         // SoftwareLocalC — the accumulator lives in
-                        // private memory instead.
-                        if !(local_c && pw) {
+                        // private memory instead. Coopmat keeps C in
+                        // subgroup-distributed registers (declared in
+                        // emit_body) so its shared slot is skipped too.
+                        if !((local_c || self.coopmat_on()) && pw) {
                             writeln!(
                                 out,
                                 "shared float _CTC_{cnm}[{}];",
@@ -665,6 +688,32 @@ impl GlslGenerator {
                         if seen_c.insert(cnm.clone()) {
                             let per_lane = (m * n).div_ceil(lw).max(1);
                             writeln!(out, "    float _CTC_lane_{cnm}[{per_lane}];").ok();
+                        }
+                    }
+                }
+            }
+        }
+        // Coopmat: declare the register-blocked fragment accumulator
+        // for each SimdGroup-scope CoopTile. `acc[MF][NF]` of
+        // `coopmat<float,Subgroup,16,16,Accumulator>` persists across the
+        // K-loop (CoopTileRun is called per kb step). One array per
+        // distinct C name (mirrors `_CTC_lane_*`).
+        if self.coopmat_on() {
+            let mut seen_c: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for blk in std::iter::once(&kernel.body).chain(kernel.blocks.values()) {
+                for op in &blk.ops {
+                    if let Op::CoopTileSetup { name, m, n, exec_scope, .. } = op
+                        && matches!(exec_scope, metaltile_core::ir::CoopTileScope::SimdGroup)
+                    {
+                        let cnm = ct_ident(&coop_c_name(name));
+                        if seen_c.insert(cnm.clone()) {
+                            let mf = (m / 16).max(1);
+                            let nf = (n / 16).max(1);
+                            writeln!(
+                                out,
+                                "    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> _CMAcc_{cnm}[{mf}][{nf}];"
+                            )
+                            .ok();
                         }
                     }
                 }
@@ -1420,6 +1469,15 @@ impl GlslGenerator {
                     Error::UnsupportedOp(format!("spirv: CoopTile `{name}` no Setup"))
                 })?;
                 let cnm = ct_ident(&coop_c_name(name));
+                if self.coopmat_on() && simd {
+                    // Zero the register-blocked coopmat fragment accumulator.
+                    let mf = (m / 16).max(1);
+                    let nf = (n / 16).max(1);
+                    writeln!(out, "{pad}[[unroll]] for (uint _mi = 0u; _mi < {mf}u; _mi++)").ok();
+                    writeln!(out, "{pad}[[unroll]] for (uint _ni = 0u; _ni < {nf}u; _ni++)").ok();
+                    writeln!(out, "{pad}    _CMAcc_{cnm}[_mi][_ni] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);").ok();
+                    return Ok(());
+                }
                 let local_c = matches!(
                     self.profile.mma,
                     crate::backend::MmaStrategy::SoftwareLocalC
@@ -1460,10 +1518,11 @@ impl GlslGenerator {
                 } else {
                     format!("(_e / {k}u) * {ei}u + (_e % {k}u)")
                 };
+                let cast = if self.coopmat_on() { "float16_t" } else { "float" };
                 writeln!(out, "{pad}barrier();").ok();
                 writeln!(
                     out,
-                    "{pad}for (uint _e = {sid}; _e < {}u; _e += {ssize}) _CTA_{nm}[{base} + _e] = float({arr}[uint({off}) + {src}]);",
+                    "{pad}for (uint _e = {sid}; _e < {}u; _e += {ssize}) _CTA_{nm}[{base} + _e] = {cast}({arr}[uint({off}) + {src}]);",
                     m * k
                 )
                 .ok();
@@ -1485,9 +1544,10 @@ impl GlslGenerator {
                 } else {
                     format!("(_e / {n}u) * {ei}u + (_e % {n}u)")
                 };
+                let cast = if self.coopmat_on() { "float16_t" } else { "float" };
                 writeln!(
                     out,
-                    "{pad}for (uint _e = {sid}; _e < {}u; _e += {ssize}) _CTB_{nm}[{base} + _e] = float({arr}[uint({off}) + {src}]);",
+                    "{pad}for (uint _e = {sid}; _e < {}u; _e += {ssize}) _CTB_{nm}[{base} + _e] = {cast}({arr}[uint({off}) + {src}]);",
                     k * n
                 )
                 .ok();
@@ -1499,6 +1559,35 @@ impl GlslGenerator {
                     })?;
                 let nm = ct_ident(name);
                 let cnm = ct_ident(&coop_c_name(name));
+                if self.coopmat_on() && simd {
+                    // Real VK_KHR_cooperative_matrix MMA. Decompose the
+                    // m×n×k SimdGroup tile into 16×16×16 fragments. A-tile
+                    // reuse: each subgroup loads `matA` once per (mi,kt)
+                    // K-step and reuses it across the NF matB column tiles
+                    // (the structure that hit ~70 TFLOP/s on RDNA4 vs the
+                    // naive one-tile-per-subgroup form). `acc[MF][NF]` is
+                    // the register-blocked accumulator declared in
+                    // emit_body and persists across the K-loop.
+                    let mf = (m / 16).max(1);
+                    let nf = (n / 16).max(1);
+                    let kf = (k / 16).max(1);
+                    let ba = coop_base_glsl(true, m * k);
+                    let bb = coop_base_glsl(true, k * n);
+                    writeln!(out, "{pad}barrier();").ok();
+                    writeln!(out, "{pad}[[unroll]] for (uint _kt = 0u; _kt < {kf}u; _kt++) {{").ok();
+                    writeln!(out, "{pad}    [[unroll]] for (uint _mi = 0u; _mi < {mf}u; _mi++) {{").ok();
+                    writeln!(out, "{pad}        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> _ca;").ok();
+                    writeln!(out, "{pad}        coopMatLoad(_ca, _CTA_{nm}, {ba} + (_mi * 16u) * {k}u + _kt * 16u, {k}u, gl_CooperativeMatrixLayoutRowMajor);").ok();
+                    writeln!(out, "{pad}        [[unroll]] for (uint _ni = 0u; _ni < {nf}u; _ni++) {{").ok();
+                    writeln!(out, "{pad}            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> _cb;").ok();
+                    writeln!(out, "{pad}            coopMatLoad(_cb, _CTB_{nm}, {bb} + (_kt * 16u) * {n}u + _ni * 16u, {n}u, gl_CooperativeMatrixLayoutRowMajor);").ok();
+                    writeln!(out, "{pad}            _CMAcc_{cnm}[_mi][_ni] = coopMatMulAdd(_ca, _cb, _CMAcc_{cnm}[_mi][_ni]);").ok();
+                    writeln!(out, "{pad}        }}").ok();
+                    writeln!(out, "{pad}    }}").ok();
+                    writeln!(out, "{pad}}}").ok();
+                    writeln!(out, "{pad}barrier();").ok();
+                    return Ok(());
+                }
                 let local_c = matches!(
                     self.profile.mma,
                     crate::backend::MmaStrategy::SoftwareLocalC
@@ -1561,6 +1650,17 @@ impl GlslGenerator {
                     .unwrap_or_else(|| "0".to_string());
                 let arr = safe_glsl_ident(ptr_name);
                 let dst = format!("(_e / {n}u) * {ei}u + (_e % {n}u)");
+                if self.coopmat_on() && simd {
+                    // coopMatStore each 16×16 fp32 fragment to the output
+                    // tile at row-major `(mi*16)*ei + ni*16`, stride ei.
+                    let mf = (m / 16).max(1);
+                    let nf = (n / 16).max(1);
+                    writeln!(out, "{pad}barrier();").ok();
+                    writeln!(out, "{pad}[[unroll]] for (uint _mi = 0u; _mi < {mf}u; _mi++)").ok();
+                    writeln!(out, "{pad}[[unroll]] for (uint _ni = 0u; _ni < {nf}u; _ni++)").ok();
+                    writeln!(out, "{pad}    coopMatStore(_CMAcc_{cnm}[_mi][_ni], {arr}, uint({off}) + (_mi * 16u) * {ei}u + _ni * 16u, {ei}u, gl_CooperativeMatrixLayoutRowMajor);").ok();
+                    return Ok(());
+                }
                 let local_c = matches!(
                     self.profile.mma,
                     crate::backend::MmaStrategy::SoftwareLocalC
