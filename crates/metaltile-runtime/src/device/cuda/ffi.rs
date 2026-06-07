@@ -234,6 +234,35 @@ unsafe extern "C" {
         compute_type: c_int,
         algo: c_int,
     ) -> cublasStatus_t;
+    /// Pointer-array batched GEMM — one call does `batch_count` independent
+    /// GEMMs that SHARE (m,n,k) but read A/B/C from arbitrary DEVICE pointer
+    /// arrays (Aarray/Barray/Carray live in DEVICE memory). Unlike the grouped
+    /// variant it does not scale poorly with batch count, and unlike the strided
+    /// variant the per-batch pointers need not advance by a uniform stride — so
+    /// one operand can BROADCAST (multiple batches point at the same slice).
+    #[allow(clippy::too_many_arguments)]
+    pub fn cublasGemmBatchedEx(
+        handle: cublasHandle_t,
+        transa: c_int,
+        transb: c_int,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        alpha: *const c_void,
+        aarray: *const *const c_void,
+        atype: c_int,
+        lda: c_int,
+        barray: *const *const c_void,
+        btype: c_int,
+        ldb: c_int,
+        beta: *const c_void,
+        carray: *const *mut c_void,
+        ctype: c_int,
+        ldc: c_int,
+        batch_count: c_int,
+        compute_type: c_int,
+        algo: c_int,
+    ) -> cublasStatus_t;
     /// Grouped-batched GEMM (CUDA 13+): one call over  independent
     /// GEMM groups, each with its own m/n/k and pointer arrays. Ideal for MoE
     /// prefill: each group is one active expert, eliminating the per-expert loop.

@@ -766,7 +766,11 @@ impl CudaDevice {
         // guarantees it's fully consumed before this Vec drops (correctness over the
         // marginal async win for a ≤few-KB pointer array). cuBLAS reads a_dev/b_dev/
         // c_dev during the enqueued GEMM; the copy is complete before we enqueue.
-        cu_check(unsafe { cuMemcpyHtoD_v2(a_dev, all_bytes.as_ptr() as *const c_void, triple_bytes) }, "cuMemcpyHtoD(grouped_ptrs)")?;
+        // H2D on self.stream (NOT null stream): orders this pooled-buffer write
+        // after any prior GEMM's stream read of a recycled copy (see the same
+        // fix + rationale in gemm_cublas_batched). Pageable src ⇒ host-sync copy,
+        // so `staging` stays valid through the call.
+        cu_check(unsafe { cuMemcpyHtoDAsync_v2(a_dev, all_bytes.as_ptr() as *const c_void, triple_bytes, self.stream) }, "cuMemcpyHtoDAsync(grouped_ptrs)")?;
 
         let st = unsafe {
             cublasGemmGroupedBatchedEx(
@@ -801,6 +805,85 @@ impl CudaDevice {
         if st != CUBLAS_STATUS_SUCCESS {
             return Err(MetalTileError::Dispatch(format!(
                 "cublasGemmGroupedBatchedEx failed: status {st} (groups={group_count} n={n} k={k})"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Pointer-array batched GEMM: `batch_count` independent GEMMs sharing
+    /// (m,n,k), reading A/B/C from per-batch DEVICE pointers. Row-major
+    /// `C_i[m,n] = X_i[m,k] · W_i[n,k]^T` (same contract/transpose as
+    /// `gemm_cublas_strided_batched`, col-major transa=T/transb=N reorder).
+    /// Unlike strided, each operand's per-batch pointer is arbitrary, so one
+    /// operand can BROADCAST (multiple batches reuse the same slice) — the SSD
+    /// per-group B/C fan-out. `x_ptrs`/`w_ptrs`/`out_ptrs` are device pointers
+    /// (one per batch). Scales fine with large batch_count (unlike grouped).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_cublas_batched(
+        &self,
+        x_ptrs: &[u64],   // [batch] device ptr per X (rows operand)
+        w_ptrs: &[u64],   // [batch] device ptr per W (weight operand)
+        out_ptrs: &[u64], // [batch] device ptr per Out
+        m: usize, n: usize, k: usize,
+        dtype: metaltile_core::DType,
+    ) -> Result<(), MetalTileError> {
+        let batch_count = x_ptrs.len();
+        assert_eq!(w_ptrs.len(), batch_count);
+        assert_eq!(out_ptrs.len(), batch_count);
+        if batch_count == 0 { return Ok(()); }
+        let h = self.cublas_handle()?;
+        let cdt = match dtype {
+            metaltile_core::DType::F16 => CUDA_R_16F,
+            metaltile_core::DType::BF16 => CUDA_R_16BF,
+            other => return Err(MetalTileError::Dispatch(format!("gemm_cublas_batched: unsupported dtype {other:?}"))),
+        };
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        // Col-major transpose reorder (same as gemm_cublas_strided_batched):
+        // out_cm[n,m] = A(=W, transa=T, lda=k) · B(=X, transb=N, ldb=k); ldc=n.
+        // cublasGemmBatchedEx requires Aarray/Barray/Carray to be DEVICE arrays
+        // of device pointers — pack [A(W)|B(X)|C(Out)] into ONE host staging Vec,
+        // one H2D into ONE pooled device buffer (same recipe as the grouped path).
+        let ptr_bytes = batch_count * 8;
+        let triple_bytes = ptr_bytes * 3;
+        let mut staging: Vec<u64> = Vec::with_capacity(batch_count * 3);
+        staging.extend_from_slice(w_ptrs);   // A = W
+        staging.extend_from_slice(x_ptrs);   // B = X
+        staging.extend_from_slice(out_ptrs); // C = Out
+        let base = self.alloc_raw(triple_bytes)?;
+        let a_dev: CUdeviceptr = base;
+        let b_dev: CUdeviceptr = base + ptr_bytes as CUdeviceptr;
+        let c_dev: CUdeviceptr = base + (2 * ptr_bytes) as CUdeviceptr;
+        let all_bytes = unsafe { std::slice::from_raw_parts(staging.as_ptr() as *const u8, triple_bytes) };
+        // H2D on self.stream (NOT the null stream): the pooled ptr-array buffer is
+        // recycled across calls, and the PRIOR batched/grouped GEMM reading its
+        // copy of the array runs on self.stream. A synchronous null-stream copy
+        // here does NOT order against that pending stream read → it can overwrite
+        // the array before the prior GEMM consumes it (observed: only the last
+        // chunk of a 4-chunk SSD scan corrupted). Issuing the copy on self.stream
+        // makes stream order serialize prior-read → this-write. (Pageable src ⇒
+        // the async copy is host-synchronous, so `staging` stays valid.)
+        cu_check(unsafe { cuMemcpyHtoDAsync_v2(a_dev, all_bytes.as_ptr() as *const c_void, triple_bytes, self.stream) }, "cuMemcpyHtoDAsync(batched_ptrs)")?;
+        let st = unsafe {
+            cublasGemmBatchedEx(
+                h,
+                CUBLAS_OP_T,
+                CUBLAS_OP_N,
+                n as c_int, m as c_int, k as c_int,
+                &alpha as *const f32 as *const c_void,
+                a_dev as *const *const c_void, cdt, k as c_int,
+                b_dev as *const *const c_void, cdt, k as c_int,
+                &beta as *const f32 as *const c_void,
+                c_dev as *const *mut c_void, cdt, n as c_int,
+                batch_count as c_int,
+                CUBLAS_COMPUTE_32F,
+                Self::gemm_algo(),
+            )
+        };
+        self.free_raw_pooled(base, triple_bytes);
+        if st != CUBLAS_STATUS_SUCCESS {
+            return Err(MetalTileError::Dispatch(format!(
+                "cublasGemmBatchedEx failed: status {st} (m={m} n={n} k={k} batch={batch_count})"
             )));
         }
         Ok(())
