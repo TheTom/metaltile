@@ -1028,12 +1028,21 @@ impl CudaDevice {
             return Ok(());
         }
         let len = bytes.len();
-        // Large (one-time weight) uploads stay synchronous — pinning them would
-        // balloon host pinned memory. Only small per-token activations go async.
+        // Large uploads skip the pinned staging path (pinning them would balloon
+        // host pinned memory), but MUST still be enqueued on `self.stream` — NOT
+        // the null stream. `self.stream` is CU_STREAM_NON_BLOCKING, so a null-
+        // stream `cuMemcpyHtoD_v2` does NOT order against the kernels riding
+        // `self.stream`: a later kernel that reads this buffer (or this very copy
+        // landing in a pool-recycled buffer mid-GEMM) races the unordered copy →
+        // run-to-run nondeterminism. `cuMemcpyHtoDAsync_v2` from pageable host
+        // memory is still host-synchronous (CUDA falls back to a blocking copy,
+        // so no pinning needed) but is correctly stream-ordered. Fixes the MoE
+        // prefill FEWER_SYNCS logit jitter (per-expert >256KB activation uploads
+        // interleaved with the on-stream expert GEMMs).
         if len > 262_144 {
             return cu_check(
-                unsafe { cuMemcpyHtoD_v2(ptr, bytes.as_ptr() as *const c_void, len) },
-                "cuMemcpyHtoD",
+                unsafe { cuMemcpyHtoDAsync_v2(ptr, bytes.as_ptr() as *const c_void, len, self.stream) },
+                "cuMemcpyHtoDAsync(large)",
             );
         }
         let pinned = self
