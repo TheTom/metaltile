@@ -363,6 +363,8 @@ pub mod kernel_tests {
             ("ssd_bdt", { let mut k = super::ssd_bdt::kernel_ir_for(); k.mode = KernelMode::Grid3D; k }),
             ("ssd_recur", { let mut k = super::ssd_recur::kernel_ir_for(); k.mode = KernelMode::Grid3D; k }),
             ("ssd_combine", { let mut k = super::ssd_combine::kernel_ir_for(); k.mode = KernelMode::Grid3D; k }),
+            ("ssd_g1_cb", { let mut k = super::ssd_g1_cb::kernel_ir_for(); k.mode = KernelMode::Reduction; k }),
+            ("ssd_g4_cs", { let mut k = super::ssd_g4_cs::kernel_ir_for(); k.mode = KernelMode::Reduction; k }),
         ];
         let msl = MslGenerator::new(MslConfig::default());
         let cuda = CudaGenerator::new();
@@ -1278,6 +1280,167 @@ pub fn ssd_combine(
             let ci = load(cs[e]) * decay;
             let xv = load(x[(t * n_heads + h) * dh + p]);
             store(y[(t * n_heads + h) * dh + p], yi + ci + xv * load(d_skip[h]));
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// SSD fused gather-GEMMs — kill the 8× gather_bc materialization.
+//
+// The portable SSD scan used to materialize b_g / c_g `[nc*H, L, ds]` (B,C
+// broadcast across the 8 heads-per-group) just to feed the G1 (CB = C·Bᵀ) and
+// G4 (CS = C·Sᵀ) batched GEMMs. That's an 8× redundant HBM write+read (head h
+// reads group h/hpg) and was the single largest elementwise cost in the scan
+// (~70% of the `pre` bucket). These two GEMMs read B / C straight from their
+// `[T, G, ds]` source with the broadcast folded into the tile-load index
+// arithmetic — no `[nc*H, L, ds]` scratch, no 8× traffic.
+//
+// Same 32×32 / 16-K Reduction-mode tiling as `ffai_gemm_batched`; the batch
+// index `bz = c*H + h` rides `tgid_z`, and the group `g = h/hpg` selects the
+// B/C slice. Tail rows (t = c*L + row ≥ T) clamp-load 0 (zero-padded chunk).
+// Portable (codegens MSL/CUDA/HIP/SPIR-V — pure index math, no raw intrinsics).
+// ══════════════════════════════════════════════════════════════════════════
+
+// G1 fused: CB[i,j] = Σ_s C[t_i,g,s] · B[t_j,g,s], then the mmask epilogue
+//   M[i,j] = CB[i,j] · exp(Lcs[bh,i] - Lcs[bh,j]) · dt[t_j,h], causal (i≥j).
+// → writes M [nc*H, L, L] directly. Fuses the separate `ssd_mmask` [L,L]
+// HBM round-trip (read CB, write M) into the GEMM epilogue: the `cb` scratch
+// is gone and the decay-mask multiply rides on the GEMM store.
+//   weight role = B (col j → t_j), input role = C (row i → t_i), k = ds.
+// Reads B,C directly from [T, G, ds]; equivalent to ffai_gemm_batched on
+// (b_g, c_g) but without ever materializing them or CB.
+#[kernel]
+pub fn ssd_g1_cb(
+    b_mat: Tensor<f32>,    // [T, G, ds]   (weight role)
+    c_mat: Tensor<f32>,    // [T, G, ds]   (input role)
+    lcs: Tensor<f32>,      // [nc*H, L]
+    dt: Tensor<f32>,       // [T, H]
+    mut out: Tensor<f32>,  // [nc*H, L, L]  (M = CB ⊙ decay-mask)
+    #[constexpr] t_total: u32,
+    #[constexpr] n_heads: u32,
+    #[constexpr] n_groups: u32,
+    #[constexpr] hpg: u32,
+    #[constexpr] l: u32,
+    #[constexpr] ds: u32,
+) {
+    let bz = program_id::<2>();          // batch = c*H + h
+    let c = bz / n_heads;
+    let h = bz - c * n_heads;
+    let g = h / hpg;
+    let tid = simd_id * 32u32 + simd_lane;
+    let lr = tid / 32u32; // output row within tile (i, 0..31)
+    let lo = tid % 32u32; // output col within tile (j, 0..31)
+    threadgroup_alloc("g1cb_b", 512);
+    threadgroup_alloc("g1cb_c", 512);
+    let mut acc = 0.0f32;
+    for k0 in range(0u32, ds, 16u32) {
+        if tid < 512u32 {
+            // B tile: col j = tgid_x*32 + s/16, state k = k0 + s%16.
+            let s = tid;
+            let j = tgid_x * 32u32 + s / 16u32;
+            let tj = c * l + j;
+            let valid = (j < l) & (tj < t_total);
+            let tj_safe = select(valid, tj, 0u32);
+            let kk = k0 + s - (s / 16u32) * 16u32;
+            let bv = select(valid, load(b_mat[(tj_safe * n_groups + g) * ds + kk]), 0.0f32);
+            threadgroup_store("g1cb_b", s, bv);
+        }
+        if tid >= 512u32 {
+            // C tile: row i = tgid_y*32 + s/16, state k = k0 + s%16.
+            let s = tid - 512u32;
+            let i = tgid_y * 32u32 + s / 16u32;
+            let ti = c * l + i;
+            let valid = (i < l) & (ti < t_total);
+            let ti_safe = select(valid, ti, 0u32);
+            let kk = k0 + s - (s / 16u32) * 16u32;
+            let cv = select(valid, load(c_mat[(ti_safe * n_groups + g) * ds + kk]), 0.0f32);
+            threadgroup_store("g1cb_c", s, cv);
+        }
+        threadgroup_barrier();
+        for k in range(0u32, 16u32, 1u32) {
+            let bb = threadgroup_load("g1cb_b", lo * 16u32 + k);
+            let cc = threadgroup_load("g1cb_c", lr * 16u32 + k);
+            acc = acc + bb * cc;
+        }
+        threadgroup_barrier();
+    }
+    let i = tgid_y * 32u32 + lr;
+    let j = tgid_x * 32u32 + lo;
+    if i < l {
+        if j < l {
+            // mmask epilogue: causal (i<j → 0) · decay · dt[t_j, h].
+            // `select` (not if/else) keeps it in the codegen-portable subset.
+            let tj = c * l + j;
+            let dtj = select(tj < t_total, load(dt[tj * n_heads + h]), 0.0f32);
+            let decay = exp(load(lcs[bz * l + i]) - load(lcs[bz * l + j]));
+            let m = select(i < j, 0.0f32, acc * decay * dtj);
+            store(out[(bz * l + i) * l + j], m);
+        }
+    }
+}
+
+// G4 fused: CS[i,p] = Σ_s C[t_i,g,s] · SinT[bz,p,s]   →  [nc*H, L, dh].
+//   weight role = sin_t[bz] [dh, ds] (col p), input role = C (row i → t_i),
+//   k = ds. sin_t is already per-batch [nc*H, dh, ds]; only C is broadcast.
+#[kernel]
+pub fn ssd_g4_cs(
+    sin_t: Tensor<f32>,    // [nc*H, dh, ds]   (weight role, per-batch)
+    c_mat: Tensor<f32>,    // [T, G, ds]       (input role, broadcast)
+    mut out: Tensor<f32>,  // [nc*H, L, dh]
+    #[constexpr] t_total: u32,
+    #[constexpr] n_heads: u32,
+    #[constexpr] n_groups: u32,
+    #[constexpr] hpg: u32,
+    #[constexpr] l: u32,
+    #[constexpr] ds: u32,
+    #[constexpr] dh: u32,
+) {
+    let bz = program_id::<2>();          // batch = c*H + h
+    let c = bz / n_heads;
+    let h = bz - c * n_heads;
+    let g = h / hpg;
+    let w_base = bz * dh * ds;           // sin_t[bz] base
+    let tid = simd_id * 32u32 + simd_lane;
+    let lr = tid / 32u32; // output row within tile (i, 0..31)
+    let lo = tid % 32u32; // output col within tile (p, 0..31)
+    threadgroup_alloc("g4cs_w", 512);
+    threadgroup_alloc("g4cs_c", 512);
+    let mut acc = 0.0f32;
+    for k0 in range(0u32, ds, 16u32) {
+        if tid < 512u32 {
+            // sin_t tile: col p = tgid_x*32 + s/16, state k = k0 + s%16.
+            let s = tid;
+            let p = tgid_x * 32u32 + s / 16u32;
+            let valid = p < dh;
+            let p_safe = select(valid, p, 0u32);
+            let kk = k0 + s - (s / 16u32) * 16u32;
+            let wv = select(valid, load(sin_t[w_base + p_safe * ds + kk]), 0.0f32);
+            threadgroup_store("g4cs_w", s, wv);
+        }
+        if tid >= 512u32 {
+            // C tile: row i = tgid_y*32 + s/16, state k = k0 + s%16.
+            let s = tid - 512u32;
+            let i = tgid_y * 32u32 + s / 16u32;
+            let ti = c * l + i;
+            let valid = (i < l) & (ti < t_total);
+            let ti_safe = select(valid, ti, 0u32);
+            let kk = k0 + s - (s / 16u32) * 16u32;
+            let cv = select(valid, load(c_mat[(ti_safe * n_groups + g) * ds + kk]), 0.0f32);
+            threadgroup_store("g4cs_c", s, cv);
+        }
+        threadgroup_barrier();
+        for k in range(0u32, 16u32, 1u32) {
+            let ww = threadgroup_load("g4cs_w", lo * 16u32 + k);
+            let cc = threadgroup_load("g4cs_c", lr * 16u32 + k);
+            acc = acc + ww * cc;
+        }
+        threadgroup_barrier();
+    }
+    let i = tgid_y * 32u32 + lr;
+    let p = tgid_x * 32u32 + lo;
+    if i < l {
+        if p < dh {
+            store(out[(bz * l + i) * dh + p], acc);
         }
     }
 }
