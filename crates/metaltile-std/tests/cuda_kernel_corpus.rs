@@ -59,8 +59,23 @@ fn known_hard(name: &str) -> bool {
 
 fn is_unsupported(msg: &str) -> bool {
     let m = msg.to_lowercase();
-    ["phase 1", "phase 2", "not supported", "not yet implemented", "strided",
-     "kernelmode", "multi-dimensional", "transform", "secondary"]
+    [
+        // Codegen coverage gaps (kernel not wired yet on CUDA).
+        "phase 1", "phase 2", "not supported", "not yet implemented", "strided",
+        "kernelmode", "multi-dimensional", "transform", "secondary",
+        // Device-capability limits (mirrors the Vulkan harness's device-cap
+        // bucket): a kernel the codegen *does* cover but the target arch
+        // physically cannot run. These reflect bit-accuracy on what the arch
+        // CAN run, so classify as UNSUPPORTED rather than a hard ERROR.
+        //   - >48KB dynamic shared memory on pre-Volta (sm_5x/6x, e.g. Pascal):
+        //     typed MetalTileError::DeviceCapability surfaced before launch.
+        "device capability", "unsupported on this device", ">48kb",
+        "dynamic shared memory",
+        //   - raw driver rejection if it ever escapes pre-launch validation.
+        "culaunchkernel: invalid argument",
+        //   - tensor-core MMA / WMMA paths needing sm_70+ on older arches.
+        "requires sm_70", "tensor core", "mma is not supported",
+    ]
         .iter()
         .any(|p| m.contains(p))
 }

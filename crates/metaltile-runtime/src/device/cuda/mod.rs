@@ -66,6 +66,35 @@ fn cu_check(res: CUresult, what: &str) -> Result<(), MetalTileError> {
     Err(MetalTileError::Dispatch(format!("{what}: {msg}")))
 }
 
+/// Opt a function into a >48KB dynamic-shared-memory launch.
+///
+/// On Volta+ (sm_70+) `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)`
+/// raises the per-block dynamic-smem cap toward the device max. On pre-Volta
+/// (sm_5x/6x, e.g. GTX 10-series Pascal) the cap is a hard 48KB and this
+/// opt-in is rejected — historically that rejection was ignored and the
+/// subsequent `cuLaunchKernel` surfaced a cryptic `invalid argument`. We now
+/// check the return and fail *before* launch with a clear, typed reason.
+fn ensure_dynamic_smem(func: CUfunction, shared_bytes: u32) -> Result<(), MetalTileError> {
+    if shared_bytes == 0 {
+        return Ok(());
+    }
+    let res = unsafe {
+        cuFuncSetAttribute(
+            func,
+            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            shared_bytes as c_int,
+        )
+    };
+    if res == CUDA_SUCCESS {
+        return Ok(());
+    }
+    // Pre-Volta hard cap: dynamic shared memory cannot exceed 48KB and the
+    // opt-in is unavailable, so this kernel cannot run on this arch.
+    Err(MetalTileError::DeviceCapability(format!(
+        "unsupported on this device: kernel needs {shared_bytes} bytes (>48KB) of dynamic shared memory, but this GPU architecture caps dynamic shared memory at 48KB (cuFuncSetAttribute opt-in rejected, code {res})"
+    )))
+}
+
 fn nvrtc_check(res: nvrtcResult, what: &str) -> Result<(), MetalTileError> {
     if res == NVRTC_SUCCESS {
         return Ok(());
@@ -1117,17 +1146,10 @@ impl CudaDevice {
         shared_bytes: u32,
         args: &mut [*mut c_void],
     ) -> Result<(), MetalTileError> {
-        if shared_bytes > 0 {
-            // Opt into the requested dynamic shared size (no-op effect if it
-            // is below the default cap; required above 48KB).
-            unsafe {
-                cuFuncSetAttribute(
-                    func.func,
-                    CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                    shared_bytes as c_int,
-                )
-            };
-        }
+        // Opt into the requested dynamic shared size (no-op below the default
+        // cap, required above 48KB). Fails *before* launch on archs that cap
+        // dynamic smem at 48KB (pre-Volta) instead of a cryptic launch error.
+        ensure_dynamic_smem(func.func, shared_bytes)?;
         cu_check(
             unsafe {
                 cuLaunchKernel(
@@ -1158,11 +1180,7 @@ impl CudaDevice {
         shared_bytes: u32,
         args: &mut [*mut c_void],
     ) -> Result<(), MetalTileError> {
-        if shared_bytes > 0 {
-            unsafe {
-                cuFuncSetAttribute(func.func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shared_bytes as c_int)
-            };
-        }
+        ensure_dynamic_smem(func.func, shared_bytes)?;
         cu_check(
             unsafe {
                 cuLaunchKernel(
@@ -1192,11 +1210,7 @@ impl CudaDevice {
         shared_bytes: u32,
         args: &mut [*mut c_void],
     ) -> Result<(), MetalTileError> {
-        if shared_bytes > 0 {
-            unsafe {
-                cuFuncSetAttribute(func.func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shared_bytes as c_int)
-            };
-        }
+        ensure_dynamic_smem(func.func, shared_bytes)?;
         cu_check(
             unsafe {
                 cuLaunchCooperativeKernel(
@@ -1429,15 +1443,7 @@ impl CudaDevice {
         let mut timed = || -> Result<Vec<f64>, MetalTileError> {
             let mut samples = Vec::with_capacity(iters as usize);
             for _ in 0..iters {
-                if prep.shared_bytes > 0 {
-                    unsafe {
-                        cuFuncSetAttribute(
-                            prep.func.func,
-                            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                            prep.shared_bytes as c_int,
-                        )
-                    };
-                }
+                ensure_dynamic_smem(prep.func.func, prep.shared_bytes)?;
                 cu_check(unsafe { cuEventRecord(start, ptr::null_mut()) }, "cuEventRecord(start)")?;
                 cu_check(
                     unsafe {
