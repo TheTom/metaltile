@@ -144,6 +144,17 @@ pub struct VulkanPipeline {
 unsafe impl Send for VulkanPipeline {}
 unsafe impl Sync for VulkanPipeline {}
 
+/// One queued dispatch in a batch: the cached pipeline, the resident buffers
+/// to bind (plan order), the push-constant bytes, and the grid. Borrows the
+/// pipeline; the buffers are `Copy` handles. Consumed by
+/// [`VulkanDevice::run_pipeline_batch`].
+pub struct BatchDispatch<'a> {
+    pub pipeline: &'a VulkanPipeline,
+    pub bufs: Vec<VulkanRawBuffer>,
+    pub push: Vec<u8>,
+    pub grid: [u32; 3],
+}
+
 /// Top-level Vulkan compute device. Holds the instance, physical device,
 /// logical device, compute queue, descriptor pool, and command pool.
 pub struct VulkanDevice {
@@ -315,18 +326,22 @@ impl VulkanDevice {
             let mut mem_props: VkPhysicalDeviceMemoryProperties = std::mem::zeroed();
             vkGetPhysicalDeviceMemoryProperties(physical_device, &mut mem_props);
 
-            // Descriptor pool: 64 sets × 8 storage buffers each — generous
-            // for Phase-1 smoke; real workloads will recycle into a pool
-            // sized from the worst-case kernel.
+            // Descriptor pool sized so a full transformer layer's dispatches
+            // (~15-25, each its own descriptor set) batch into ONE command
+            // buffer before a single submit+wait. `run_pipeline_batch` resets
+            // the pool after each batch, so this is the per-batch high-water
+            // mark, not a global limit. 1024 sets × 16 SSBOs covers any single
+            // layer (and the per-op `run_pipeline_bound` path, which resets
+            // after each dispatch, never approaches it).
             let pool_sizes = [VkDescriptorPoolSize {
                 typ: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                descriptorCount: 64 * 8,
+                descriptorCount: 1024 * 16,
             }];
             let pool_ci = VkDescriptorPoolCreateInfo {
                 sType: VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
                 pNext: ptr::null(),
                 flags: 0,
-                maxSets: 64,
+                maxSets: 1024,
                 poolSizeCount: 1,
                 pPoolSizes: pool_sizes.as_ptr(),
             };
@@ -971,6 +986,129 @@ impl VulkanDevice {
         Ok(())
     }
 
+    /// Allocate a **DEVICE_LOCAL** resident buffer and stage `data` into it via a
+    /// temporary host-visible staging buffer + `vkCmdCopyBuffer`. Unlike
+    /// [`alloc_raw`] (which picks HOST_VISIBLE|HOST_COHERENT memory — system RAM
+    /// / a slow PCIe-mapped window on a discrete GPU, ~12 GB/s for shader reads),
+    /// this puts the bytes in the fast on-card VRAM heap (~hundreds of GB/s), so
+    /// a resident weight read in a decode GEMV runs at device bandwidth instead
+    /// of host bandwidth. Upload is one-time (staged); reads are device-local.
+    /// The returned handle is freed with [`free_raw`] exactly like `alloc_raw`.
+    pub fn alloc_raw_device_local(
+        &self,
+        data: &[u8],
+    ) -> Result<VulkanRawBuffer, MetalTileError> {
+        let size = (data.len().max(4)) as u64;
+        let make_buffer = |usage: u32, props: u32| -> Result<(VkBuffer_, VkDeviceMemory), MetalTileError> {
+            let bci = VkBufferCreateInfo {
+                sType: VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                pNext: ptr::null(),
+                flags: 0,
+                size,
+                usage,
+                sharingMode: VK_SHARING_MODE_EXCLUSIVE,
+                queueFamilyIndexCount: 0,
+                pQueueFamilyIndices: ptr::null(),
+            };
+            unsafe {
+                let mut buffer: VkBuffer_ = VK_NULL_HANDLE;
+                vk_check(
+                    vkCreateBuffer(self.device, &bci, ptr::null(), &mut buffer),
+                    "vkCreateBuffer(devlocal)",
+                )?;
+                let mut req = VkMemoryRequirements { size: 0, alignment: 0, memoryTypeBits: 0 };
+                vkGetBufferMemoryRequirements(self.device, buffer, &mut req);
+                let mti = self.find_memory_type(req.memoryTypeBits, props)?;
+                let ai = VkMemoryAllocateInfo {
+                    sType: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                    pNext: ptr::null(),
+                    allocationSize: req.size,
+                    memoryTypeIndex: mti,
+                };
+                let mut memory: VkDeviceMemory = VK_NULL_HANDLE;
+                vk_check(
+                    vkAllocateMemory(self.device, &ai, ptr::null(), &mut memory),
+                    "vkAllocateMemory(devlocal)",
+                )?;
+                vk_check(
+                    vkBindBufferMemory(self.device, buffer, memory, 0),
+                    "vkBindBufferMemory(devlocal)",
+                )?;
+                Ok((buffer, memory))
+            }
+        };
+
+        // Device-local destination (shader reads it fast).
+        let (dst_buf, dst_mem) = make_buffer(
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        )?;
+        if data.is_empty() {
+            return Ok(VulkanRawBuffer { buffer: dst_buf, memory: dst_mem, size });
+        }
+
+        // Host-visible staging source (one-time map+memcpy).
+        let (stg_buf, stg_mem) = make_buffer(
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        )?;
+        unsafe {
+            let mut p: *mut c_void = ptr::null_mut();
+            vk_check(
+                vkMapMemory(self.device, stg_mem, 0, VK_WHOLE_SIZE, 0, &mut p),
+                "vkMapMemory(staging)",
+            )?;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), p as *mut u8, data.len());
+            vkUnmapMemory(self.device, stg_mem);
+
+            // Record + submit a one-shot copy.
+            let cb_ai = VkCommandBufferAllocateInfo {
+                sType: VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                pNext: ptr::null(),
+                commandPool: self.command_pool,
+                level: VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                commandBufferCount: 1,
+            };
+            let mut cb: VkCommandBuffer = ptr::null_mut();
+            vk_check(
+                vkAllocateCommandBuffers(self.device, &cb_ai, &mut cb),
+                "vkAllocateCommandBuffers(staging)",
+            )?;
+            let begin = VkCommandBufferBeginInfo {
+                sType: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                pNext: ptr::null(),
+                flags: VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+                pInheritanceInfo: ptr::null(),
+            };
+            vk_check(vkBeginCommandBuffer(cb, &begin), "vkBeginCommandBuffer(staging)")?;
+            let region = VkBufferCopy { srcOffset: 0, dstOffset: 0, size };
+            vkCmdCopyBuffer(cb, stg_buf, dst_buf, 1, &region);
+            vk_check(vkEndCommandBuffer(cb), "vkEndCommandBuffer(staging)")?;
+            let submit = VkSubmitInfo {
+                sType: VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                pNext: ptr::null(),
+                waitSemaphoreCount: 0,
+                pWaitSemaphores: ptr::null(),
+                pWaitDstStageMask: ptr::null(),
+                commandBufferCount: 1,
+                pCommandBuffers: &cb,
+                signalSemaphoreCount: 0,
+                pSignalSemaphores: ptr::null(),
+            };
+            vk_check(
+                vkQueueSubmit(self.queue, 1, &submit, VK_NULL_HANDLE),
+                "vkQueueSubmit(staging)",
+            )?;
+            vk_check(vkQueueWaitIdle(self.queue), "vkQueueWaitIdle(staging)")?;
+            vkFreeCommandBuffers(self.device, self.command_pool, 1, &cb);
+            vkDestroyBuffer(self.device, stg_buf, ptr::null());
+            vkFreeMemory(self.device, stg_mem, ptr::null());
+        }
+        Ok(VulkanRawBuffer { buffer: dst_buf, memory: dst_mem, size })
+    }
+
     /// Copy a resident raw buffer back to host (device->host).
     pub fn dtoh_raw(&self, buf: &VulkanRawBuffer, out: &mut [u8]) -> Result<(), MetalTileError> {
         if out.is_empty() {
@@ -1153,6 +1291,186 @@ impl VulkanDevice {
         Ok(())
     }
 
+    /// Record many bound dispatches into ONE command buffer and submit them with
+    /// a SINGLE `vkQueueSubmit` + `vkQueueWaitIdle`, with a shader-write→read
+    /// memory barrier between consecutive dispatches (so a later op that binds an
+    /// earlier op's output as input sees the writes). This collapses the
+    /// per-dispatch CPU↔GPU round-trip that dominates decode latency: a layer's
+    /// worth of dispatches pays ONE wait instead of ~20.
+    ///
+    /// Each dispatch gets its own descriptor set (all must stay live until the
+    /// submit completes — that is why the descriptor pool is sized for a whole
+    /// layer). The pool + the single command buffer are reset/freed after the
+    /// wait, so a long decode loop cannot leak handles. The caller is
+    /// responsible for the lifetime of every `VulkanRawBuffer` bound here (the
+    /// ffai-vulkan resident-tensor cache owns them across the batch).
+    pub fn run_pipeline_batch(&self, items: &[BatchDispatch]) -> Result<(), MetalTileError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        // Validate binding counts up front so a bad item can't half-record.
+        for (i, it) in items.iter().enumerate() {
+            let nb = it.pipeline.plan.bindings.len();
+            if it.bufs.len() != nb {
+                return Err(MetalTileError::Dispatch(format!(
+                    "run_pipeline_batch: item {i} has {} buffers but plan has {nb} bindings",
+                    it.bufs.len()
+                )));
+            }
+        }
+
+        // Allocate one command buffer for the whole batch.
+        let cb = unsafe {
+            let cb_ai = VkCommandBufferAllocateInfo {
+                sType: VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                pNext: ptr::null(),
+                commandPool: self.command_pool,
+                level: VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                commandBufferCount: 1,
+            };
+            let mut cb: VkCommandBuffer = ptr::null_mut();
+            vk_check(
+                vkAllocateCommandBuffers(self.device, &cb_ai, &mut cb),
+                "vkAllocateCommandBuffers(batch)",
+            )?;
+            let begin = VkCommandBufferBeginInfo {
+                sType: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                pNext: ptr::null(),
+                flags: VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+                pInheritanceInfo: ptr::null(),
+            };
+            vk_check(vkBeginCommandBuffer(cb, &begin), "vkBeginCommandBuffer(batch)")?;
+            cb
+        };
+
+        // Keep every descriptor set's buffer-info Vec alive until vkEndCommandBuffer
+        // (pBufferInfo is read at vkUpdateDescriptorSets time, which we call
+        // before recording each dispatch, so a per-iteration Vec is fine — but we
+        // hold them in an outer Vec to be safe against any driver deferral).
+        let mut keep_infos: Vec<Vec<VkDescriptorBufferInfo>> = Vec::with_capacity(items.len());
+        let barrier = VkMemoryBarrier {
+            sType: VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            pNext: ptr::null(),
+            srcAccessMask: VK_ACCESS_SHADER_WRITE_BIT,
+            dstAccessMask: VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+        };
+
+        for it in items {
+            // Allocate + update a descriptor set for this dispatch's buffers.
+            let descriptor_set = unsafe {
+                let ai = VkDescriptorSetAllocateInfo {
+                    sType: VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                    pNext: ptr::null(),
+                    descriptorPool: self.descriptor_pool,
+                    descriptorSetCount: 1,
+                    pSetLayouts: &it.pipeline.set_layout,
+                };
+                let mut ds: VkDescriptorSet = VK_NULL_HANDLE;
+                vk_check(
+                    vkAllocateDescriptorSets(self.device, &ai, &mut ds),
+                    "vkAllocateDescriptorSets(batch)",
+                )?;
+                ds
+            };
+            let buf_infos: Vec<VkDescriptorBufferInfo> = it
+                .bufs
+                .iter()
+                .map(|b| VkDescriptorBufferInfo { buffer: b.buffer, offset: 0, range: b.size })
+                .collect();
+            let writes: Vec<VkWriteDescriptorSet> = it
+                .pipeline
+                .plan
+                .bindings
+                .iter()
+                .enumerate()
+                .map(|(i, b)| VkWriteDescriptorSet {
+                    sType: VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                    pNext: ptr::null(),
+                    dstSet: descriptor_set,
+                    dstBinding: b.binding,
+                    dstArrayElement: 0,
+                    descriptorCount: 1,
+                    descriptorType: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                    pImageInfo: ptr::null(),
+                    pBufferInfo: &buf_infos[i],
+                    pTexelBufferView: ptr::null(),
+                })
+                .collect();
+            unsafe {
+                vkUpdateDescriptorSets(
+                    self.device,
+                    writes.len() as u32,
+                    writes.as_ptr(),
+                    0,
+                    ptr::null(),
+                );
+                vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, it.pipeline.pipeline);
+                vkCmdBindDescriptorSets(
+                    cb,
+                    VK_PIPELINE_BIND_POINT_COMPUTE,
+                    it.pipeline.layout,
+                    0,
+                    1,
+                    &descriptor_set,
+                    0,
+                    ptr::null(),
+                );
+                if !it.push.is_empty() {
+                    vkCmdPushConstants(
+                        cb,
+                        it.pipeline.layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT,
+                        0,
+                        it.push.len() as u32,
+                        it.push.as_ptr() as *const c_void,
+                    );
+                }
+                vkCmdDispatch(cb, it.grid[0], it.grid[1], it.grid[2]);
+                // Barrier between every dispatch: the next op may read this one's
+                // output. A single global barrier is conservative but cheap vs the
+                // per-op submit it replaces.
+                vkCmdPipelineBarrier(
+                    cb,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    0,
+                    1,
+                    &barrier,
+                    0,
+                    ptr::null(),
+                    0,
+                    ptr::null(),
+                );
+            }
+            keep_infos.push(buf_infos);
+        }
+
+        unsafe {
+            vk_check(vkEndCommandBuffer(cb), "vkEndCommandBuffer(batch)")?;
+            let submit = VkSubmitInfo {
+                sType: VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                pNext: ptr::null(),
+                waitSemaphoreCount: 0,
+                pWaitSemaphores: ptr::null(),
+                pWaitDstStageMask: ptr::null(),
+                commandBufferCount: 1,
+                pCommandBuffers: &cb,
+                signalSemaphoreCount: 0,
+                pSignalSemaphores: ptr::null(),
+            };
+            vk_check(
+                vkQueueSubmit(self.queue, 1, &submit, VK_NULL_HANDLE),
+                "vkQueueSubmit(batch)",
+            )?;
+            vk_check(vkQueueWaitIdle(self.queue), "vkQueueWaitIdle(batch)")?;
+            vkFreeCommandBuffers(self.device, self.command_pool, 1, &cb);
+            // Free every descriptor set allocated in this batch in one shot.
+            vkResetDescriptorPool(self.device, self.descriptor_pool, 0);
+        }
+        drop(keep_infos);
+        Ok(())
+    }
+
     pub fn name(&self) -> &str { "vulkan-device" }
 
     /// Physical handle (for future direct queries via `vkGetPhysicalDeviceProperties`).
@@ -1208,9 +1526,18 @@ pub fn compile_glsl_to_spv(
             shaderc_target_env_vulkan,
             shaderc_env_version_vulkan_1_2 as u32,
         );
-        // Optimisation level 0: zero-opt, identical to debug. Phase 1
-        // prioritises correctness + readable shader disassembly.
-        shaderc_compile_options_set_optimization_level(opts, 0);
+        // Shaderc optimization level. Default 2 (performance): the SPIR-V
+        // optimizer runs once per (kernel,dims) at first compile, then the
+        // pipeline is cached, so the cost is paid once but every dispatch
+        // reaps the faster shader. Override with METALTILE_SHADERC_OPT:
+        //   0 = zero-opt (readable disasm / correctness fallback),
+        //   1 = size, 2 = performance (default).
+        let opt_level: ::std::os::raw::c_int = ::std::env::var("METALTILE_SHADERC_OPT")
+            .ok()
+            .and_then(|v| v.trim().parse::<i32>().ok())
+            .filter(|n| (0..=2).contains(n))
+            .unwrap_or(2);
+        shaderc_compile_options_set_optimization_level(opts, opt_level);
         let result = shaderc_compile_into_spv(
             compiler,
             csrc.as_ptr(),

@@ -26,4 +26,6 @@ pub use device::cuda::{CudaDevice, CudaFunction, CudaModule, DeviceBuffer};
 pub use device::hip::{HipBuffer, HipDevice, HipKernel, HipModuleHandle};
 
 #[cfg(feature = "vulkan")]
-pub use device::vulkan::{VulkanBuffer, VulkanDevice, VulkanPipeline, VulkanRawBuffer, compile_glsl_to_spv};
+pub use device::vulkan::{
+    BatchDispatch, VulkanBuffer, VulkanDevice, VulkanPipeline, VulkanRawBuffer, compile_glsl_to_spv,
+};
