@@ -404,7 +404,7 @@ impl CudaDevice {
         // legacy algo selector do NOT suppress this on sm_121; cublasLt does.
         // METALTILE_GEMM_NONDET=1 opts back into the legacy path (A/B perf only).
         if std::env::var("METALTILE_GEMM_NONDET").ok().as_deref() != Some("1") {
-            return self.gemm_cublaslt(x, w, out, m, n, k, dtype);
+            return self.gemm_cublaslt(x, w, out, m, n, k, dtype, dtype);
         }
         let h = self.cublas_handle()?;
         let cdt = match dtype {
@@ -457,6 +457,26 @@ impl CudaDevice {
         Ok((guard.0 as cublasLtHandle_t, guard.1 as CUdeviceptr))
     }
 
+    /// f16/bf16 inputs, **f32 output** — convenience wrapper over [`gemm_cublaslt`]
+    /// that keeps the A/B (weight/activation) dtype but writes the result as f32.
+    /// cuBLAS already accumulates in f32 (`CUBLAS_COMPUTE_32F`); only the D-layout
+    /// type changes, so this FUSES the post-GEMM `f16→f32` cast into the matmul at
+    /// zero extra cost (no separate cast kernel, MFU preserved). Used by Nemotron
+    /// prefill so the residual stream stays f32 without a trailing cast pass.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_cublas_f32out(
+        &self,
+        x: CUdeviceptr,
+        w: CUdeviceptr,
+        out: CUdeviceptr,
+        m: usize,
+        n: usize,
+        k: usize,
+        ab_dtype: metaltile_core::DType,
+    ) -> Result<(), MetalTileError> {
+        self.gemm_cublaslt(x, w, out, m, n, k, ab_dtype, metaltile_core::DType::F32)
+    }
+
     /// DETERMINISTIC tensor-core GEMM via cublasLt. Same row-major contract as
     /// [`gemm_cublas`] (`C[m,n] = X[m,k] · W[n,k]ᵀ`) but forbids split-K
     /// reductions (`REDUCTION_SCHEME_NONE`) so the heuristic only returns algos
@@ -464,6 +484,9 @@ impl CudaDevice {
     /// MoE-prefill logit jitter that `cublasSetAtomicsMode`/legacy-algo selection
     /// could not suppress on sm_121. Falls back to an error (caller can retry the
     /// nondeterministic path) if no deterministic algo is found.
+    ///
+    /// `out_dtype` is the D-layout type (f16/bf16 = same as inputs, or f32 to fuse
+    /// the post-GEMM widening cast). Accumulation is always f32.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_cublaslt(
         &self,
@@ -474,12 +497,19 @@ impl CudaDevice {
         n: usize,
         k: usize,
         dtype: metaltile_core::DType,
+        out_dtype: metaltile_core::DType,
     ) -> Result<(), MetalTileError> {
         let (lt, workspace) = self.cublaslt_ctx()?;
         let cdt = match dtype {
             metaltile_core::DType::F16 => CUDA_R_16F,
             metaltile_core::DType::BF16 => CUDA_R_16BF,
             other => return Err(MetalTileError::Dispatch(format!("gemm_cublaslt: unsupported dtype {other:?} (need f16/bf16)"))),
+        };
+        let ddt = match out_dtype {
+            metaltile_core::DType::F16 => CUDA_R_16F,
+            metaltile_core::DType::BF16 => CUDA_R_16BF,
+            metaltile_core::DType::F32 => CUDA_R_32F,
+            other => return Err(MetalTileError::Dispatch(format!("gemm_cublaslt: unsupported out_dtype {other:?}"))),
         };
         // Col-major identity (same as gemm_cublas): out_cm[n,m] = (W^T)·X.
         //   op(A)=T, op(B)=N; A=W (rows=k, cols=n, ld=k), B=X (rows=k, cols=m, ld=k),
@@ -504,7 +534,7 @@ impl CudaDevice {
             let mut d_l: cublasLtMatrixLayout_t = ptr::null_mut();
             cublasLtMatrixLayoutCreate(&mut a_l, cdt, k as u64, n as u64, k as i64);
             cublasLtMatrixLayoutCreate(&mut b_l, cdt, k as u64, m as u64, k as i64);
-            cublasLtMatrixLayoutCreate(&mut d_l, cdt, n as u64, m as u64, n as i64);
+            cublasLtMatrixLayoutCreate(&mut d_l, ddt, n as u64, m as u64, n as i64);
 
             let mut pref: cublasLtMatmulPreference_t = ptr::null_mut();
             cublasLtMatmulPreferenceCreate(&mut pref);
