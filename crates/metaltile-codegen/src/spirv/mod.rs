@@ -1174,12 +1174,19 @@ impl GlslGenerator {
                 let ls = self.local_size_total();
                 writeln!(out, "{pad}{red}[tid] = ({input});").ok();
                 writeln!(out, "{pad}barrier();").ok();
+                // The barrier-tree must start at next-power-of-two(ls)/2 with a
+                // `tid + _s < ls` guard. A bare `ls/2` halving tree only sums
+                // correctly when ls (local_size/TPG) is a power of two; a
+                // non-pow2 TPG (e.g. 384 = 2^7*3 for an RMSNorm at hidden=1536)
+                // drops upper-partial lanes and loses ~1/3 of the reduction.
+                // No-op for power-of-two ls (tid+_s<ls is then always true).
+                let np = (ls as u64).next_power_of_two();
                 writeln!(
                     out,
-                    "{pad}for (uint _s = {ls}u / 2u; _s > 0u; _s >>= 1) {{"
+                    "{pad}for (uint _s = {np}u / 2u; _s > 0u; _s >>= 1) {{"
                 )
                 .ok();
-                writeln!(out, "{pad}    if (tid < _s) {{").ok();
+                writeln!(out, "{pad}    if (tid < _s && tid + _s < {ls}u) {{").ok();
                 let combine =
                     reduce_combine(*rk, &format!("{red}[tid]"), &format!("{red}[tid + _s]"));
                 writeln!(out, "{pad}        {red}[tid] = {combine};").ok();
@@ -2156,6 +2163,8 @@ mod tests {
         assert!(src.contains("shared float _red_5[256];"));
         assert!(src.contains("_red_5[tid] = (v_acc_4);"));
         assert!(src.contains("for (uint _s = 256u / 2u; _s > 0u; _s >>= 1)"));
+        // npot-safe guard: tree must drop upper-partial lanes for non-pow2 TPG.
+        assert!(src.contains("tid + _s < 256u"));
         assert!(src.contains("barrier();"));
         assert!(src.contains("_b_out[uint(v_row_0)] = float(v_result_5);"));
     }
